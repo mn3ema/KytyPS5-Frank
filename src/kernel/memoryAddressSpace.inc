@@ -1214,20 +1214,81 @@ private:
 		return (value & (m_granularity - 1u)) == 0;
 	}
 
+	// KYTY_PROTECT_STATS=1: what guest-range protections cost in host calls (one per mapping a range
+	// crosses: a call cannot span two views), every 10 s on stderr: protections, host calls and their
+	// time, how many calls each protection took, and the 2 MB regions with the most host calls.
+	static bool ProtectStatsEnabled() {
+		static const bool enabled = std::getenv("KYTY_PROTECT_STATS") != nullptr;
+		return enabled;
+	}
+
+	static void NoteProtectCalls(uint64_t vaddr, uint32_t calls, VirtualMemory::Mode mode,
+	                             std::chrono::steady_clock::time_point start) {
+		static std::mutex                   mutex;
+		static uint64_t                     protects = 0, host_calls = 0, arm_calls = 0, ns = 0;
+		static uint64_t                     buckets[5] {}; // 1, 2-4, 5-16, 17-64, >64 calls
+		static std::map<uint64_t, uint64_t> regions;       // 2 MB region -> host calls
+		static auto                         last = std::chrono::steady_clock::now();
+		const auto                          now  = std::chrono::steady_clock::now();
+		std::lock_guard                     lock(mutex);
+		protects++;
+		host_calls += calls;
+		if (mode != VirtualMemory::Mode::ReadWrite) {
+			arm_calls += calls; // fewer rights: a TLB shootdown on every processor of the process
+		}
+		ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		buckets[calls <= 1 ? 0 : calls <= 4 ? 1 : calls <= 16 ? 2 : calls <= 64 ? 3 : 4]++;
+		regions[vaddr >> 21u] += calls;
+		const double seconds = std::chrono::duration<double>(now - last).count();
+		if (seconds < 10.0) {
+			return;
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> top(regions.begin(), regions.end());
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::string text;
+		for (size_t i = 0; i < top.size() && i < 8; i++) {
+			char line[64];
+			std::snprintf(line, sizeof(line), " 0x%llx:%llu", static_cast<unsigned long long>(top[i].first << 21u),
+			              static_cast<unsigned long long>(top[i].second));
+			text += line;
+		}
+		std::fprintf(stderr,
+		             "[protect-stats] %.0f protections/s, %.0f host calls/s (%.0f removing rights), "
+		             "%.1f ms/s in them | calls per protection 1:%llu 2-4:%llu 5-16:%llu 17-64:%llu >64:%llu "
+		             "| top 2 MB regions by calls:%s\n",
+		             protects / seconds, host_calls / seconds, arm_calls / seconds, ns / 1e6 / seconds,
+		             static_cast<unsigned long long>(buckets[0]), static_cast<unsigned long long>(buckets[1]),
+		             static_cast<unsigned long long>(buckets[2]), static_cast<unsigned long long>(buckets[3]),
+		             static_cast<unsigned long long>(buckets[4]), text.c_str());
+		protects = host_calls = arm_calls = ns = 0;
+		std::fill(std::begin(buckets), std::end(buckets), 0);
+		regions.clear();
+		last = now;
+	}
+
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
 			--it;
 		}
+		const bool stats = ProtectStatsEnabled();
+		const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		uint32_t   calls = 0;
 		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start < range_end &&
-			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
-				return false;
+			if (range_start < range_end) {
+				calls++;
+				if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+					return false;
+				}
 			}
+		}
+		if (stats) {
+			NoteProtectCalls(vaddr, calls, mode, start);
 		}
 		return true;
 	}
