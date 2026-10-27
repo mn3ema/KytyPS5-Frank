@@ -67,6 +67,46 @@ bool ShaderFailureNonFatal() {
 
 namespace {
 
+// Switches only the SPIR-V emitter reads. A source entry's key records them as unset, a permutation
+// entry's key (built on the full session key) with their values, so a shader translated under one
+// value is not translated again under another: the translation is the expensive half (~85 ms a
+// compute shader, on the GPU thread). KYTY_DENORM_FLUSH=0 had made every source a miss after
+// sessions with the default, and every first draw of a shader stalled again (2026-10-27).
+constexpr std::string_view EmitterOnlySwitches[] = {"KYTY_DENORM_FLUSH"};
+
+void AppendSwitch(std::vector<uint8_t>& bytes, std::string_view name, std::string_view value) {
+	const uint64_t name_size  = name.size();
+	const uint64_t value_size = value.size();
+	const auto*    name_bytes = reinterpret_cast<const uint8_t*>(&name_size);
+	bytes.insert(bytes.end(), name_bytes, name_bytes + sizeof(name_size));
+	bytes.insert(bytes.end(), name.begin(), name.end());
+	bytes.push_back(1u);
+	const auto* value_bytes = reinterpret_cast<const uint8_t*>(&value_size);
+	bytes.insert(bytes.end(), value_bytes, value_bytes + sizeof(value_size));
+	bytes.insert(bytes.end(), value.begin(), value.end());
+}
+
+// ShaderDiskCache::SessionKey's bytes with the emitter-only switches as SessionKey writes an unset
+// one: [name size][name][0] instead of [name size][name][1][value size][value].
+std::vector<uint8_t> SourceSessionKey(std::vector<uint8_t> key) {
+	for (const auto name: EmitterOnlySwitches) {
+		const char* value = std::getenv(std::string(name).c_str());
+		if (value == nullptr) {
+			continue;
+		}
+		std::vector<uint8_t> set;
+		AppendSwitch(set, name, value);
+		const auto found = std::search(key.begin(), key.end(), set.begin(), set.end());
+		if (found == key.end()) {
+			continue;
+		}
+		const auto flag = (found - key.begin()) + static_cast<ptrdiff_t>(sizeof(uint64_t) + name.size());
+		key.erase(key.begin() + flag, key.begin() + (found - key.begin()) + static_cast<ptrdiff_t>(set.size()));
+		key.insert(key.begin() + flag, uint8_t {0});
+	}
+	return key;
+}
+
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kSrcAlpha:
@@ -1470,7 +1510,8 @@ struct PipelineCache::ProgramCache {
 	                    const InputInfo& input_info) {
 		if (disk_session_key.empty()) {
 			// Built at first use: the device layer has set the emitter's switches by then.
-			disk_session_key = ShaderDiskCache::SessionKey(disk_session);
+			disk_full_session_key = ShaderDiskCache::SessionKey(disk_session);
+			disk_session_key      = SourceSessionKey(disk_full_session_key);
 		}
 		ShaderDiskCache::ByteWriter writer;
 		writer.bytes.reserve(disk_session_key.size() + code.size_bytes() +
@@ -1511,6 +1552,23 @@ struct PipelineCache::ProgramCache {
 		ShaderDiskCache::AppendSpecialization(writer, specialization);
 		writer.Put(push_data_cursor);
 		key = std::move(writer.bytes);
+	}
+
+	// A permutation key is built on the full session key (SourceSessionKey: the source key leaves
+	// the emitter-only switches unset).
+	void BuildDiskPermutationKey(std::vector<uint8_t>& key, std::span<const uint8_t> source_key,
+	                             const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                             uint32_t push_data_cursor) const {
+		if (disk_full_session_key == disk_session_key) {
+			BuildPermutationKey(key, source_key, specialization, push_data_cursor);
+			return;
+		}
+		std::vector<uint8_t> full;
+		full.reserve(disk_full_session_key.size() + source_key.size() - disk_session_key.size());
+		full.insert(full.end(), disk_full_session_key.begin(), disk_full_session_key.end());
+		full.insert(full.end(), source_key.begin() + static_cast<ptrdiff_t>(disk_session_key.size()),
+		            source_key.end());
+		BuildPermutationKey(key, full, specialization, push_data_cursor);
 	}
 
 	// Stores a fresh entry; in verify mode compares it with the cached one first (`cached`, empty
@@ -2012,8 +2070,8 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			if (entry != nullptr) {
-				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
-				                    push_data_cursor);
+				BuildDiskPermutationKey(permutation_key, source_key, entry->second.specialization,
+				                        push_data_cursor);
 				std::vector<uint8_t>               payload;
 				ShaderDiskCache::PermutationRecord record;
 				if (!disk->Load(permutation_key, payload)) {
@@ -2119,8 +2177,8 @@ struct PipelineCache::ProgramCache {
 				return ShaderProgram {};
 			}
 			if (disk != nullptr) {
-				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
-				                    push_data_cursor);
+				BuildDiskPermutationKey(permutation_key, source_key, entry->second.specialization,
+				                        push_data_cursor);
 				if (disk_verify) {
 					std::vector<uint8_t> payload;
 					if (disk->Load(permutation_key, payload)) {
@@ -2374,6 +2432,7 @@ struct PipelineCache::ProgramCache {
 	// The shader disk cache (null when off) and its session key, built at first use.
 	ShaderDiskCache::SessionInfo                                disk_session;
 	std::vector<uint8_t>                                        disk_session_key;
+	std::vector<uint8_t>                                        disk_full_session_key;
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
