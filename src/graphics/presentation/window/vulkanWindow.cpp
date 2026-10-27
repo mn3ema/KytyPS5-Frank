@@ -816,6 +816,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
+	vk::PhysicalDeviceFragmentShadingRateFeaturesKHR shading_rate {};
+	if (HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFragmentShadingRateFeaturesKHR supported_rate {};
+		vk::PhysicalDeviceFeatures2                      rate_query {};
+		rate_query.pNext = &supported_rate;
+		physical_device.getFeatures2(&rate_query);
+		if (supported_rate.pipelineFragmentShadingRate) {
+			shading_rate.pipelineFragmentShadingRate = VK_TRUE;
+			shading_rate.pNext                       = const_cast<void*>(create_info.pNext);
+			create_info.pNext                        = &shading_rate;
+			graphics.pipeline_shading_rate_enabled   = true;
+		}
+		LOGF("Vulkan pipeline fragment shading rate: %s\n",
+		     graphics.pipeline_shading_rate_enabled ? "enabled" : "unsupported");
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1310,6 +1325,12 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		// KYTY_VRS_HASHES: the listed pixel shaders run at a coarser shading rate (shaders.cpp).
+		if (const char* vrs = std::getenv("KYTY_VRS_HASHES");
+		    vrs != nullptr && vrs[0] != '\0' &&
+		    HasExtension(available_extensions, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
 		}
 	}
 

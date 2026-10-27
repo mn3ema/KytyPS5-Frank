@@ -167,6 +167,44 @@ static bool DisableOptimizationFor(uint64_t shader_hash) {
 	return std::ranges::find(hashes, shader_hash) != hashes.end();
 }
 
+// KYTY_VRS_HASHES="hash,...": pipelines whose pixel shader is listed shade one invocation per
+// KYTY_VRS_RATE block of pixels (2x2 by default, or 1x2, 2x1, 2x4, 4x2, 4x4). Meant for a full-screen
+// pass whose translation costs far more than the original, because the predicated code runs every
+// branch for every pixel (Wolverine's swamp water, 0x283e883115bc9cd7: 19 ms of a 47 ms frame).
+static bool CoarseShadingFor(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		if (const char* value = std::getenv("KYTY_VRS_HASHES"); value != nullptr) {
+			std::string list(value);
+			size_t      start = 0;
+			while (start < list.size()) {
+				const auto end = std::min(list.find(',', start), list.size());
+				if (end > start) {
+					result.push_back(std::strtoull(list.substr(start, end - start).c_str(), nullptr, 16));
+				}
+				start = end + 1;
+			}
+		}
+		return result;
+	}();
+	return std::ranges::find(hashes, shader_hash) != hashes.end();
+}
+
+static vk::Extent2D CoarseShadingRate() {
+	static const vk::Extent2D rate = [] {
+		unsigned width  = 2;
+		unsigned height = 2;
+		if (const char* value = std::getenv("KYTY_VRS_RATE"); value != nullptr) {
+			if (std::sscanf(value, "%ux%u", &width, &height) != 2) {
+				width  = 2;
+				height = 2;
+			}
+		}
+		return vk::Extent2D {width, height};
+	}();
+	return rate;
+}
+
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
     static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
@@ -765,6 +803,15 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		LOGF("PipelineTrace: graphics pipeline VS=0x%016" PRIx64 " PS=0x%016" PRIx64
 		     " built without optimization\n",
 		     vs_input_info.stage.program->shader_hash, ps_hash);
+	}
+	if (graphics.pipeline_shading_rate_enabled && ps_hash != 0 && CoarseShadingFor(ps_hash)) {
+		build.shading_rate.fragmentSize = CoarseShadingRate();
+		build.shading_rate.pNext        = const_cast<void*>(pipeline_info.pNext);
+		pipeline_info.pNext             = &build.shading_rate;
+		LOGF("PipelineTrace: graphics pipeline VS=0x%016" PRIx64 " PS=0x%016" PRIx64
+		     " shades at %ux%u\n",
+		     build.vs_hash, ps_hash, build.shading_rate.fragmentSize.width,
+		     build.shading_rate.fragmentSize.height);
 	}
 
 	if (graphics_debug_dump_enabled()) {

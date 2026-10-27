@@ -60,6 +60,8 @@ struct GraphicContext {
 	bool                               calibrated_timestamps_enabled         = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
+	// KYTY_VRS_HASHES (shaders.cpp): VK_KHR_fragment_shading_rate with per-pipeline rates.
+	bool                               pipeline_shading_rate_enabled         = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;

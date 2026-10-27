@@ -148,6 +148,7 @@ struct GraphicsPipelineBuild {
 	vk::PipelineTessellationStateCreateInfo                               tessellation {};
 	PipelineRenderingState                                                rendering;
 	vk::PipelineRenderingCreateInfo                                       rendering_info {};
+	vk::PipelineFragmentShadingRateStateCreateInfoKHR                     shading_rate {};
 	vk::GraphicsPipelineCreateInfo                                        pipeline_info {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
