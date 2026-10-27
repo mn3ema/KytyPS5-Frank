@@ -90,6 +90,33 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return true;
 }
 
+// HashGuestBacking's hash of bytes already in host memory (the collector's staging copy).
+[[nodiscard]] uint64_t HashBytes(const uint8_t* bytes, uint64_t size) {
+	constexpr uint64_t Chunk = 64 * 1024;
+	uint64_t           seed  = 0;
+	for (uint64_t done = 0; done < size;) {
+		const auto part = std::min(size - done, Chunk);
+		seed            = XXH3_64bits_withSeed(bytes + done, static_cast<size_t>(part), seed);
+		done += part;
+	}
+	return seed;
+}
+
+// The collector copies and hashes an evicted image's guest bytes (a full pass each, up to 256 MB a
+// frame under memory pressure) with the cache lock released: a guest write fault takes that lock,
+// and on a 16 GB card the game's two busiest threads spun on it for 13-14 % of their time while
+// the copy ran (2026-10-27). The image is checked again once the lock is back: a write that
+// landed meanwhile left it CPU-dirty, and the eviction is dropped. The hash is taken from the copy,
+// so it covers exactly the bytes the write-back publishes, and the guest is read once instead of
+// twice. KYTY_GC_UNLOCKED_READS=0 copies and hashes under the lock again.
+[[nodiscard]] bool GcUnlockedReads() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GC_UNLOCKED_READS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -2204,17 +2231,34 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		}
 		ring.Commit();
 	}
-	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
-		return false;
-	}
 	const bool guard      = evicting && EvictWriteBackGuard();
 	uint64_t   guest_hash = 0;
-	if (guard && !HashGuestBacking(range.address, range.size, guest_hash)) {
-		return false;
+	auto*      target     = &image;
+	if (evicting && GcUnlockedReads()) {
+		// The collector holds m_lock (RunGarbageCollector) and is the only thread that frees images.
+		m_lock.unlock();
+		const bool read = LibKernel::Memory::TryReadBacking(range.address, mapped, range.size);
+		if (read && guard) {
+			guest_hash = HashBytes(mapped, range.size);
+		}
+		m_lock.lock();
+		target = m_slot_images.try_get(id);
+		if (!read || target == nullptr || !target->registered ||
+		    target->info.data.address != range.address || target->info.data.size != range.size ||
+		    !target->SafeToDownload()) {
+			return false;
+		}
+	} else {
+		if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
+			return false;
+		}
+		if (guard && !HashGuestBacking(range.address, range.size, guest_hash)) {
+			return false;
+		}
 	}
 	download->Flush(offset, range.size);
 
-	DownloadImage(image, *download, offset, range.size, std::move(transfer));
+	DownloadImage(*target, *download, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -2634,6 +2678,11 @@ void TextureCache::RunGarbageCollector() {
 				std::shared_ptr<std::atomic<bool>> landed;
 				if (safe && !DownloadImageMemory(id, true, &landed)) {
 					g_gc_skip.gpu_download++;
+					continue;
+				}
+				// DownloadImageMemory can release m_lock while it reads the guest (GcUnlockedReads).
+				owner = m_slot_images.try_get(id);
+				if (owner == nullptr) {
 					continue;
 				}
 				if (safe && owner->info.IsTiled()) {
