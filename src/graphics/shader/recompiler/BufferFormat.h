@@ -245,6 +245,50 @@ constexpr uint32_t GetFormatComponentByteOffset(const BufferFormatInfo& info, ui
 	return info.packed_bitfield ? 0u : info.component_bit_offset[component] / 8u;
 }
 
+// v432 (dynamic buffer formats): the distinct memory layouts of the valid buffer formats (byte
+// size, components, their bits and offsets), numbered from 1 in format order; 0: no valid format.
+// A format is decoded at run time as its layout (the loads) and its component type (the conversion).
+struct BufferLayouts {
+	BufferFormatInfo info[16] {};
+	uint8_t          id[128] {};
+	uint32_t         count = 0;
+};
+
+constexpr bool SameBufferLayout(const BufferFormatInfo& a, const BufferFormatInfo& b) {
+	if (a.byte_size != b.byte_size || a.component_count != b.component_count ||
+	    a.packed_bitfield != b.packed_bitfield) {
+		return false;
+	}
+	for (uint32_t c = 0; c < 4u; c++) {
+		if (a.component_bits[c] != b.component_bits[c] ||
+		    a.component_bit_offset[c] != b.component_bit_offset[c]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+constexpr BufferLayouts MakeBufferLayouts() {
+	BufferLayouts layouts;
+	for (uint32_t value = 0; value < 128u; value++) {
+		const auto info = GetFormatInfo(static_cast<Prospero::BufferFormat>(value));
+		if (info.type == ComponentType::Unknown || info.component_count == 0u) continue;
+		uint32_t id = 0;
+		for (uint32_t i = 1; i <= layouts.count; i++) {
+			if (SameBufferLayout(layouts.info[i], info)) id = i;
+		}
+		if (id == 0) {
+			id                = ++layouts.count;
+			layouts.info[id]  = info;
+		}
+		layouts.id[value] = static_cast<uint8_t>(id);
+	}
+	return layouts;
+}
+
+inline constexpr BufferLayouts kBufferLayouts = MakeBufferLayouts();
+static_assert(kBufferLayouts.count <= 15u, "buffer layouts must fit 4 bits");
+
 } // namespace Libs::Graphics::ShaderRecompiler::Format
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_BUFFERFORMAT_H_ */

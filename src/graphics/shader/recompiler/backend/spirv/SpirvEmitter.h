@@ -16,7 +16,15 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 struct HostImageFeatures {
 	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.
 	bool min_lod = false;
+	// fragmentShaderPixelInterlock: ordered critical sections for POPS pixel shaders.
+	bool pixel_interlock = false;
+	// maxSamplerLodBias: the clamp the sampler cache applies to the S# LOD bias.
+	float max_sampler_lod_bias = 0.0f;
 };
+
+// Whether a pixel shader of this program runs inside an ordered fragment interlock
+// (KYTY_POPS_INTERLOCK=0 turns it off).
+bool UsesPixelInterlock(const IR::Program& program);
 
 void              SetHostImageFeatures(const HostImageFeatures& features);
 HostImageFeatures GetHostImageFeatures();
@@ -43,6 +51,15 @@ bool GetCoherentLoadAcquire();
 // the software flushes.
 void SetDenormFlushToZero32(bool supported);
 bool GetDenormFlushToZero32();
+
+// The device bounds-checks storage buffers to the byte (robustBufferAccess2 with a 1-byte
+// robustStorageBufferAccessSizeAlignment): plain loads and stores of guest buffers whose bound is
+// the descriptor range then skip the shader's own check and branch, as upstream KytyPS5 ee034be4
+// does. Accesses whose bound is narrower than the range (GPU-sized buffers), atomics, merged
+// subword stores and write-tracked stores keep the check. KYTY_ROBUST_BUFFER_BOUNDS=0 keeps every
+// shader check.
+void SetRobustBufferAccess(bool supported);
+bool GetRobustBufferAccess();
 
 // Why a mesh program cannot run in passes (ShaderMeshInputInfo::passes), or nullptr.
 [[nodiscard]] const char* MeshPassesUnsupported(const IR::Program& program);

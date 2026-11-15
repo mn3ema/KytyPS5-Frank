@@ -26,6 +26,19 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // Emulated 64-bit FLAT apertures. Each contains 4 GiB of byte offsets and is
 // outside guest global VA space. Keep queries and FLAT routing consistent: the values are
 // upstream's Decoder::SharedApertureHigh / PrivateApertureHigh (ShaderDecoder.h).
+// KYTY_G6_VERIFY=1 (diagnosis, 11-11): every G6 scalar table read is done twice, through the table
+// and through a host binding of the same buffer resource (which stays bound); the first invocation
+// whose two values differ writes a shader trap (hash, pc, byte offset, table value, binding value,
+// the V# base the GPU used), and the emulator stops with it. The renderer binds the resource
+// normally in this mode (the descriptor the host evaluated).
+inline bool G6Verify() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_G6_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 inline constexpr uint32_t SharedApertureHigh = 0x80000000u;
 inline constexpr uint32_t PrivateApertureHigh = 0x70000000u;
 
@@ -78,6 +91,9 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// G6 table read (ResourceKind::IndirectBuffer through the GPU address table): the buffer
+	// resource it reads, for KYTY_G6_VERIFY. UINT32_MAX otherwise.
+	uint32_t                table_resource                                        = UINT32_MAX;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		// Formatted loads of any width decode the descriptor's format in the shader
@@ -143,6 +159,14 @@ struct BufferResource {
 	// KYTY_GPU_SIZED_DYNAMIC, a count no flat slot holds: the shader bounds its accesses by the
 	// count its own descriptor carries (the handle's dword 2, computed in the shader).
 	bool                   gpu_records_ssa            = false;
+	// G6 S1 (KYTY_G6): every use reads through the GPU address table (ResourceKind::IndirectBuffer)
+	// with the descriptor words the host also evaluates; the host keeps the buffer present but
+	// binds no descriptor for it.
+	bool                   table_read                 = false;
+	// v432: a read-only formatted buffer whose format and destination selects are per-draw data
+	// (DynamicBufferFormat): the specialization keeps them canonical, and the shader decodes
+	// the format the draw writes in the high bits of its stride word (BufferFormatData).
+	bool                   dynamic_format             = false;
 	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
@@ -178,6 +202,31 @@ struct ImageResource {
 	// Sampled through the bindless image arrays (descriptor set 1) at the slot the translation
 	// table gives for the handle's key; the mapping offset locates the heap's region and size.
 	bool                          bindless          = false;
+	// Read without filtering (texel load or size query; ImageRead, ImageQueryDimensions): an
+	// out-of-range array layer is undefined there, so a 2D T# keeps the 2D type (v418 collapse,
+	// KYTY_IMAGE_2D_AS_ARRAY).
+	bool                          unfiltered        = false;
+	// v429 (zero-compile plan step 5): a load-only sampled image whose T# may be float or unsigned
+	// integer (DynamicImageClass): it is bound twice, as a float image (its numeric_class) and as a
+	// uint image (the uint binding group), the host binds the real view in the group of the T#'s
+	// class and a null image in the other, and the shader reads both and selects by the class bit
+	// the draw writes (BindingLayout::ImageClassDword).
+	bool                          dynamic_class     = false;
+	// v430: a load-only slot of an array instruction whose T# may be a 2D texture or a 2D array
+	// (DynamicImageLayer): declared as a 2D array (the host binds a 2D T# as its one layer), and
+	// the draw's layer bit makes the shader read layer 0 and report no layers for a 2D T#, as the
+	// hardware does when it addresses by the T#'s type.
+	bool                          dynamic_layer     = false;
+	// v431: an array instruction's slot whose T# may be a 2D array or a cube (DynamicImageCube):
+	// float coordinates are built both ways (cube faces as layers, CoordF32) and the draw's cube
+	// bit picks one; a sample with offsets (ignored on a cube) is emitted both ways and selected.
+	bool                          dynamic_cube      = false;
+	// v433: a 3D instruction's sampled slot whose T# may be a 3D texture or a 2D one
+	// (DynamicImage3D): bound twice, as a 3D image (its dimension) and in the 2D group of its class;
+	// the host binds the real view in the group of the T#'s type and a null image in the other, and
+	// the shader emits the instruction for both (as the 2D-specialized module would for a 2D T#) and
+	// selects by the draw's bit (BindingLayout::ImageDim3DDword: 1 = the T# is 2D).
+	bool                          dynamic_3d        = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -348,7 +397,10 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 
 struct PushData {
-	static constexpr uint32_t DwordCount = 32;
+	// v426: 64 dwords (256 bytes, what desktop GPUs report as maxPushConstantsSize; vulkanWindow.cpp
+	// checks it). At 32 the per-draw shader data of many stages spilled into the ShaderData storage
+	// buffer, which cost fps (v424).
+	static constexpr uint32_t DwordCount = 64;
 	static constexpr uint32_t MeshDrawDwordCount = 7;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
@@ -356,12 +408,22 @@ struct PushData {
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
 		return size != 0 && start <= DwordCount && size <= DwordCount - start;
 	}
+	// v434 (cursor-free modules, Fable): a pixel shader's data is anchored at the top (it ends at
+	// the last dword, above the mesh draw words), the stage before it starts at 0 (7 under a mesh
+	// shader), so neither module depends on the other's size. A pair whose data overlap takes the
+	// other stage's NoPush variant (its data in the ShaderData buffer).
+	static constexpr uint32_t TopAnchor = 0x10000u;
+	static constexpr uint32_t NoPush    = 0x10001u;
 	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
+		if (cursor == NoPush) return NoStart;
+		if (cursor == TopAnchor) {
+			return size != 0 && size <= DwordCount - MeshDrawDwordCount ? DwordCount - size : NoStart;
+		}
 		return CanFit(cursor, size) ? cursor : NoStart;
 	}
 };
 
-static_assert(sizeof(PushData) == 128);
+static_assert(sizeof(PushData) == 256);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
@@ -470,6 +532,20 @@ struct DescriptorBinding {
 };
 
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
+bool ClipSpaceData(); // KYTY_CLIP_SPACE_DATA (default on), BindingLayout::clip_space
+bool ExportMappingData(); // KYTY_EXPORT_MAPPING_DATA (default on), BindingLayout::export_mapping
+// Experiments (zero-compile plan, cursor-free modules): KYTY_PUSH_DATA=0 puts every stage's
+// shader data in the ShaderData buffer; KYTY_SHADER_DATA_UBO=1 makes that buffer a uniform buffer
+// (constant cache) instead of a storage buffer.
+bool PushDataEnabled();
+// KYTY_STAGE_SETS=1 (graphics pipeline library, step A): a pixel shader's own descriptors are in
+// set 2 (the stage before it keeps set 0, bindless stays set 1), so each stage's set layout depends
+// only on its own module (independent sets).
+bool StageDescriptorSets();
+inline constexpr uint32_t PixelDescriptorSet = 2;
+bool ShaderDataUniform();
+bool BufferStrideAsData(); // KYTY_BUFFER_STRIDE_DATA (v428: default on again; =0 off), BindingLayout::buffer_stride_count
+
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
@@ -482,6 +558,35 @@ struct BindingLayout {
 	// KYTY_SRT_VERIFY (ResourceSnapshot.h, SrtVerify): VerifyDword() holds the flattened SRT dword
 	// where the pairs start, their count, and the device address of the report buffer (2 dwords).
 	bool                           srt_verify          = false;
+	// KYTY_LOOP_GUARD_HASHES applies to the program (LoopGuard.h): GuardDword() holds the device
+	// address of the guard-trip report (2 dwords); an invocation whose guard exhausts writes the
+	// shader hash there once.
+	bool                           loop_guard          = false;
+	// v422 (zero-compile plan step 1): the screen-space position transform of a clip-disabled
+	// draw reads its viewport scale, offset and half extent (x, y each) from ClipSpaceDword()
+	// (6 floats the host writes per draw, PreparedBindings::clip_space) instead of constants, so
+	// the viewport stays out of the shader key. KYTY_CLIP_SPACE_DATA=0: constants as before.
+	bool                           clip_space          = false;
+	// v423 (zero-compile plan step 1): the pixel shader's colour export channel mapping per render
+	// target (8 x ColorComponentMapping::packed) is read from ExportMappingDword() (2 dwords the
+	// host writes per draw, PreparedBindings::export_mapping) instead of being baked in.
+	// KYTY_EXPORT_MAPPING_DATA=0: constants as before.
+	bool                           export_mapping      = false;
+	// v429: some image has dynamic_class: ImageClassDword() holds one bit per image (1: the T# is
+	// an unsigned-integer format), written per draw. v430: some image has dynamic_layer:
+	// ImageLayerDword() holds one bit per image (1: the T# is a plain 2D texture).
+	// v431: some image has dynamic_cube: ImageCubeDword() holds one bit per image (1: the T# is a
+	// cube). One byte for the three (layout size).
+	uint8_t                        image_flags         = 0;
+	static constexpr uint8_t       ImageClassFlags     = 1u;
+	static constexpr uint8_t       ImageLayerFlags     = 2u;
+	static constexpr uint8_t       ImageCubeFlags      = 4u;
+	static constexpr uint8_t       ImageDim3DFlags     = 8u; // v433: ImageDim3DDword()
+	// v424 (zero-compile plan step 2a): each buffer's stride and index stride (canonical packed
+	// stride, BufferStrideData) are read from BufferStrideDword() + buffer index (written per
+	// draw by RebindBuffers) instead of being baked in; the specialization keeps only the static
+	// bits (swizzle enable, ADD_TID). KYTY_BUFFER_STRIDE_DATA=0: constants as before.
+	uint8_t                        buffer_stride_count = 0; // (8 bits, MaxBuffers 64: keeps the layout's size)
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -494,8 +599,32 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t VerifyDword() const {
 		return WriteTrackDword() + (write_tracking ? 2u + 2u * memory_offset_count : 0u);
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t GuardDword() const {
 		return VerifyDword() + (srt_verify ? 4u : 0u);
+	}
+	[[nodiscard]] uint32_t ClipSpaceDword() const {
+		return GuardDword() + (loop_guard ? 2u : 0u);
+	}
+	[[nodiscard]] uint32_t ExportMappingDword() const {
+		return ClipSpaceDword() + (clip_space ? 6u : 0u);
+	}
+	[[nodiscard]] uint32_t BufferStrideDword() const {
+		return ExportMappingDword() + (export_mapping ? 2u : 0u);
+	}
+	[[nodiscard]] uint32_t ImageClassDword() const {
+		return BufferStrideDword() + buffer_stride_count;
+	}
+	[[nodiscard]] uint32_t ImageLayerDword() const {
+		return ImageClassDword() + ((image_flags & ImageClassFlags) != 0 ? 1u : 0u);
+	}
+	[[nodiscard]] uint32_t ImageCubeDword() const {
+		return ImageLayerDword() + ((image_flags & ImageLayerFlags) != 0 ? 1u : 0u);
+	}
+	[[nodiscard]] uint32_t ImageDim3DDword() const {
+		return ImageCubeDword() + ((image_flags & ImageCubeFlags) != 0 ? 1u : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return ImageDim3DDword() + ((image_flags & ImageDim3DFlags) != 0 ? 1u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -557,6 +686,9 @@ struct DescriptorSource {
 		uint32_t key_mask  = UINT32_MAX;
 		// No enumeration: the shader looks the key up in the bindless translation table.
 		bool     bindless  = false;
+		// Bindless through the storage array (BindlessStorage2D): the stores to a GPU-selected
+		// image, and the loads of the same descriptor in a pixel-ordered (POPS) section.
+		bool     storage   = false;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;
@@ -740,6 +872,9 @@ struct Program: ResourcePlan {
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
 	bool                          has_address_writes = false;
+	// The shader reads POPS_EXITING_WAVE_ID: a primitive-ordered pixel shader (POPS), whose
+	// overlapping pixels must run in primitive order (the emitter adds a fragment interlock).
+	bool                          uses_pops          = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;

@@ -28,6 +28,22 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// v420 (ledger carry-over): inside a RecoverableExitScope on this thread, EXIT, EXIT_IF and
+// EXIT_NOT_IMPLEMENTED throw RecoverableExit instead of ending the process (builds with
+// exceptions: clang-cl /EHsc; elsewhere they stay fatal). For work whose failure is expected and
+// harmless to drop: replaying a recorded shader permutation that may not fit this build.
+struct RecoverableExit {
+	std::string text;
+};
+class RecoverableExitScope {
+public:
+	RecoverableExitScope();
+	~RecoverableExitScope();
+	RecoverableExitScope(const RecoverableExitScope&)            = delete;
+	RecoverableExitScope& operator=(const RecoverableExitScope&) = delete;
+};
+[[nodiscard]] bool RecoverableExitsSupported();
+
 // Symbolised host call stack of the calling thread (Windows), empty elsewhere. Every fatal
 // report includes it; use it directly where a non-fatal oddity needs its caller named.
 std::string HostBacktrace();

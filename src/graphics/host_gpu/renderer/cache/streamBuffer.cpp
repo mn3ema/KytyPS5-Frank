@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/staleHooks.h"
+#include "common/fpsLog.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -8,10 +10,13 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <fmt/format.h>
 #include <cinttypes>
 #include <cstdio>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -19,6 +24,10 @@
 #include <string>
 #include <numeric>
 #include <vk_mem_alloc.h>
+
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
+#include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -63,7 +72,447 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 	return true;
 }
 
+
+// Every buffer with a device address, live and recently destroyed, so a GPU fault address
+// (VK_EXT_device_fault) can be named: which buffer, what guest range, alive or freed (and when).
+struct BdaEntry {
+	uint64_t device = 0, size = 0, cpu = 0;
+	uint64_t created_tick = 0, released_tick = 0;
+	std::chrono::steady_clock::time_point created, released;
+	MemoryUsage usage  = MemoryUsage::DeviceLocal;
+	bool        shared = false;
+	bool        no_bda = false; // a buffer without a device address, placed by a probe (KYTY_FAULT_MAP)
+};
+struct BdaRegistry {
+	std::unordered_map<const void*, uint64_t> probed; // buffers without a device address -> va
+	std::unordered_map<const void*, uint64_t> handle_va; // VkBuffer -> va (bindings a draw records)
+	std::mutex                   mutex;
+	std::map<uint64_t, BdaEntry> live;
+	std::vector<BdaEntry>        released; // ring
+	size_t                       released_next = 0;
+	uint64_t                     created_count = 0, released_count = 0;
+	// KYTY_FAULT_MAP=1: images too, at the device addresses of their memory (found with a probe
+	// buffer bound to the image's memory object).
+	struct Image {
+		uint64_t va = 0, size = 0;
+		uint32_t width = 0, height = 0, depth = 0, layers = 0, levels = 0, format = 0, usage = 0;
+		const void* image = nullptr; // VkImage, matched against img= in [gpu-hang] draw views
+		std::chrono::steady_clock::time_point created, released;
+	};
+	std::unordered_map<const void*, Image> live_images;
+	std::unordered_map<const void*, std::pair<uint64_t, uint64_t>> image_va; // VkImage -> memory range
+	std::vector<Image>                     released_images; // ring
+	size_t                                 released_images_next = 0;
+	uint64_t                               images_mapped = 0, images_unmapped = 0;
+};
+BdaRegistry& Bda() {
+	static auto* registry = new BdaRegistry; // never destroyed: buffers die at exit too
+	return *registry;
+}
+void BdaNoteCreated(uint64_t device, uint64_t size, uint64_t cpu, MemoryUsage usage, bool shared,
+                    uint64_t tick) {
+	if (device == 0) return;
+	auto& r = Bda();
+	std::lock_guard lock(r.mutex);
+	BdaEntry e;
+	e.device = device; e.size = size; e.cpu = cpu; e.usage = usage; e.shared = shared;
+	e.created_tick = tick;
+	e.created = std::chrono::steady_clock::now();
+	r.live[device] = e;
+	r.created_count++;
+}
+void BdaNoteReleased(uint64_t device, uint64_t tick) {
+	if (device == 0) return;
+	auto& r = Bda();
+	std::lock_guard lock(r.mutex);
+	const auto found = r.live.find(device);
+	if (found == r.live.end()) return;
+	auto e          = found->second;
+	e.released      = std::chrono::steady_clock::now();
+	e.released_tick = tick;
+	r.live.erase(found);
+	constexpr size_t Ring = 8192;
+	if (r.released.size() < Ring) {
+		r.released.push_back(e);
+	} else {
+		r.released[r.released_next] = e;
+		r.released_next = (r.released_next + 1) % Ring;
+	}
+	r.released_count++;
+}
+const char* BdaUsageName(MemoryUsage usage) {
+	switch (usage) {
+		case MemoryUsage::DeviceLocal: return "device-local";
+		case MemoryUsage::Upload: return "upload";
+		case MemoryUsage::Download: return "download";
+		case MemoryUsage::Stream: return "stream";
+	}
+	return "?";
+}
+void BdaPrint(const char* what, const BdaEntry& e, uint64_t address, uint64_t now_tick) {
+	const auto now = std::chrono::steady_clock::now();
+	const auto ms  = [&](std::chrono::steady_clock::time_point t) {
+		return std::chrono::duration<double, std::milli>(now - t).count();
+	};
+	char released[96] = "";
+	if (e.released_tick != 0 || e.released.time_since_epoch().count() != 0) {
+		std::snprintf(released, sizeof(released), " released %.1f ms ago at tick %" PRIu64,
+		              ms(e.released), e.released_tick);
+	}
+	std::fprintf(stderr,
+	             "[device-fault]   %s: dev 0x%016" PRIx64 "+0x%" PRIx64 " (fault at +0x%" PRIx64
+	             "%s) guest 0x%016" PRIx64 " %s%s, created %.1f ms ago at tick %" PRIu64 "%s"
+	             " (now tick %" PRIu64 ")\n",
+	             what, e.device, e.size, address - e.device,
+	             address >= e.device + e.size ? ", past its end" : "", e.cpu,
+	             BdaUsageName(e.usage), e.shared ? " shared" : (e.no_bda ? " no-BDA" : ""), ms(e.created), e.created_tick,
+	             released, now_tick);
+}
+
+bool FaultMapEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAULT_MAP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void PrintImage(const char* what, const BdaRegistry::Image& e, uint64_t address) {
+	const auto now = std::chrono::steady_clock::now();
+	const auto ms  = [&](std::chrono::steady_clock::time_point t) {
+		return std::chrono::duration<double, std::milli>(now - t).count();
+	};
+	char released[64] = "";
+	if (e.released.time_since_epoch().count() != 0) {
+		std::snprintf(released, sizeof(released), ", destroyed %.1f ms ago", ms(e.released));
+	}
+	std::fprintf(stderr,
+	             "[device-fault]   %s: image va 0x%016" PRIx64 "+0x%" PRIx64 " (fault at +0x%" PRIx64
+	             ") %ux%ux%u layers=%u levels=%u format=%u usage=0x%x img=%p, created %.1f ms ago%s\n",
+	             what, e.va, e.size, address - e.va, e.width, e.height, e.depth, e.layers, e.levels,
+	             e.format, e.usage, e.image, ms(e.created), released);
+}
+
+// The device address of a memory object's start: a small buffer bound there (0: not mappable).
+uint64_t ProbeMemoryBase(GraphicContext& graphics, VkDeviceMemory memory, uint32_t memory_type) {
+	const auto&        d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto         device = static_cast<VkDevice>(graphics.device);
+	VkBufferCreateInfo probe_info {};
+	probe_info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	probe_info.size        = 256;
+	probe_info.usage       = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	probe_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VkBuffer probe         = VK_NULL_HANDLE;
+	uint64_t base          = 0;
+	if (d.vkCreateBuffer(device, &probe_info, nullptr, &probe) == VK_SUCCESS) {
+		VkMemoryRequirements req {};
+		d.vkGetBufferMemoryRequirements(device, probe, &req);
+		if ((req.memoryTypeBits & (1u << memory_type)) != 0 &&
+		    d.vkBindBufferMemory(device, probe, memory, 0) == VK_SUCCESS) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = vk::Buffer(probe);
+			base                = graphics.device.getBufferAddress(address_info);
+		}
+		d.vkDestroyBuffer(device, probe, nullptr);
+	}
+	return base;
+}
+
 } // namespace
+
+// KYTY_FAULT_MAP=1: a buffer without a device address, registered at the address of its memory.
+void FaultMapNoteBuffer(GraphicContext& graphics, const void* owner, VmaAllocation allocation,
+                        uint64_t size, uint64_t cpu, MemoryUsage usage, uint64_t tick, bool created) {
+	if (!FaultMapEnabled()) {
+		return;
+	}
+	auto& r = Bda();
+	if (!created) {
+		uint64_t va = 0;
+		{
+			std::lock_guard lock(r.mutex);
+			const auto found = r.probed.find(owner);
+			if (found == r.probed.end()) return;
+			va = found->second;
+			r.probed.erase(found);
+		}
+		BdaNoteReleased(va, tick);
+		return;
+	}
+	if (allocation == nullptr) return;
+	VmaAllocationInfo ai {};
+	vmaGetAllocationInfo(graphics.allocator, allocation, &ai);
+	const auto base = ProbeMemoryBase(graphics, ai.deviceMemory, ai.memoryType);
+	if (base == 0) return;
+	const auto va = base + ai.offset;
+	BdaNoteCreated(va, size, cpu, usage, false, tick);
+	std::lock_guard lock(r.mutex);
+	if (auto found = r.live.find(va); found != r.live.end()) found->second.no_bda = true;
+	r.probed[owner] = va;
+}
+
+// KYTY_FAULT_MAP=1: VkBuffer -> device address of its memory (va 0 forgets it), so the buffer
+// bindings a draw or dispatch records can be compared with a fault address.
+void FaultMapNoteHandle(const void* handle, const void* owner, uint64_t device_address) {
+	if (!FaultMapEnabled() || handle == nullptr) {
+		return;
+	}
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	uint64_t        va = device_address;
+	if (va == 0 && owner != nullptr) {
+		if (const auto found = r.probed.find(owner); found != r.probed.end()) va = found->second;
+	}
+	if (va == 0) {
+		r.handle_va.erase(handle);
+	} else {
+		r.handle_va[handle] = va;
+	}
+}
+void FaultMapForgetHandle(const void* handle) {
+	if (!FaultMapEnabled() || handle == nullptr) {
+		return;
+	}
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	r.handle_va.erase(handle);
+}
+// KYTY_BDA_AUDIT: what a device address points into: "live", "destroyed N ms ago" or "nothing known".
+std::string DeviceAddressState(uint64_t address) {
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	if (auto it = r.live.upper_bound(address); it != r.live.begin()) {
+		--it;
+		if (address - it->second.device < it->second.size) {
+			return fmt::format("live buffer guest 0x{:x}", it->second.cpu);
+		}
+	}
+	const auto now = std::chrono::steady_clock::now();
+	double     best = -1;
+	uint64_t   cpu  = 0;
+	for (const auto& e: r.released) {
+		if (e.size != 0 && address >= e.device && address - e.device < e.size) {
+			const auto ms = std::chrono::duration<double, std::milli>(now - e.released).count();
+			if (best < 0 || ms < best) {
+				best = ms;
+				cpu  = e.cpu;
+			}
+		}
+	}
+	if (best >= 0) {
+		return fmt::format("DESTROYED buffer guest 0x{:x}, freed {:.0f} ms ago", cpu, best);
+	}
+	return "no buffer known there";
+}
+
+uint64_t FaultMapBufferVa(const void* handle) {
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	const auto      found = r.handle_va.find(handle);
+	return found == r.handle_va.end() ? 0 : found->second;
+}
+
+void FaultMapNoteImage(GraphicContext& graphics, VmaAllocation allocation,
+                       const vk::ImageCreateInfo& info, bool created, VkImage image) {
+	if (!FaultMapEnabled() || allocation == nullptr) {
+		return;
+	}
+	auto& r = Bda();
+	if (!created) {
+		std::lock_guard lock(r.mutex);
+		const auto found = r.live_images.find(allocation);
+		if (found == r.live_images.end()) return;
+		auto e     = found->second;
+		e.released = std::chrono::steady_clock::now();
+		r.live_images.erase(found);
+		r.image_va.erase(e.image);
+		constexpr size_t Ring = 8192;
+		if (r.released_images.size() < Ring) {
+			r.released_images.push_back(e);
+		} else {
+			r.released_images[r.released_images_next] = e;
+			r.released_images_next = (r.released_images_next + 1) % Ring;
+		}
+		return;
+	}
+	VmaAllocationInfo ai {};
+	vmaGetAllocationInfo(graphics.allocator, allocation, &ai);
+	// The device address of the memory object: a small buffer bound at its start.
+	const auto&        d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto         device = static_cast<VkDevice>(graphics.device);
+	VkBufferCreateInfo probe_info {};
+	probe_info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	probe_info.size        = 256;
+	probe_info.usage       = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	probe_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VkBuffer probe         = VK_NULL_HANDLE;
+	uint64_t base          = 0;
+	if (d.vkCreateBuffer(device, &probe_info, nullptr, &probe) == VK_SUCCESS) {
+		VkMemoryRequirements req {};
+		d.vkGetBufferMemoryRequirements(device, probe, &req);
+		if ((req.memoryTypeBits & (1u << ai.memoryType)) != 0 &&
+		    d.vkBindBufferMemory(device, probe, ai.deviceMemory, 0) == VK_SUCCESS) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = vk::Buffer(probe);
+			base                = graphics.device.getBufferAddress(address_info);
+		}
+		d.vkDestroyBuffer(device, probe, nullptr);
+	}
+	std::lock_guard lock(r.mutex);
+	if (base == 0) {
+		r.images_unmapped++;
+		return;
+	}
+	BdaRegistry::Image e;
+	e.va      = base + ai.offset;
+	e.size    = ai.size;
+	e.width   = info.extent.width;
+	e.height  = info.extent.height;
+	e.depth   = info.extent.depth;
+	e.layers  = info.arrayLayers;
+	e.levels  = info.mipLevels;
+	e.format  = static_cast<uint32_t>(info.format);
+	e.usage   = static_cast<uint32_t>(info.usage);
+	e.image   = image;
+	e.created = std::chrono::steady_clock::now();
+	r.live_images[allocation] = e;
+	r.image_va[image] = {e.va, e.size};
+	r.images_mapped++;
+}
+
+// diagnosticCheckpoints.cpp: the memory range of a live image (false: unknown or freed).
+bool FaultMapImageVa(const void* image, uint64_t& va, uint64_t& size) {
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	const auto      found = r.image_va.find(image);
+	if (found == r.image_va.end()) {
+		return false;
+	}
+	va   = found->second.first;
+	size = found->second.second;
+	return true;
+}
+
+// image.cpp (v125): the device address range of an image's memory, for the hang listing.
+std::string FaultMapImageRange(const void* image) {
+	if (!FaultMapEnabled() || image == nullptr) {
+		return {};
+	}
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	char            text[96];
+	for (const auto& [key, e]: r.live_images) {
+		if (e.image == image) {
+			std::snprintf(text, sizeof(text), " va=0x%016llx+0x%llx", static_cast<unsigned long long>(e.va),
+			              static_cast<unsigned long long>(e.size));
+			return text;
+		}
+	}
+	for (auto it = r.released_images.rbegin(); it != r.released_images.rend(); ++it) {
+		if (it->image == image) {
+			std::snprintf(text, sizeof(text), " va=0x%016llx+0x%llx (memory freed)",
+			              static_cast<unsigned long long>(it->va), static_cast<unsigned long long>(it->size));
+			return text;
+		}
+	}
+	return " (no memory record)";
+}
+
+// bufferCache.cpp (KYTY_FAULT_MAP=1): BDA page-table entries pointing into [lo, hi).
+void BdaShadowDescribe(uint64_t lo, uint64_t hi);
+
+// Declared where it is used (diagnosticCheckpoints.cpp).
+void DescribeDeviceAddress(uint64_t address, uint64_t precision, uint64_t now_tick);
+void DescribeDeviceAddress(uint64_t address, uint64_t precision, uint64_t now_tick) {
+	auto& r = Bda();
+	std::lock_guard lock(r.mutex);
+	const uint64_t lo = address & ~(precision > 0 ? precision - 1 : 0);
+	const uint64_t hi = lo + (precision > 0 ? precision : 1);
+	std::fprintf(stderr,
+	             "[device-fault] address 0x%016" PRIx64 ": %zu live buffers with device addresses "
+	             "(%" PRIu64 " created, %" PRIu64 " destroyed)\n",
+	             address, r.live.size(), r.created_count, r.released_count);
+	bool any = false;
+	auto it  = r.live.upper_bound(hi);
+	if (it != r.live.begin()) {
+		auto below = std::prev(it);
+		if (below->second.device + below->second.size > lo) {
+			BdaPrint("in live buffer", below->second, address, now_tick);
+			any = true;
+		} else {
+			BdaPrint("nearest live below", below->second, address, now_tick);
+		}
+	}
+	if (it != r.live.end()) {
+		BdaPrint("nearest live above", it->second, address, now_tick);
+	}
+	// Destroyed buffers that covered it, newest first.
+	std::vector<const BdaEntry*> hits;
+	for (const auto& e: r.released) {
+		if (e.device < hi && e.device + e.size > lo) hits.push_back(&e);
+	}
+	std::sort(hits.begin(), hits.end(),
+	          [](const BdaEntry* a, const BdaEntry* b) { return a->released > b->released; });
+	for (size_t i = 0; i < hits.size() && i < 6; i++) {
+		BdaPrint("in destroyed buffer", *hits[i], address, now_tick);
+		any = true;
+	}
+	if (FaultMapEnabled()) {
+		std::fprintf(stderr, "[device-fault]   images: %zu live mapped, %" PRIu64 " mapped, %" PRIu64
+		                     " not mappable\n",
+		             r.live_images.size(), r.images_mapped, r.images_unmapped);
+		const BdaRegistry::Image* below_image = nullptr;
+		const BdaRegistry::Image* above_image = nullptr;
+		for (const auto& [key, e]: r.live_images) {
+			if (e.va < hi && e.va + e.size > lo) {
+				PrintImage("in live image", e, address);
+				any = true;
+			} else if (e.va + e.size <= lo) {
+				if (below_image == nullptr || e.va > below_image->va) below_image = &e;
+			} else if (e.va >= hi) {
+				if (above_image == nullptr || e.va < above_image->va) above_image = &e;
+			}
+		}
+		// v121: the live images either side, to compare with what Aftermath says lives there.
+		if (below_image != nullptr) PrintImage("nearest live image below", *below_image, address);
+		if (above_image != nullptr) PrintImage("nearest live image above", *above_image, address);
+		std::vector<const BdaRegistry::Image*> image_hits;
+		for (const auto& e: r.released_images) {
+			if (e.va < hi && e.va + e.size > lo) image_hits.push_back(&e);
+		}
+		std::sort(image_hits.begin(), image_hits.end(),
+		          [](const auto* a, const auto* b) { return a->released > b->released; });
+		for (size_t i = 0; i < image_hits.size() && i < 6; i++) {
+			PrintImage("in destroyed image", *image_hits[i], address);
+			any = true;
+		}
+		// v122: what the host did with these images (bindless slots, set-0 binds, attachments).
+		for (const auto& [key, e]: r.live_images) {
+			if (e.va < hi && e.va + e.size > lo) {
+				ImageHistory::Describe(static_cast<VkImage>(const_cast<void*>(e.image)), stderr);
+			}
+		}
+		for (size_t i = 0; i < image_hits.size() && i < 3; i++) {
+			ImageHistory::Describe(static_cast<VkImage>(const_cast<void*>(image_hits[i]->image)), stderr);
+		}
+		if (below_image != nullptr) {
+			ImageHistory::Describe(static_cast<VkImage>(const_cast<void*>(below_image->image)), stderr);
+		}
+		if (above_image != nullptr) {
+			ImageHistory::Describe(static_cast<VkImage>(const_cast<void*>(above_image->image)), stderr);
+		}
+	}
+	if (!any) {
+		std::fprintf(stderr, "[device-fault]   no buffer (live or among the last %zu destroyed) covers it\n",
+		             r.released.size());
+	}
+	BdaShadowDescribe(lo, hi);
+	std::fflush(stderr);
+}
+
+VmaPool BufferPoolFor(VmaAllocator allocator, const VkBufferCreateInfo& info,
+                      const VmaAllocationCreateInfo& alloc_info);
+void GpuPoolNoteAllocation(VmaAllocator allocator, VmaAllocation allocation); // vma.cpp
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
@@ -75,6 +524,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// KYTY_DMA_READBACK: readbacks copy from these on a transfer-only queue family.
+	const std::array<uint32_t, 2> sharing_families {graphics.queue_family, graphics.transfer_family};
+	if (graphics.transfer_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = sharing_families.data();
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
@@ -94,7 +550,29 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
             graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &create_info,
             &native_buffer, &m_allocation, &allocation_result));
 	};
-	auto result = create(allocation_info);
+	vk::Result result = vk::Result::eErrorOutOfDeviceMemory;
+	if (usage == MemoryUsage::DeviceLocal) {
+		// KYTY_BUFFER_POOL_MB (vma.cpp): placed in a never-released pool instead of its own memory.
+		if (const auto pool = BufferPoolFor(graphics.allocator,
+		                                    *static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                                    allocation_info);
+		    pool != VK_NULL_HANDLE) {
+			auto pooled  = allocation_info;
+			pooled.flags &= ~static_cast<VmaAllocationCreateFlags>(
+			    VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT | VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+			pooled.pool = pool;
+			result      = create(pooled);
+			if (result != vk::Result::eSuccess) {
+				native_buffer = VK_NULL_HANDLE;
+				m_allocation  = nullptr;
+			} else {
+				GpuPoolNoteAllocation(graphics.allocator, m_allocation);
+			}
+		}
+	}
+	if (result != vk::Result::eSuccess) {
+		result = create(allocation_info);
+	}
 	if (result != vk::Result::eSuccess) {
 		// The heap it prefers is out of budget: video memory, on a 4-8 GB card, for the game's
 		// large buffers. As images do (GraphicContext::CreateImage), take system memory and pay in
@@ -129,12 +607,19 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 
 	m_buffer = native_buffer;
+	StaleHooksNoteBuffer(native_buffer, size, with_bda ? "VMA, BDA" : "VMA", true);
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
 	}
+	BdaNoteCreated(m_device_address, size, cpu_address, usage, false, scheduler.CurrentTick());
+	if (m_device_address == 0) {
+		FaultMapNoteBuffer(graphics, this, m_allocation, size, cpu_address, usage,
+		                   scheduler.CurrentTick(), true);
+	}
+	FaultMapNoteHandle(static_cast<VkBuffer>(m_buffer), this, m_device_address);
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
@@ -221,6 +706,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
+		BdaNoteCreated(m_device_address, size, cpu_address, MemoryUsage::DeviceLocal, true,
+		               scheduler.CurrentTick());
+		FaultMapNoteHandle(static_cast<VkBuffer>(m_buffer), nullptr, m_device_address);
 	}
 }
 
@@ -229,6 +717,8 @@ void Buffer::ReleaseImport() noexcept {
 		return;
 	}
 	const auto& d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+	BdaNoteReleased(m_device_address, m_scheduler->CurrentTick());
+	FaultMapForgetHandle(static_cast<VkBuffer>(m_buffer));
 	const auto  device = static_cast<VkDevice>(m_graphics->device);
 	if (m_buffer != nullptr) {
 		d.vkDestroyBuffer(device, static_cast<VkBuffer>(m_buffer), nullptr);
@@ -240,6 +730,16 @@ void Buffer::ReleaseImport() noexcept {
 }
 
 Buffer::~Buffer() {
+	if (m_buffer != nullptr) {
+		FaultMapForgetHandle(static_cast<VkBuffer>(m_buffer));
+	}
+	if (m_device_address == 0 && m_graphics != nullptr && m_scheduler != nullptr) {
+		FaultMapNoteBuffer(*m_graphics, this, nullptr, 0, 0, MemoryUsage::DeviceLocal,
+		                   m_scheduler->CurrentTick(), false);
+	}
+	if (m_device_address != 0 && m_scheduler != nullptr) {
+		BdaNoteReleased(m_device_address, m_scheduler->CurrentTick());
+	}
 	if (m_imported != VK_NULL_HANDLE) {
 		const auto& d      = VULKAN_HPP_DEFAULT_DISPATCHER;
 		const auto  device = static_cast<VkDevice>(m_graphics->device);
@@ -250,7 +750,8 @@ Buffer::~Buffer() {
 		return;
 	}
 	if (m_buffer != nullptr) {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		StaleHooksNoteBuffer(static_cast<VkBuffer>(m_buffer), m_size, nullptr, false);
+		m_graphics->DestroyBufferMemory(static_cast<VkBuffer>(m_buffer), m_allocation);
 	}
 }
 
@@ -273,7 +774,9 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+	// Any host-mapped buffer (Download, Stream, Upload) may be invalidated: vmaInvalidateAllocation is
+	// valid for every host-visible allocation. The device-loss audit reads Stream buffers this way.
+	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
@@ -473,7 +976,7 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		{
 			KYTY_PROFILER_BLOCK("StreamBuffer::WaitPendingOperations (ring wrap wait)");
 			// KYTY_FPS_LOG: [ring-wait] per 5 s, the waits and their time by ring size.
-			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+			static const bool log = Common::FpsLogDiagnostics();
 			const auto        wait_start = std::chrono::steady_clock::now();
 			Scheduler().Wait(watch.tick);
 			if (log) {

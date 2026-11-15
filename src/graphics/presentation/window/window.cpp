@@ -1,6 +1,8 @@
 #include "graphics/presentation/window.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompileProgress.h"
 
 #include <SDL3/SDL.h>
+#include <algorithm>
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -27,6 +29,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -187,6 +190,37 @@ static void ToggleDesktopFullscreen() {
 	}
 }
 
+// v438i (Mac 11-15): skipping the startup shader preparation. Open: Esc or Cross (J); in the
+// confirmation, Yes: Y, Circle (L) or Enter; No: N, Square (K) or Esc. Returns true when the
+// input was taken (only while the startup wait offers the skip).
+enum class SkipInput { None, Open, Yes, No };
+static bool PrecompileSkipInput(SkipInput action, bool escape) {
+	if (action == SkipInput::None) {
+		return false;
+	}
+	auto& progress = GetShaderPrecompileProgress();
+	if (!progress.skip_offered.load(std::memory_order_acquire) ||
+	    progress.startup_wait_done.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const int state = progress.skip_state.load(std::memory_order_acquire);
+	if (state == 0) {
+		if (action == SkipInput::Open) {
+			progress.skip_state.store(1, std::memory_order_release);
+		}
+		return true;
+	}
+	if (state == 1) {
+		if (action == SkipInput::Yes) {
+			progress.skip_state.store(2, std::memory_order_release);
+		} else if (action == SkipInput::No || escape) {
+			progress.skip_state.store(0, std::memory_order_release);
+		}
+		return true;
+	}
+	return false;
+}
+
 static void GameEventKeyboard(const EventKeyboard& key) {
 	static SDL_Keycode fullscreen_key = SDLK_UNKNOWN;
 
@@ -196,6 +230,20 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 	     (key.pressed ? "pressed" : ""), (key.released ? "released" : ""),
 	     (key.repeat ? "repeat" : ""), key.scan_code, key.key_code, key.mod);
 #endif
+
+	// v438i: skipping the startup shader preparation (PrecompileSkipInput).
+	if (key.down && !key.repeat) {
+		const auto code   = key.key_code;
+		const auto action = code == SDLK_ESCAPE                       ? SkipInput::Open
+		                    : code == SDLK_J                          ? SkipInput::Open
+		                    : (code == SDLK_Y || code == SDLK_L ||
+		                       code == SDLK_RETURN || code == SDLK_KP_ENTER) ? SkipInput::Yes
+		                    : (code == SDLK_N || code == SDLK_K)      ? SkipInput::No
+		                                                              : SkipInput::None;
+		if (PrecompileSkipInput(action, code == SDLK_ESCAPE)) {
+			return;
+		}
+	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
@@ -288,6 +336,17 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
 	EXIT_NOT_IMPLEMENTED(f.remapped);
+
+	if (f.down && !f.axis) {
+		const auto pad    = ControllerButtonToPadButton(f.button);
+		const auto action = pad == Controller::PAD_BUTTON_CROSS    ? SkipInput::Open
+		                    : pad == Controller::PAD_BUTTON_CIRCLE ? SkipInput::Yes
+		                    : pad == Controller::PAD_BUTTON_SQUARE ? SkipInput::No
+		                                                           : SkipInput::None;
+		if (PrecompileSkipInput(action, false)) {
+			return;
+		}
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -913,7 +972,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle() {
+void WindowContext::UpdateTitle(bool new_frame) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -938,8 +997,12 @@ void WindowContext::UpdateTitle() {
 
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	frame_num++;
-	fps_frames++;
+	// Only guest flips count: with a system overlay up, the presenter repeats the last frame at
+	// every vblank, which used to show 60 fps whatever the game did (Mac, 10-25 14:17).
+	if (new_frame) {
+		frame_num++;
+		fps_frames++;
+	}
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
@@ -948,22 +1011,75 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	// The startup shader precompile (plan 4.12), while it runs.
+	std::string precompile;
+	if (const auto& progress = GetShaderPrecompileProgress();
+	    progress.importing.load(std::memory_order_acquire)) {
+		precompile = fmt::format(" | Preparing shaders: reading the cache {}/{}",
+		                         progress.import_done.load(std::memory_order_relaxed),
+		                         progress.import_total.load(std::memory_order_relaxed));
+	} else if (progress.active.load(std::memory_order_acquire)) {
+		const auto total = std::max(progress.total.load(std::memory_order_relaxed), 1u);
+		const auto done  = std::min(progress.done.load(std::memory_order_relaxed), total);
+		precompile       = fmt::format(" | {} {}/{} ({}%)", progress.skipped.load(std::memory_order_relaxed) ? "Preparing shaders in the background" : "Compiling shaders", done, total,
+		                               static_cast<uint32_t>(uint64_t {done} * 100u / total));
+	} else if (progress.ledger_known.load(std::memory_order_acquire) && progress.SecondsSinceFinish() >= 0.0) {
+		// The whole session after the replay: the ledger's size and what this session added.
+		const auto shaders = progress.ledger_total.load(std::memory_order_relaxed);
+		const auto base    = progress.ledger_base.load(std::memory_order_relaxed);
+		precompile = fmt::format(" | Shaders {} (+{} new)", shaders, shaders > base ? shaders - base : 0u);
+		if (progress.pipelines_active.load(std::memory_order_acquire)) {
+			precompile += fmt::format(" | Compiling pipelines {}/{}",
+			                          progress.pipelines_done.load(std::memory_order_relaxed),
+			                          progress.pipelines_total.load(std::memory_order_relaxed));
+		} else if (const auto pipes_new = progress.pipelines_new.load(std::memory_order_relaxed);
+		           progress.pipelines_finished.load(std::memory_order_acquire) &&
+		           (progress.pipelines_total.load(std::memory_order_relaxed) != 0u || pipes_new != 0u)) {
+			precompile += fmt::format(" | Pipelines {} (+{} new)",
+			                          progress.pipelines_built.load(std::memory_order_relaxed) + pipes_new, pipes_new);
+		}
+	}
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}]{}, frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, precompile, frame_num, current_fps);
 
+	// The title is set on the main thread. This ran on the present thread at every present and
+	// waited for the main thread (SDL_RunOnMainThread with wait_complete): when the main thread's
+	// wakeup was missed it slept on until its next event timeout, and the present thread -- which
+	// holds the flip queue -- with it, so the GPU thread waited for a flip and the game stopped
+	// for ~3 s, every 30-60 s (plan 4.14, [hitch] reports of 2026-10-25). Now the update is
+	// queued without waiting, at most 4 a second and only when the text changed, and only one is
+	// ever in flight.
+	static std::string                last_text;
+	static uint64_t                   last_update = 0;
+	static std::atomic<bool>          in_flight {false};
+	if (text == last_text || now - last_update < frequency / 4u ||
+	    in_flight.load(std::memory_order_acquire)) {
+		return;
+	}
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+		SDL_Window*        window;
+		std::string        text;
+		std::atomic<bool>* in_flight;
+	};
+	auto* update = new TitleUpdate {window, text, &in_flight};
+	in_flight.store(true, std::memory_order_release);
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        auto* title = static_cast<TitleUpdate*>(data);
+		        SDL_SetWindowTitle(title->window, title->text.c_str());
+		        title->in_flight->store(false, std::memory_order_release);
+		        delete title;
+	        },
+	        update, false)) {
+		in_flight.store(false, std::memory_order_release);
+		delete update;
+		return;
+	}
+	last_text   = std::move(text);
+	last_update = now;
 }
 
 } // namespace Libs::Graphics

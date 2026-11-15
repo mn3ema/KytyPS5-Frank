@@ -62,6 +62,18 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// The async-compute command-processor thread (KYTY_ASYNC_THREAD).
+	[[nodiscard]] static bool IsAsyncThread() noexcept;
+	// KYTY_DRAW_PIPE: marks the calling thread (the draw thread, stage B) as a GPU thread.
+	static void MarkDrawPipeThread() noexcept;
+	// KYTY_ASYNC_THREAD=1, or KYTY_SYNC_TOGGLE_MODE=async: the async-compute thread exists (and
+	// both threads take the renderer mutex around the renderer).
+	[[nodiscard]] static bool AsyncThreadConfigured() noexcept;
+	// The async-compute thread runs the compute queues now (always with KYTY_ASYNC_THREAD=1).
+	[[nodiscard]] static bool AsyncThreadActiveNow() noexcept;
+	// After an off-lock window: binds this thread's command processor's registers to the
+	// scheduler's command buffer again (the other thread may have bound its own).
+	static void RebindCurrentProcessor();
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -86,6 +98,8 @@ private:
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
 		uint64_t                  srt_wait_tick     = 0; // KYTY_SRT_DEFER: run again once free
+		// g_cpu_dirty_epoch when the guest submitted: the CPU writes its commands may read.
+		uint64_t                  cpu_epoch         = 0;
 		// KYTY_COPY_SUBMISSIONS=1: the command words as they were at submission (the spans point
 		// here), in case the game rewrites the buffer before the GPU thread reaches it.
 		std::shared_ptr<std::vector<uint32_t>> owned_words;
@@ -97,6 +111,10 @@ private:
 	// A submission waits in a queue and is not blocked (KYTY_COALESCE_SUBMITS).
 	bool              HasReadySubmission();
 	static void       ThreadRun(void* data);
+	// KYTY_ASYNC_THREAD=1: role 0 runs the graphics queue and the commands, role 1 (its own
+	// thread) the compute queues; without it role 0 runs everything.
+	static void       ThreadRunRole(GuestGpu* gpu, uint32_t role);
+	[[nodiscard]] static uint32_t RoleOf(uint32_t queue_id) noexcept;
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
 	RenderContext&                                 m_renderer;
@@ -107,9 +125,14 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
-	uint32_t                                       m_next_queue        = 0;
+	uint32_t                                       m_next_queue[2]     = {0, 1};
 	uint32_t                                       m_submission_count  = 0;
-	bool                                           m_processing        = false;
+	bool                                           m_processing[2]     = {false, false};
+	uint32_t                                       m_role_count[2]     = {0, 0};
+	// A submission of the queue is being processed (outside m_queue_mutex): with the toggle
+	// (KYTY_SYNC_TOGGLE_MODE=async) either thread can run a compute queue, one at a time.
+	std::array<bool, QueueCount>                   m_queue_busy {};
+	Common::CondVar                                m_async_work;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
@@ -136,6 +159,7 @@ private:
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
+	std::jthread    m_async_thread;
 
 	friend class CommandProcessor;
 };

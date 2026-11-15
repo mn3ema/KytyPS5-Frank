@@ -7,23 +7,32 @@ I'm testing it only on Marvel's Wolverine for now, the tests are all done on my 
 I'm sharing this for anyone who wants to try it and add to it, if you can help us with the issues we're facing that would be awesome.
 This is where it stands right now:
 
-## Where it stands (October 21, 2026, v0.3)
+## Where it stands (November 2026, v0.4)
 
 **Game:** Marvel's Wolverine (PPSA03671, version 01.001.005).
 
-| Scene (RTX 5090 Laptop) | v0.3 FPS |
-|---|---|
-| First rooftop, standing | 21–22 |
-| First rooftop, turning the camera | ~25 |
-| Sewer, standing | 23 |
-| Sewer, turning the camera | ~14 |
-| Grass / jungle, standing | 19 |
-| A Fidelity-mode save, standing | 19 |
-| Title screen and opening cutscene (v0.2, not re-measured) | 24–28 |
+| Scene (RTX 5090 Laptop, Performance mode) | Typical FPS | Lowest 1-second average |
+|---|---|---|
+| Title screen (with a save) | 21–25 | 21 |
+| Opening cinematic, first shot | 49–53 | 49 |
+| Opening cinematic, the rest | 28–38 | 9 (at scene cuts) |
+| First gameplay, Trask Outpost (jungle at night, rain) | 18–21 | 10 |
 
-Turning the camera used to drop to single digits (rooftop ~13, sewer ~9–12); in v0.3 it no longer does.
+Measured with v0.4 on the test laptop (new game, first start with the shipped shader list). The jungle gameplay is the limit right now: the emulator's GPU thread is at its limit there, and that is what the next versions go after.
+
+v0.3 measured other spots (see "New in v0.3" below); the closest match, grass / jungle standing, was 19 FPS.
 
 Target: 60 FPS in Performance mode, 30 in Fidelity.
+
+### New in v0.4
+
+- **Shader compile stutter mostly gone, even on a first play.** The download ships a shader list for Wolverine; the first start builds it before the title screen ("Preparing pipelines", about 45–50 minutes on the test laptop, resumable; Esc or Cross skips it, with a warning that the game may stutter). In a 10-minute cold run of the opening and first gameplay, 7 shaders still compiled during play, a few milliseconds each (875 in a 40-minute session before). A restart compiles nothing.
+- **Graphics pipeline libraries**: one piece per shader stage, prepared ahead and linked in microseconds; fewer shader variants (more state passed per draw); caches carried over between builds.
+- **Correct aspect ratio** (black bars instead of a stretched picture) and **borderless full screen** with F11 or Alt+Enter.
+- **Fixed:** the "device lost" crash every 20–40 minutes, holes in Wolverine's skin, flickering decals/dirt/cracks, black silhouettes after ~25 minutes, exploded character bodies, an upgrade-menu crash, a crash after ~45 minutes, the PlayGo stop at "Reached end of initial game content installed".
+- **Faster:** multi-draw replay working again, readbacks on the copy engine (+15%), merged barriers and other GPU-thread savings.
+
+The full list is in the [v0.4 release notes](../../releases/tag/v0.4).
 
 ### Gameplay video (v0.3)
 
@@ -46,7 +55,7 @@ From v0.2 (FPS is in each window title, Performance mode, RTX 5090 Laptop). Clic
 
 **Working:** boots, menus, cutscenes and gameplay, with correct terrain, foliage, lighting and ray-traced passes.
 
-### New in v0.3
+### New in v0.3 (October 21)
 
 - **Faster, most of all when turning the camera.** The game's call shaders (shaders that call functions through per-object tables) were re-resolved on every dispatch: the reuse window (50 ms) was shorter than one frame at 18 FPS, and a shader that can't be compiled was re-processed for every new object only to be refused again. Turning the camera on the first rooftop went from ~13 to ~25 FPS.
 - **Host zones and sync skip on by default.** The memory ranges the game writes every frame get a buffer shared with the GPU instead of a page fault per write, and repeated buffer syncs with nothing changed are skipped. Standing FPS up 7–18% depending on the scene. `KYTY_HOST_ZONES=0` / `KYTY_SYNC_SKIP=0` turn them off.
@@ -86,50 +95,55 @@ Stability:
 
 ## Known issues and caveats
 
-- **Tested only on Marvel's Wolverine, and only on an NVIDIA RTX 5090 Laptop.** Two testers run it on AMD (RX 7600, RX 7900 XT); v0.2 has their first fixes. Intel GPUs and other games are untested.
-- **Occasional GPU "device lost" crash** (about once every 20–40 minutes of play on the test laptop). The GPU reads an address just past a mapped buffer. The two crashes seen with v0.3 both had the particle draws of `8fb896cb9412ab56` / `4efbcf79c36d8adf` in flight. Under investigation.
-- **Occasional freeze.** The game can stop responding in some scene changes, for example the drop-off scene below (frame counter stuck). Restarting gets past it. v0.3 empties one kind of runaway GPU job that caused hangs like this; whether that was the cause of these freezes isn't confirmed yet.
+- **Tested only on Marvel's Wolverine, and only on an NVIDIA RTX 5090 Laptop.** Nothing new for AMD in v0.4. Intel GPUs and other games are untested.
+- **Short hitches (100–250 ms) when a new area or a lot of new content appears**, also on a restart. They come from the emulator's GPU thread being at its limit, not from shader compiles.
+- **First launch is long** and writes a large cache next to the emulator (about 25 GB); caches are per GPU and driver, so a driver update means a new warm-up. Set the NVIDIA shader cache size to Unlimited.
+- **A rare GPU hang** in a chain of compute shaders is still open (seen once in a 16-minute session).
+- **Cards with 16 GB or less** will run with texture trimming much of the time (the jungle gameplay uses 15–17 GB here).
+- **Occasional freeze in some scene changes** (reported in v0.3, for example the drop-off scene; frame counter stuck). Not seen in the v0.4 test runs, but not confirmed fixed. Restarting gets past it.
+- **The blue scent trail in the sewer area doesn't draw** (its pipeline never finishes compiling on NVIDIA and is skipped).
+- **Red squares and streaks instead of some particles** are worked around since v0.2 (particle shader `4efbcf79c36d8adf`, GS user-data slot 28); the root cause is still open.
+- **The download includes a shader list made from the game** (`_ShaderList`, shader code taken from Wolverine). You still need your own legally dumped copy of the game; no game files are otherwise provided or linked.
 
-  ![Freeze at the drop-off scene](docs/screenshots/frank/07_freeze.jpg)
-- **The blue scent trail in the sewer area doesn't draw** (its pipeline is skipped, see v0.3 above).
-- **Flickering textures** in some places, for example cracks in the ground.
-- **Red squares and red streaks instead of some particles** (title screen, rain and embers in some scenes; worked around in v0.2, the root cause is still open). The particle shader (ES `4efbcf79c36d8adf`) adds GS user-data slot 28 (s36) to the instance ID to pick its one 16-byte record. The game sets slot 28 with a 29-register `SET_SH_REG` whose last dword is leftover command-buffer data on some frames (`0x00100011`, even a PM4 header), so the index lands past the record and the shader reads zeros. Forcing it to 0 gives the correct soft particles. What we've ruled out: the dword doesn't change in the 40 ms after we parse it, the GPU doesn't write it, and the draw (`DRAW_INDEX_INDIRECT_MULTI`, no base-vertex/start-instance/draw-index register) writes no user data. So either the real GPU doesn't load that register for this shader, or it treats that out-of-range index differently. It's a good place to help if you know RDNA2 merged ES/GS user SGPRs or PS5 command buffers.
-- **You need your own legally dumped copy of the game.** No games or system files are provided or linked.
+## Where we're struggling, and what's next
 
-## Where we're struggling, and what we tried
+Measured in the jungle gameplay on the test laptop:
+- **The GPU now takes about 34–36 ms per frame**, and the emulator's GPU thread (which walks the game's command stream in order) is right behind it at 25–32 ms. Both have to drop for 60 FPS.
+- Of the GPU frame, about 11 ms is gaps between the game's work (barriers, copies, sync), about 18 ms is draws and about 5 ms compute. One pixel shader alone takes about 7 ms: the emulator holds the GPU's draw-order lock for the whole shader, where the game needs it only for its last few percent.
+- When a new area appears, the GPU thread is already near its limit, so the extra work for the new content shows up as 100–250 ms frames.
 
-**The frame rate is held back by waits, not by one slow part.** Measured in jungle gameplay:
-- The game submits a frame, then waits until the emulator has translated it and the GPU has run it.
-- The game's 5 job threads stop about 9 times a frame to read GPU results. Each read is a full GPU round trip; on a PS5 the CPU and GPU share memory, so it costs nothing there.
-- The GPU spends about 20 ms per frame on the game's shaders and about 30 ms on everything between them (copies, barriers, syncs). The frame is split into about 160 GPU submissions (about 62 for the game's graphics submissions, 46 for its compute submissions, 45 periodic flushes), but halving them didn't help, so the cost is in the work between the shaders rather than the number of submissions. We haven't broken that 30 ms down yet.
-- The command processor (one thread) needs about 40 ms per frame for ~2,400 draws and dispatches.
-
-**Tried, with little or no FPS change:**
-- Making the command thread ~25% faster.
-- Skipping game-thread readback waits entirely (measurement only).
-- Snapshot reads: average read wait 4.5 → 1.9 ms.
-- Skipping repeated buffer syncs.
-- A draw-preparation thread.
-- Deferring dispatches whose resource tables the GPU just wrote.
-- Halving the GPU submissions (about 160 → 75 per frame) by recording back-to-back game submissions into one: slightly slower, because the game's readbacks then wait longer (`KYTY_COALESCE_SUBMITS=1`).
-- Flushing draws to the GPU less often (every 64 or 256 draws instead of 16): slower.
-
-Each of these sped up one part, but the frame still waits on the next link in the chain.
-
-**Next:**
-1. Group game-thread reads into one GPU sync.
-2. Put buffers the game reads back every frame in memory both the CPU and GPU can reach (Resizable BAR), so reads need no copy.
-3. Check how many frames ahead the game may run compared with a real PS5.
-4. Spread command processing across CPU cores.
+**Next (v0.5):**
+1. Hold the draw-order lock only where the game asks for it (the 7 ms shader).
+2. Drop barriers between compute passes that don't depend on each other.
+3. Name and fix the work behind the 100 ms+ frames (v0.4 already logs it with `KYTY_HITCH_COST_MS=100`).
+4. Prepared shaders for parts of the game nobody has recorded yet.
 
 ## How to run
 
 Needs 64-bit Windows 10/11, a CPU with AVX2 (Intel Haswell from 2013 or AMD Zen, and newer) and a Vulkan 1.3 GPU with a recent driver.
 
-1. Download the latest `KytyPS5-Frank-...-win64.zip` from the [Releases](../../releases) page and unzip it.
-2. You need your own legally dumped copy of the game. No games or system files are provided or linked.
-3. Open `Play.bat` in a text editor and set `GAME` to your game folder (the one with `eboot.bin`).
-4. Double-click `Play.bat`. The log goes to `kyty_log.txt` next to it. `launcher.exe`, the KytyPS5 launcher, works too.
+1. Download the latest `KytyPS5-Frank-...-win64.zip` from the [Releases](../../releases) page and unzip it to a folder on a drive with plenty of free space (the first start writes a large cache next to the emulator).
+2. You need your own legally dumped copy of the game, version 01.001.005. No games or system files are provided or linked.
+3. Open `Play.bat` in a text editor (right-click > Edit) and set `GAME` to your game folder, the one that contains `eboot.bin`, for example `set GAME=D:\Games\Wolverine`. If you used v0.3, delete its `_ShaderCache` and `_PipelineCache` folders.
+4. Double-click `Play.bat`. The first start shows "Preparing pipelines" for a long time (about 45–50 minutes on the test laptop); leave it running and the game starts by itself when it's done. To play at once instead, press Esc or Cross and confirm with Y / Circle (the game may stutter until the rest is prepared in the background).
+5. Later starts take under a minute. The log goes to `kyty_log.txt` next to `Play.bat`; please attach it when you report a problem.
+
+Settings are environment variables: to change one, add a line such as `set KYTY_KEEP_ASPECT=0` to `Play.bat` before the line that starts `kyty_emulator.exe`. `launcher.exe`, the KytyPS5 launcher, works too, but it doesn't restart a first start that a driver crash cut off.
+
+### Controls
+
+A game controller should work too (only the keyboard was tested for this release). The keyboard is mapped like this:
+
+| PS5 button | Key | | PS5 button | Key |
+|---|---|---|---|---|
+| Cross | J | | L1 / R1 | Q / E |
+| Circle | L | | L2 / R2 | Z / C |
+| Square | K | | L3 / R3 | Left Shift / Left Ctrl |
+| Triangle | I | | Options | Enter |
+| D-pad | Arrow keys | | Touchpad (left / right) | Backspace / Tab |
+| Left stick | W A S D | | Right stick | T F G H |
+
+F7 uses the mouse as the right stick (F7 again releases it). F11 or Alt+Enter: full screen.
 
 The settings tuned for Wolverine are built in. To start with plain KytyPS5 settings, set the environment variable `KYTY_FRANK_DEFAULTS=0`.
 

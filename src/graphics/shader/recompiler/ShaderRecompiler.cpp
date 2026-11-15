@@ -98,6 +98,13 @@ const char* StageName(ShaderType stage) {
 }
 
 void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
+	// Also to stderr (first 256): a dispatcher shader stops after a bounded number of block
+	// transitions (KYTY_DISPATCHER_MAX_TRANSITIONS), which can cut long per-pixel loops short.
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1) < 256) {
+		std::fprintf(stderr, "[dispatcher] %s 0x%016" PRIx64 " (%s)\n", StageName(options.stage),
+		             options.shader_hash, phase);
+	}
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
@@ -535,6 +542,42 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     static_cast<unsigned>(options.stage));
 	}
 
+	// KYTY_PATCH_GUEST=<hash>@<pc hex>=<word hex>[+<word hex>...][/...] (diagnostics, 11-13 hex
+	// holes): replaces guest code dwords of that shader before decoding, e.g. a V_MOV_B32 over a
+	// culling decision. The shader keeps its hash; the switch is part of the disk cache key.
+	std::vector<uint32_t> patched_code;
+	if (const char* patches = std::getenv("KYTY_PATCH_GUEST"); patches != nullptr) {
+		const auto        hash_text = fmt::format("{:016x}", options.shader_hash);
+		std::string_view  rest(patches);
+		while (!rest.empty()) {
+			const auto end   = rest.find('/');
+			const auto entry = rest.substr(0, end);
+			rest             = end == std::string_view::npos ? std::string_view() : rest.substr(end + 1);
+			const auto at    = entry.find('@');
+			const auto eq    = entry.find('=');
+			if (at == std::string_view::npos || eq == std::string_view::npos || eq < at ||
+			    entry.substr(0, at) != hash_text) {
+				continue;
+			}
+			if (patched_code.empty()) patched_code.assign(code.begin(), code.end());
+			auto pc = std::strtoull(std::string(entry.substr(at + 1, eq - at - 1)).c_str(), nullptr, 16);
+			std::string_view words = entry.substr(eq + 1);
+			while (!words.empty()) {
+				const auto plus = words.find('+');
+				const auto word = std::strtoul(std::string(words.substr(0, plus)).c_str(), nullptr, 16);
+				words = plus == std::string_view::npos ? std::string_view() : words.substr(plus + 1);
+				if (pc / 4u < patched_code.size()) {
+					std::fprintf(stderr, "[patch-guest] %s pc=0x%04llx %08x -> %08lx\n",
+					             hash_text.c_str(), static_cast<unsigned long long>(pc),
+					             patched_code[pc / 4u], static_cast<unsigned long>(word));
+					patched_code[pc / 4u] = static_cast<uint32_t>(word);
+				}
+				pc += 4u;
+			}
+		}
+		if (!patched_code.empty()) code = patched_code;
+	}
+
 	// The phases as Tracy zones, each with the stage and hash as its text.
 	Profiler::Phases phases;
 	phases.SetText("%s 0x%016" PRIx64, StageName(options.stage), options.shader_hash);
@@ -909,7 +952,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword,
 	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
-	                         options.input_info.compute->lds_storage);
+	                         options.input_info.compute->lds_storage,
+	                     ir.stage != ShaderType::Compute && ir.stage != ShaderType::Pixel &&
+	                         options.input_info.vertex != nullptr &&
+	                         options.input_info.vertex->clip_space.enabled);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

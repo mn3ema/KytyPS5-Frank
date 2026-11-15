@@ -1,4 +1,14 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/drawPipe.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/shaderBindings.h"
+#include "graphics/host_gpu/renderer/syncToggle.h"
+#include "common/tracePoints.h"
+#include "graphics/host_gpu/renderer/reuseProbe.h"
+
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
+#include "graphics/host_gpu/timeline.h"
+#include "common/fpsLog.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -10,6 +20,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/imgRef.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -33,6 +44,17 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/host_gpu/renderer/htileWatch.h"
+#include "graphics/host_gpu/renderer/presentRt.h"
+#include "graphics/host_gpu/renderer/rtDrawLog.h"
+#include "graphics/host_gpu/renderer/imgTrace.h"
+#include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/renderer/rtSnap.h"
+#include "graphics/host_gpu/renderer/drawStats.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
+#include "graphics/host_gpu/renderer/paintDraws.h"
+#include "graphics/host_gpu/renderer/renderStats.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -43,7 +65,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <mutex>
+#include <string>
 #include <unordered_set>
 #include <bit>
 #include <cinttypes>
@@ -54,6 +78,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -61,7 +86,535 @@
 
 namespace Libs::Graphics {
 
+static bool EnvSwitchOn(const char* name); // below, with ReplayDiagnosticsActive
+
+namespace {
+
+// Diagnostics: KYTY_MESH_WALK=1 with KYTY_LOG_PS_DRAWS walks the title's generic meshlet mesh
+// shader's data path on the CPU for each logged mesh draw and prints what the shader will read:
+// the entity record (user data 0..3, one 16-byte record per draw index), the mesh record it names
+// (64 bytes in the ring slot 0x620 table), the meshlet descriptors (ring slot 0x5a0 data), the
+// first meshlet's indices and vertices, the instance transform (ring slot 0x660) and the camera
+// position, plus whether the buffer cache holds those bytes as GPU-written. A mesh whose
+// triangles rasterize nothing (KYTY_DRAW_STATS frag=0) shows here whether its data is missing,
+// stale or read from the wrong place.
+struct WalkDescriptor {
+	uint64_t base    = 0;
+	uint32_t stride  = 0;
+	uint32_t records = 0;
+	uint32_t dword3  = 0;
+	[[nodiscard]] uint64_t Bytes() const noexcept {
+		return stride == 0 ? records : static_cast<uint64_t>(records) * stride;
+	}
+	[[nodiscard]] bool Readable(uint64_t offset, uint64_t size) const noexcept {
+		return GuestRange {base + offset, size}.Valid();
+	}
+};
+
+WalkDescriptor ReadWalkDescriptor(const uint32_t* words) {
+	return {words[0] | (static_cast<uint64_t>(words[1] & 0xffffu) << 32u), (words[1] >> 16u) & 0x3fffu,
+	        words[2], words[3]};
+}
+
+uint32_t WalkDword(const WalkDescriptor& d, uint64_t offset) {
+	if (!d.Readable(offset, 4)) {
+		return 0xdeadbeefu;
+	}
+	uint32_t value = 0;
+	std::memcpy(&value, reinterpret_cast<const void*>(d.base + offset), 4);
+	return value;
+}
+
+std::string WalkDwords(const WalkDescriptor& d, uint64_t offset, uint32_t count) {
+	std::string text;
+	for (uint32_t i = 0; i < count; i++) {
+		text += fmt::format("{}{:08x}", i == 0 ? "" : " ", WalkDword(d, offset + i * 4u));
+	}
+	return text;
+}
+
+std::string WalkFormat(const WalkDescriptor& d) {
+	return fmt::format("{:x}+{:x}(stride {} records {} dw3 {:08x})", d.base, d.Bytes(), d.stride,
+	                   d.records, d.dword3);
+}
+
+const char* WalkModified(BufferCache& cache, uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return "invalid";
+	}
+	const bool gpu = cache.IsRegionGpuModified(address, size);
+	const bool cpu = cache.IsRegionCpuModified(address, size);
+	return gpu && cpu ? "gpu+cpu" : gpu ? "gpu" : cpu ? "cpu" : "clean";
+}
+
+// The GPU's copy of the bytes (the cached buffer's, which the BDA page table points into),
+// against guest memory: "gpu=same" or the differing dwords.
+std::string GpuCopyText(BufferCache& cache, uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid() || size == 0 || size % 4 != 0) {
+		return {};
+	}
+	std::vector<uint32_t> gpu;
+	if (!cache.PeekGpuCopy(address, size, gpu)) {
+		return " gpu=no-buffer";
+	}
+	std::vector<uint32_t> cpu(gpu.size());
+	std::memcpy(cpu.data(), reinterpret_cast<const void*>(address), size);
+	if (cpu == gpu) {
+		return " gpu=same";
+	}
+	std::string text = " gpu=DIFF:";
+	for (size_t i = 0; i < gpu.size(); i++) {
+		text += fmt::format(" {:08x}", gpu[i]);
+	}
+	return text;
+}
+
+// KYTY_MESH_WALK=2: GpuCopyText for the mesh walk.
+std::string WalkGpuCopy(BufferCache& cache, uint64_t address, uint64_t size) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MESH_WALK");
+		return value != nullptr && value[0] == '2';
+	}();
+	return enabled ? GpuCopyText(cache, address, size) : std::string();
+}
+
+// KYTY_SLOT_DUMP=<slot>:<offset>:<dwords>[:<record>:<dwords>][+...] (all hex, slot = NGG
+// user-data slot of a V#, 0 = s8): with KYTY_LOG_PS_DRAWS, every logged draw also prints its
+// vertex stage's user data and, per entry, the V# at that slot with the dwords at <offset> of its
+// memory (guest copy, and the buffer cache's GPU copy when it differs). With the optional pair,
+// the four dwords at <offset> are themselves a V# (a descriptor the shader loads from a table),
+// and the dwords at <record> × its stride of that buffer are printed too.
+struct SlotDump {
+	uint32_t slot            = 0;
+	uint32_t offset          = 0;
+	uint32_t dwords          = 0;
+	uint32_t indirect_record = 0;
+	uint32_t indirect_dwords = 0;
+	// <record> as @<slot>:<offset>: the record index is the dword at <offset> of that slot's buffer.
+	int32_t  record_slot   = -1;
+	uint32_t record_offset = 0;
+};
+
+const std::vector<SlotDump>& SlotDumps() {
+	static const std::vector<SlotDump> dumps = [] {
+		std::vector<SlotDump> result;
+		const char*           value = std::getenv("KYTY_SLOT_DUMP");
+		if (value == nullptr) {
+			return result;
+		}
+		const char* p = value;
+		while (*p != '\0') {
+			char*    end = nullptr;
+			SlotDump d;
+			d.slot = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+			if (end == nullptr || *end != ':') break;
+			d.offset = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			if (end == nullptr || *end != ':') break;
+			d.dwords = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			if (end != nullptr && *end == ':') {
+				if (end[1] == '@') {
+					d.record_slot = static_cast<int32_t>(std::strtoul(end + 2, &end, 16));
+					if (end == nullptr || *end != ':') break;
+					d.record_offset = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+				} else {
+					d.indirect_record = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+				}
+				if (end == nullptr || *end != ':') break;
+				d.indirect_dwords = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			}
+			result.push_back(d);
+			if (end == nullptr || (*end != '+' && *end != ',')) break;
+			p = end + 1;
+		}
+		return result;
+	}();
+	return dumps;
+}
+
+void LogSlotDumps(uint64_t flip, const uint32_t* users, uint32_t user_count, BufferCache& cache) {
+	std::string ud;
+	for (uint32_t i = 0; i < user_count; i++) {
+		ud += fmt::format(" {:08x}", users[i]);
+	}
+	std::fprintf(stderr, "[ps-draw-vs-ud] flip=%llu n=%u%s\n", static_cast<unsigned long long>(flip),
+	             user_count, ud.c_str());
+	for (const auto& d: SlotDumps()) {
+		if (d.slot + 3u >= user_count) {
+			std::fprintf(stderr, "[slot-dump] flip=%llu slot=%x beyond %u user slots\n",
+			             static_cast<unsigned long long>(flip), d.slot, user_count);
+			continue;
+		}
+		const auto     desc  = ReadWalkDescriptor(users + d.slot);
+		const uint64_t bytes = static_cast<uint64_t>(d.dwords) * 4u;
+		std::fprintf(stderr, "[slot-dump] flip=%llu slot=%x off=%x v#=%s |%s%s\n",
+		             static_cast<unsigned long long>(flip), d.slot, d.offset,
+		             WalkFormat(desc).c_str(), WalkDwords(desc, d.offset, d.dwords).c_str(),
+		             GpuCopyText(cache, desc.base + d.offset, bytes).c_str());
+		if (d.indirect_dwords == 0) {
+			continue;
+		}
+		uint32_t words[4];
+		for (uint32_t i = 0; i < 4u; i++) {
+			words[i] = WalkDword(desc, d.offset + i * 4u);
+		}
+		const auto inner  = ReadWalkDescriptor(words);
+		uint32_t   record = d.indirect_record;
+		if (d.record_slot >= 0 && static_cast<uint32_t>(d.record_slot) + 3u < user_count) {
+			record = WalkDword(ReadWalkDescriptor(users + d.record_slot), d.record_offset);
+		}
+		const uint64_t inner_offset =
+		    static_cast<uint64_t>(record) * (inner.stride == 0 ? 1u : inner.stride);
+		const uint64_t inner_bytes = static_cast<uint64_t>(d.indirect_dwords) * 4u;
+		std::fprintf(stderr, "[slot-dump] flip=%llu slot=%x off=%x -> v#=%s rec=%x off=%llx |%s%s\n",
+		             static_cast<unsigned long long>(flip), d.slot, d.offset,
+		             WalkFormat(inner).c_str(), record,
+		             static_cast<unsigned long long>(inner_offset),
+		             WalkDwords(inner, inner_offset, d.indirect_dwords).c_str(),
+		             GpuCopyText(cache, inner.base + inner_offset, inner_bytes).c_str());
+	}
+}
+
+// KYTY_MESH_WALK=2: the GPU's BDA page table entry for the page holding address, against the
+// device address of the cached buffer that should be there.
+std::string WalkBdaEntry(BufferCache& cache, uint64_t address) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MESH_WALK");
+		return value != nullptr && value[0] == '2';
+	}();
+	if (!enabled) {
+		return {};
+	}
+	uint64_t entry = 0, expected = 0;
+	if (!cache.PeekBdaEntry(address, entry, expected)) {
+		return " bda=none";
+	}
+	return entry == expected ? fmt::format(" bda=ok({:x})", entry)
+	                         : fmt::format(" bda=MISMATCH(table {:x} buffer {:x})", entry, expected);
+}
+
+bool MeshWalkEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MESH_WALK");
+		return value != nullptr && (value[0] == '1' || value[0] == '2');
+	}();
+	return enabled;
+}
+
+// KYTY_MESH_NEAR=<x>:<y>:<z>:<radius> (diagnostics, floats): every meshlet draw (generic meshlet
+// shader layout, see LogMeshWalk) whose instance translation lies within <radius> of the point is
+// logged as "[mesh-near]" with its shaders, counts, the instance's 3x4 transform and the mesh record
+// (every 100th guest flip, 400 lines at most). Finds the draws of objects at a known world position.
+void LogMeshNear(uint64_t flip, const uint32_t* users, uint32_t user_count, uint32_t count,
+                 uint32_t first_instance, uint64_t vs_hash, uint64_t ps_hash) {
+	static const std::vector<float> near_point = [] {
+		std::vector<float> v;
+		if (const char* value = std::getenv("KYTY_MESH_NEAR"); value != nullptr) {
+			std::string text(value);
+			size_t      start = 0;
+			while (start <= text.size() && v.size() < 4) {
+				const auto end = text.find(':', start);
+				v.push_back(std::strtof(text.substr(start, end == std::string::npos ? std::string::npos : end - start).c_str(), nullptr));
+				if (end == std::string::npos) break;
+				start = end + 1;
+			}
+		}
+		return v;
+	}();
+	if (near_point.size() < 4 || user_count < 21 || (flip % 100u) != 0) { // every 100th guest flip
+		return;
+	}
+	const auto entities   = ReadWalkDescriptor(users + 0);
+	const auto ring       = ReadWalkDescriptor(users + 16);
+	const auto draw_index = users[20];
+	const auto slot       = [&](uint32_t offset) {
+		uint32_t words[4] = {};
+		for (uint32_t i = 0; i < 4; i++) {
+			words[i] = WalkDword(ring, offset + i * 4u);
+		}
+		return ReadWalkDescriptor(words);
+	};
+	const auto     meshes    = slot(0x620);
+	const auto     instances = slot(0x660);
+	const uint64_t eoff      = static_cast<uint64_t>(draw_index) * 16u;
+	const uint32_t e1        = WalkDword(entities, eoff + 4);
+	const uint32_t e2        = WalkDword(entities, eoff + 8);
+	const uint64_t toff      = static_cast<uint64_t>(e1 & 0xffffffu) * 128u;
+	float          row[12]   = {};
+	for (uint32_t i = 0; i < 12; i++) {
+		const uint32_t bits = WalkDword(instances, toff + i * 4u);
+		std::memcpy(&row[i], &bits, 4);
+	}
+	const float dx = row[3] - near_point[0];
+	const float dy = row[7] - near_point[1];
+	const float dz = row[11] - near_point[2];
+	if (!(dx * dx + dy * dy + dz * dz <= near_point[3] * near_point[3])) {
+		return;
+	}
+	static std::atomic<uint64_t> last_flip {0};
+	static std::atomic<uint32_t> lines {0};
+	if (last_flip.exchange(flip) != flip) lines.store(0);
+	if (lines.fetch_add(1) >= 400) {
+		return;
+	}
+	const uint64_t moff = (static_cast<uint64_t>(e2) << 6u) & 0xffffc0u;
+	std::fprintf(stderr,
+	             "[mesh-near] flip=%llu vs=%016llx ps=%016llx count=%u first_inst=%u draw_index=%u "
+	             "xf=[%g %g %g %g] [%g %g %g %g] [%g %g %g %g] mesh: %s\n",
+	             static_cast<unsigned long long>(flip), static_cast<unsigned long long>(vs_hash),
+	             static_cast<unsigned long long>(ps_hash), count, first_instance, draw_index, row[0], row[1],
+	             row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11],
+	             WalkDwords(meshes, moff, 16).c_str());
+}
+
+void LogMeshWalk(uint64_t flip, const uint32_t* users, uint32_t user_count, uint32_t count,
+                 uint32_t first_instance, BufferCache& cache) {
+	if (user_count < 21) {
+		std::fprintf(stderr, "[mesh-walk] flip=%llu only %u user data slots\n",
+		             static_cast<unsigned long long>(flip), user_count);
+		return;
+	}
+	const auto entities   = ReadWalkDescriptor(users + 0);  // s[8:11]
+	const auto view_cb    = ReadWalkDescriptor(users + 4);  // s[12:15]
+	const auto misc_cb    = ReadWalkDescriptor(users + 8);  // s[16:19]
+	const auto control    = ReadWalkDescriptor(users + 12); // s[20:23]
+	const auto ring       = ReadWalkDescriptor(users + 16); // s[24:27]
+	const auto draw_index = users[20];                      // s28
+	std::fprintf(stderr,
+	             "[mesh-walk] flip=%llu count=%u first_inst=%u draw_index=%u entities=%s control=%s "
+	             "ring=%s view=%s misc=%s\n",
+	             static_cast<unsigned long long>(flip), count, first_instance, draw_index,
+	             WalkFormat(entities).c_str(), WalkFormat(control).c_str(), WalkFormat(ring).c_str(),
+	             WalkFormat(view_cb).c_str(), WalkFormat(misc_cb).c_str());
+	std::fprintf(stderr, "[mesh-walk]   control: %s | camera(view+0xf0): %s\n",
+	             WalkDwords(control, 0, 4).c_str(), WalkDwords(view_cb, 0xf0, 4).c_str());
+	// The ring slots the shader loads descriptors from.
+	struct Slot {
+		uint32_t    offset;
+		const char* name;
+	};
+	static constexpr Slot slots[] = {{0x540, "visible"}, {0x620, "meshes"},  {0x5a0, "data"},
+	                                 {0x2e0, "stream0"}, {0x2c0, "stream1"}, {0x580, "attrA"},
+	                                 {0x2a0, "attrB"},   {0x4e0, "prev"},    {0x660, "instances"},
+	                                 {0x640, "materials"}};
+	std::string slot_text;
+	for (const auto& slot: slots) {
+		uint32_t words[4] = {};
+		for (uint32_t i = 0; i < 4; i++) {
+			words[i] = WalkDword(ring, slot.offset + i * 4u);
+		}
+		slot_text += fmt::format(" {}={}", slot.name, WalkFormat(ReadWalkDescriptor(words)));
+	}
+	std::fprintf(stderr, "[mesh-walk]   ring slots:%s\n", slot_text.c_str());
+	const auto slot = [&](uint32_t offset) {
+		uint32_t words[4] = {};
+		for (uint32_t i = 0; i < 4; i++) {
+			words[i] = WalkDword(ring, offset + i * 4u);
+		}
+		return ReadWalkDescriptor(words);
+	};
+	const auto meshes    = slot(0x620);
+	const auto data      = slot(0x5a0);
+	const auto stream0   = slot(0x2e0);
+	const auto instances = slot(0x660);
+	// The entity record of this draw index (Y = 0: one instance).
+	const uint64_t entity_offset = static_cast<uint64_t>(draw_index) * 16u;
+	const uint32_t e0            = WalkDword(entities, entity_offset);
+	const uint32_t e1            = WalkDword(entities, entity_offset + 4);
+	const uint32_t e2            = WalkDword(entities, entity_offset + 8);
+	const uint32_t e3            = WalkDword(entities, entity_offset + 12);
+	const uint32_t transform     = e1 & 0xffffffu;
+	const uint64_t mesh_offset   = (static_cast<uint64_t>(e2) << 6u) & 0xffffc0u;
+	std::fprintf(stderr,
+	             "[mesh-walk]   entity[%u] @%llx: %08x %08x %08x %08x (%s%s) -> mesh record %x "
+	             "transform %u\n",
+	             draw_index,
+	             static_cast<unsigned long long>(entities.base + entity_offset), e0, e1, e2, e3,
+	             WalkModified(cache, entities.base + entity_offset, 16),
+	             WalkGpuCopy(cache, entities.base + entity_offset, 16).c_str(), e2, transform);
+	std::fprintf(stderr, "[mesh-walk]   mesh @%llx (%s%s): %s\n",
+	             static_cast<unsigned long long>(meshes.base + mesh_offset),
+	             WalkModified(cache, meshes.base + mesh_offset, 64),
+	             WalkGpuCopy(cache, meshes.base + mesh_offset, 64).c_str(),
+	             WalkDwords(meshes, mesh_offset, 16).c_str());
+	const uint32_t vertex_base   = WalkDword(meshes, mesh_offset + 0x00);
+	const uint32_t table         = WalkDword(meshes, mesh_offset + 0x14);
+	const uint32_t meshlets      = WalkDword(meshes, mesh_offset + 0x18);
+	const uint32_t flags         = WalkDword(meshes, mesh_offset + 0x1c);
+	const uint32_t off_x         = WalkDword(meshes, mesh_offset + 0x20);
+	const uint32_t off_y         = WalkDword(meshes, mesh_offset + 0x24);
+	const uint32_t off_z         = WalkDword(meshes, mesh_offset + 0x28);
+	const uint32_t scale_bits    = WalkDword(meshes, mesh_offset + 0x3c);
+	float          scale         = 0.0f;
+	std::memcpy(&scale, &scale_bits, 4);
+	std::fprintf(stderr,
+	             "[mesh-walk]   mesh: vertex_base=%u table=0x%x meshlets=%u flags=%08x (layout %s, "
+	             "offsets %d) offsets=%d,%d,%d scale=%g\n",
+	             vertex_base, table, meshlets, flags, (flags & 1u) != 0 ? "streams" : "raw",
+	             (flags & 16u) != 0 ? 1 : 0, static_cast<int32_t>(off_x << 16u) >> 8,
+	             static_cast<int32_t>(off_y << 16u) >> 8, static_cast<int32_t>(off_z << 16u) >> 8,
+	             scale);
+	// The instance transform: three rows of a 3x4 matrix at 128 bytes per instance.
+	{
+		const uint64_t offset = static_cast<uint64_t>(transform) * 128u;
+		float          row[12] = {};
+		for (uint32_t i = 0; i < 12; i++) {
+			const uint32_t bits = WalkDword(instances, offset + i * 4u);
+			std::memcpy(&row[i], &bits, 4);
+		}
+		std::fprintf(stderr,
+		             "[mesh-walk]   instance %u @%llx (%s%s): [%g %g %g %g] [%g %g %g %g] [%g %g %g %g] "
+		             "+0x30..: %s\n",
+		             transform, static_cast<unsigned long long>(instances.base + offset),
+		             WalkModified(cache, instances.base + offset, 128),
+		             WalkGpuCopy(cache, instances.base + offset, 48).c_str(), row[0], row[1], row[2], row[3],
+		             row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11],
+		             WalkDwords(instances, offset + 0x30, 12).c_str());
+	}
+	// The meshlet descriptors and the first meshlet's indices and vertices.
+	if (meshlets == 0 || meshlets > 4096 || table == 0xdeadbeefu) {
+		std::fprintf(stderr, "[mesh-walk]   no meshlets to walk\n");
+		return;
+	}
+	uint64_t    prims_total = 0;
+	std::string meshlet_text;
+	for (uint32_t m = 0; m < meshlets; m++) {
+		const uint32_t desc   = WalkDword(data, table + static_cast<uint64_t>(m) * 4u);
+		const uint32_t vcount = ((desc >> 17u) & 0x7fu) + 1u;
+		const uint32_t pcount = (desc >> 24u) + 1u;
+		prims_total += pcount;
+		if (m < 6) {
+			meshlet_text += fmt::format(" [{}: v{} p{} idx 0x{:x}]", m, vcount, pcount,
+			                            (desc << 4u) & 0x1ffff0u);
+		}
+	}
+	std::fprintf(stderr, "[mesh-walk]   meshlet table @%llx (%s%s%s): prims_total=%llu%s\n",
+	             static_cast<unsigned long long>(data.base + table),
+	             WalkModified(cache, data.base + table, static_cast<uint64_t>(meshlets) * 4u),
+	             WalkGpuCopy(cache, data.base + table, std::min<uint64_t>(meshlets, 8u) * 4u).c_str(),
+	             WalkBdaEntry(cache, data.base + table).c_str(),
+	             static_cast<unsigned long long>(prims_total), meshlet_text.c_str());
+	const uint32_t desc0      = WalkDword(data, table);
+	const uint32_t vcount0    = ((desc0 >> 17u) & 0x7fu) + 1u;
+	const uint32_t pcount0    = (desc0 >> 24u) + 1u;
+	const uint64_t index_base = static_cast<uint64_t>(table) + static_cast<uint64_t>(meshlets) * 24u +
+	                            ((desc0 << 4u) & 0x1ffff0u);
+	std::string prim_text;
+	std::string vertex_text;
+	const auto  index16 = [&](uint64_t byte_offset) {
+		const uint32_t word = WalkDword(data, byte_offset & ~3ull);
+		return (word >> ((byte_offset & 3u) * 8u)) & 0xffffu;
+	};
+	for (uint32_t t = 0; t < std::min(pcount0, 4u); t++) {
+		const uint32_t packed = index16(index_base + t * 2u);
+		prim_text += fmt::format(" {}/{}/{}", packed & 31u, (packed >> 5u) & 31u, (packed >> 10u) & 31u);
+	}
+	std::fprintf(stderr,
+	             "[mesh-walk]   meshlet 0: indices @%llx (%s%s) prims:%s\n",
+	             static_cast<unsigned long long>(data.base + index_base),
+	             WalkModified(cache, data.base + index_base, static_cast<uint64_t>(pcount0 + vcount0) * 2u),
+	             WalkGpuCopy(cache, data.base + (index_base & ~3ull), 16).c_str(), prim_text.c_str());
+	for (uint32_t t = 0; t < std::min(vcount0, 4u); t++) {
+		const uint32_t index  = index16(index_base + static_cast<uint64_t>(pcount0) * 2u + t * 2u);
+		const uint64_t vertex = static_cast<uint64_t>(vertex_base) + index;
+		uint32_t       words[4] = {};
+		uint64_t       address  = 0;
+		if ((flags & 1u) != 0) {
+			address = stream0.base + vertex * 2u * stream0.stride;
+			for (uint32_t i = 0; i < 4; i++) {
+				words[i] = WalkDword(stream0, vertex * 2u * stream0.stride + i * 4u);
+			}
+		} else {
+			address = data.base + vertex * 16u;
+			for (uint32_t i = 0; i < 4; i++) {
+				words[i] = WalkDword(data, vertex * 16u + i * 4u);
+			}
+		}
+		const auto     x   = static_cast<int32_t>(static_cast<int16_t>(words[0] & 0xffffu));
+		const auto     y   = static_cast<int32_t>(static_cast<int16_t>(words[0] >> 16u));
+		const auto     z   = static_cast<int32_t>(static_cast<int16_t>(words[1] & 0xffffu));
+		const uint32_t w   = words[1] >> 16u;
+		const uint32_t exp = (w >> 5u) & 0xfu;
+		const bool     add = (flags & 16u) != 0;
+		const float    px  = static_cast<float>((x << exp) + (add ? (static_cast<int32_t>(off_x << 16u) >> 8) : 0)) * scale;
+		const float    py  = static_cast<float>((y << exp) + (add ? (static_cast<int32_t>(off_y << 16u) >> 8) : 0)) * scale;
+		const float    pz  = static_cast<float>((z << exp) + (add ? (static_cast<int32_t>(off_z << 16u) >> 8) : 0)) * scale;
+		vertex_text += fmt::format(" [v{} idx {} @{:x} ({}{}{}): {:08x} {:08x} {:08x} {:08x} -> {:g} {:g} {:g}]",
+		                           t, index, address, WalkModified(cache, address, 16),
+		                           WalkGpuCopy(cache, address, 16),
+		                           t == 0 ? WalkBdaEntry(cache, address) : std::string(), words[0],
+		                           words[1], words[2], words[3], px, py, pz);
+	}
+	std::fprintf(stderr, "[mesh-walk]   vertices:%s\n", vertex_text.c_str());
+	// The whole mesh's extent in local and in camera-relative world space (every vertex of every
+	// meshlet, as the shader decodes them): a mesh the game built collapsed shows up here.
+	{
+		float    lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+		float    wlo[3] = {1e30f, 1e30f, 1e30f}, whi[3] = {-1e30f, -1e30f, -1e30f};
+		uint32_t total = 0, zero_words = 0;
+		float    row[12] = {}, cam[3] = {};
+		{
+			const uint64_t offset = static_cast<uint64_t>(transform) * 128u;
+			for (uint32_t i = 0; i < 12; i++) {
+				const uint32_t bits = WalkDword(instances, offset + i * 4u);
+				std::memcpy(&row[i], &bits, 4);
+			}
+			for (uint32_t i = 0; i < 3; i++) {
+				const uint32_t bits = WalkDword(view_cb, 0xf0 + i * 4u);
+				std::memcpy(&cam[i], &bits, 4);
+			}
+		}
+		for (uint32_t m = 0; m < meshlets && m < 256; m++) {
+			const uint32_t desc   = WalkDword(data, table + static_cast<uint64_t>(m) * 4u);
+			const uint32_t vcount = ((desc >> 17u) & 0x7fu) + 1u;
+			const uint32_t pcount = (desc >> 24u) + 1u;
+			const uint64_t base   = static_cast<uint64_t>(table) + static_cast<uint64_t>(meshlets) * 24u +
+			                      ((desc << 4u) & 0x1ffff0u) + static_cast<uint64_t>(pcount) * 2u;
+			for (uint32_t t = 0; t < vcount; t++) {
+				const uint32_t index  = index16(base + t * 2u);
+				const uint64_t vertex = static_cast<uint64_t>(vertex_base) + index;
+				uint32_t       words[2] = {};
+				for (uint32_t i = 0; i < 2; i++) {
+					words[i] = (flags & 1u) != 0
+					               ? WalkDword(stream0, vertex * 2u * stream0.stride + i * 4u)
+					               : WalkDword(data, vertex * 16u + i * 4u);
+				}
+				if (words[0] == 0 && words[1] == 0) {
+					zero_words++;
+				}
+				const auto     x   = static_cast<int32_t>(static_cast<int16_t>(words[0] & 0xffffu));
+				const auto     y   = static_cast<int32_t>(static_cast<int16_t>(words[0] >> 16u));
+				const auto     z   = static_cast<int32_t>(static_cast<int16_t>(words[1] & 0xffffu));
+				const uint32_t exp = ((words[1] >> 16u) >> 5u) & 0xfu;
+				const bool     add = (flags & 16u) != 0;
+				const float    p[3] = {
+				    static_cast<float>((x << exp) + (add ? (static_cast<int32_t>(off_x << 16u) >> 8) : 0)) * scale,
+				    static_cast<float>((y << exp) + (add ? (static_cast<int32_t>(off_y << 16u) >> 8) : 0)) * scale,
+				    static_cast<float>((z << exp) + (add ? (static_cast<int32_t>(off_z << 16u) >> 8) : 0)) * scale};
+				const float w[3] = {row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3] - cam[0],
+				                    row[4] * p[0] + row[5] * p[1] + row[6] * p[2] + row[7] - cam[1],
+				                    row[8] * p[0] + row[9] * p[1] + row[10] * p[2] + row[11] - cam[2]};
+				for (int i = 0; i < 3; i++) {
+					lo[i]  = std::min(lo[i], p[i]);
+					hi[i]  = std::max(hi[i], p[i]);
+					wlo[i] = std::min(wlo[i], w[i]);
+					whi[i] = std::max(whi[i], w[i]);
+				}
+				total++;
+			}
+		}
+		std::fprintf(stderr,
+		             "[mesh-walk]   extent: %u vertices (%u zero) local [%g %g %g]..[%g %g %g] "
+		             "camera-relative [%g %g %g]..[%g %g %g]\n",
+		             total, zero_words, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], wlo[0], wlo[1],
+		             wlo[2], whi[0], whi[1], whi[2]);
+	}
+}
+
+} // namespace
+
 void NoteTickWork(uint64_t tick, char kind, uint64_t a, uint64_t b); // diagnosticCheckpoints.cpp
+void NoteTickWorkViews(const uint64_t* views, size_t count, const uint32_t* regions,
+                       size_t num_regions); // diagnosticCheckpoints.cpp
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -327,6 +880,104 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+// Diagnostics for facing (changes nothing unless asked):
+// - KYTY_LOG_FACE_STATE=<pixel shader hash>: the first 8 draws of that pixel shader log the
+//   registers that decide facing: PA_SU_SC_MODE_CNTL (cull, FACE), the primitive type,
+//   VGT_TF_PARAM (tessellator topology), SPI_BARYC_CNTL (FRONT_FACE_ALL_BITS) and viewport 0.
+// - KYTY_DIAG_FLIP_TESS_FACE_FILE=<file>: while that file exists, tessellated (patch) draws get
+//   the opposite VkFrontFace, which flips gl_FrontFacing and culling for them only. A test of
+//   whether a tessellated surface's facing matches the guest's; not a fix.
+// - KYTY_DIAG_FLIP_ALL_FACE_FILE=<file>: the same for every draw while that file exists.
+// - KYTY_FACE_CENSUS=1: every 5 s, how many draws had each culling / FACE / tessellation state.
+static void LogAndDiagnoseFacing(const CommandBuffer& buffer, const CommandRecorder& vk_buffer,
+                                 uint64_t ps_hash) {
+	static const uint64_t log_ps = [] {
+		const char* value = std::getenv("KYTY_LOG_FACE_STATE");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	static const char* flip_file     = std::getenv("KYTY_DIAG_FLIP_TESS_FACE_FILE");
+	static const char* flip_all_file = std::getenv("KYTY_DIAG_FLIP_ALL_FACE_FILE");
+	static const bool  census        = [] {
+		const char* value = std::getenv("KYTY_FACE_CENSUS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (log_ps == 0 && flip_file == nullptr && flip_all_file == nullptr && !census) {
+		return;
+	}
+	const auto& ctx   = buffer.GetRegisters();
+	const auto& mode  = ctx.GetModeControl();
+	const auto  prim  = buffer.GetUserConfig().GetPrimType();
+	const bool  patch = prim == Prospero::PrimitiveType::kPatch;
+	if (log_ps != 0 && ps_hash == log_ps) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			const auto& sh = ctx.GetShaderRegisters();
+			const auto& vp = ctx.GetScreenViewport().viewports[0];
+			std::fprintf(stderr,
+			             "[face-state] ps=%016" PRIx64 " prim=%u patch=%d cull_front=%d cull_back=%d "
+			             "face=%d(%s front) tf_param=0x%08x topology=%u baryc_cntl=0x%08x "
+			             "front_face_all_bits=%d vp_xscale=%f vp_yscale=%f vp_yoffset=%f "
+			             "db_shader_control: z_order=%u kill=%d other_bits=0x%08x z=%d zw=%d zfunc=%u\n",
+			             log_ps, static_cast<uint32_t>(prim), patch ? 1 : 0, mode.cull_front ? 1 : 0,
+			             mode.cull_back ? 1 : 0, mode.face ? 1 : 0, mode.face ? "CW" : "CCW",
+			             sh.m_vgtTfParam, (sh.m_vgtTfParam >> 5u) & 0x7u, sh.baryc_cntl,
+			             (sh.baryc_cntl & 0x01000000u) != 0 ? 1 : 0, vp.xscale, vp.yscale, vp.yoffset,
+			             sh.db_shader_control.shader_z_behavior, sh.db_shader_control.shader_kill_enable ? 1 : 0,
+			             sh.db_shader_control.other_bits, ctx.GetDepthControl().z_enable ? 1 : 0,
+			             ctx.GetDepthControl().z_write_enable ? 1 : 0, ctx.GetDepthControl().zfunc);
+		}
+	}
+	const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	if (census) {
+		// [patch][cull_front][cull_back][face]
+		static std::atomic<uint64_t> counts[2][2][2][2] {};
+		static std::atomic<int64_t>  printed_ms {0};
+		counts[patch ? 1 : 0][mode.cull_front ? 1 : 0][mode.cull_back ? 1 : 0][mode.face ? 1 : 0]
+		    .fetch_add(1, std::memory_order_relaxed);
+		auto last = printed_ms.load(std::memory_order_relaxed);
+		if (now_ms - last > 5000 && printed_ms.compare_exchange_strong(last, now_ms)) {
+			std::string line;
+			for (int t = 0; t < 2; t++)
+				for (int f = 0; f < 2; f++)
+					for (int b = 0; b < 2; b++)
+						for (int c = 0; c < 2; c++) {
+							const auto n = counts[t][f][b][c].exchange(0, std::memory_order_relaxed);
+							if (n != 0) {
+								line += fmt::format(" {}{}{}{}={}", t ? "tess:" : "", f ? "cullF" : "",
+								                    b ? "cullB" : "", c ? "/CW" : "/CCW", n);
+							}
+						}
+			std::fprintf(stderr, "[face-census]%s\n", line.c_str());
+		}
+	}
+	if (!PipelineDynamicRasterStateEnabled() || (flip_file == nullptr && flip_all_file == nullptr)) {
+		return;
+	}
+	static std::atomic<int64_t> checked_ms {-1};
+	static std::atomic<bool>    flip_tess {false};
+	static std::atomic<bool>    flip_all {false};
+	if (now_ms - checked_ms.load(std::memory_order_relaxed) > 500) {
+		checked_ms.store(now_ms, std::memory_order_relaxed);
+		std::error_code error;
+		const bool      tess_on = flip_file != nullptr && std::filesystem::exists(flip_file, error);
+		const bool all_on = flip_all_file != nullptr && std::filesystem::exists(flip_all_file, error);
+		if (tess_on != flip_tess.exchange(tess_on, std::memory_order_relaxed)) {
+			std::fprintf(stderr, "[face-diag] tessellated front face %s\n",
+			             tess_on ? "FLIPPED" : "normal");
+		}
+		if (all_on != flip_all.exchange(all_on, std::memory_order_relaxed)) {
+			std::fprintf(stderr, "[face-diag] all draws' front face %s\n", all_on ? "FLIPPED" : "normal");
+		}
+	}
+	if (flip_all.load(std::memory_order_relaxed) ||
+	    (patch && flip_tess.load(std::memory_order_relaxed))) {
+		vk_buffer.setFrontFace(mode.face ? vk::FrontFace::eCounterClockwise
+		                                 : vk::FrontFace::eClockwise);
+	}
+}
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandRecorder& vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering) {
@@ -391,15 +1042,21 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
 	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
+	// Tests only on aspects the pass has: a monolithic pipeline without them had no depth/stencil
+	// state at all, but a linked pipeline's fragment library always has one (it cannot see the
+	// formats), and depth/stencil on with no such attachment faulted the GPU (v436, fixed address
+	// reads). Same values as before for every pass that has the aspect.
+	const bool pass_depth   = rendering.depth_stencil_attachment.has_depth;
+	const bool pass_stencil = rendering.depth_stencil_attachment.has_stencil;
+	vk_buffer.setDepthTestEnable(depth.depth_test_enable && pass_depth ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthWriteEnable(depth.depth_write_enable && pass_depth ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
-	const bool  depth_bias_enable = use_front || use_back;
+	const bool  depth_bias_enable = (use_front || use_back) && pass_depth;
 	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
@@ -412,8 +1069,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
-	if (depth.stencil_test_enable) {
+	vk_buffer.setStencilTestEnable(depth.stencil_test_enable && pass_stencil ? VK_TRUE : VK_FALSE);
+	if (depth.stencil_test_enable && pass_stencil) {
 		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
 			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
 			vk_buffer.setStencilCompareMask(face, state.compareMask);
@@ -502,6 +1159,11 @@ static bool ConvertMeshArgsRun(RenderContext& context, MeshIndirectArgs& convert
                                CommandBuffer& buffer, uint64_t args, vk::Buffer& command_buffer,
                                vk::DeviceSize& command_offset) {
 	auto& run = MeshArgsRun();
+	const bool replay_configured = RenderStats::IndirectReplayConfigured();
+	if (replay_configured) {
+		run.last_used_packet = nullptr;
+		run.last_used_generation = 0;
+	}
 	if (run.packet == nullptr) {
 		return false;
 	}
@@ -514,6 +1176,10 @@ static bool ConvertMeshArgsRun(RenderContext& context, MeshIndirectArgs& convert
 		}
 		command_buffer = entry->buffer;
 		command_offset = entry->offset;
+		if (replay_configured) {
+			run.last_used_packet = run.packet;
+			run.last_used_generation = run.generation;
+		}
 		run.hits++;
 		return true;
 	}
@@ -525,6 +1191,14 @@ static bool ConvertMeshArgsRun(RenderContext& context, MeshIndirectArgs& convert
 	// their own, which must come before the conversions read the counts.
 	std::vector<std::pair<Buffer*, uint64_t>> sources;
 	sources.reserve(run.upcoming.size());
+	// Obtaining a later range can merge buffers obtained before it (the earlier Buffer* is then a
+	// deleted buffer whose bytes stop following the guest's): obtain them all once, then again
+	// for the pointers the conversions use (as FillFlatSlotsOnGpu does).
+	if (run.upcoming.size() > 1u) {
+		for (const auto& entry: run.upcoming) {
+			(void)context.GetBufferCache().ObtainBuffer(entry.args, 16u, false, false, {}, true);
+		}
+	}
 	for (const auto& entry: run.upcoming) {
 		const auto source = context.GetBufferCache().ObtainBuffer(entry.args, 16u, false, false, {},
 		                                                          true);
@@ -554,6 +1228,7 @@ static bool ConvertMeshArgsRun(RenderContext& context, MeshIndirectArgs& convert
 		run.converted.push_back(
 		    {run.upcoming[i].packet, run.upcoming[i].args, converted.buffer, converted.offset});
 	}
+	if (replay_configured) run.generation++;
 	vk::MemoryBarrier command_ready {};
 	command_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	command_ready.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
@@ -567,7 +1242,11 @@ static bool ConvertMeshArgsRun(RenderContext& context, MeshIndirectArgs& convert
 	EXIT_IF(entry == nullptr);
 	command_buffer = entry->buffer;
 	command_offset = entry->offset;
-	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+	if (replay_configured) {
+		run.last_used_packet = run.packet;
+		run.last_used_generation = run.generation;
+	}
+	if (static const bool log = Common::FpsLogDiagnostics(); log) {
 		static auto last = std::chrono::steady_clock::now();
 		const auto  now  = std::chrono::steady_clock::now();
 		if (now - last >= std::chrono::seconds(5)) {
@@ -588,6 +1267,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
+	const CpuCost::Phase cpu_phase_("AcquireRenderTargets");
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
@@ -600,13 +1280,49 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
 		const auto owner = cache.m_slot_images.try_get(target.image_id);
-		if (owner == nullptr || (!owner->registered && !owner->info.data.Empty()) ||
+		// v393 (11-11, mac_v390_1): this check let through what FindRenderTarget refuses, and the
+		// game exited there ("color target requires rediscovery") at a level change with no word of
+		// which condition held. Same conditions now (a target without guest memory is never
+		// registered, as FindTexture allows), and the image is described before the exit.
+		if (owner == nullptr || (!owner->registered && !owner->info.data.Empty()) || owner->depth_id ||
 		    owner->binding.needs_rebind) {
+			if (owner != nullptr) {
+				std::fprintf(stderr,
+				             "[rt-rediscover] slot %u id %u: registered %d, empty %d, depth_id %u, needs_rebind %d; "
+				             "image 0x%llx+0x%llx %ux%u fmt %u; wanted 0x%llx+0x%llx %ux%u\n",
+				             target.target_slot, static_cast<uint32_t>(target.image_id.index),
+				             static_cast<int>(owner->registered), static_cast<int>(owner->info.data.Empty()),
+				             static_cast<uint32_t>(owner->depth_id.index), static_cast<int>(owner->binding.needs_rebind),
+				             static_cast<unsigned long long>(owner->info.data.address),
+				             static_cast<unsigned long long>(owner->info.data.size), owner->info.extent.width,
+				             owner->info.extent.height, static_cast<uint32_t>(owner->backing.format),
+				             static_cast<unsigned long long>(target.desc.info.data.address),
+				             static_cast<unsigned long long>(target.desc.info.data.size), target.desc.info.extent.width,
+				             target.desc.info.extent.height);
+				std::fflush(stderr);
+			}
 			EXIT("color target changed after render-state discovery\n");
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
+		if (ImgTrace::Overlaps(target.desc.info.data.address, target.desc.info.data.size)) {
+			ImgTrace::Log("rt slot%u want 0x%llx %ux%u -> id=%u img 0x%llx+0x%llx %ux%u fmt%u vk=%p",
+			              target.target_slot,
+			              static_cast<unsigned long long>(target.desc.info.data.address),
+			              target.desc.info.extent.width, target.desc.info.extent.height,
+			              static_cast<uint32_t>(target.image_id.index),
+			              static_cast<unsigned long long>(image.info.data.address),
+			              static_cast<unsigned long long>(image.info.data.size), image.info.extent.width,
+			              image.info.extent.height, static_cast<uint32_t>(image.backing.format),
+			              static_cast<const void*>(static_cast<VkImage>(image.backing.image)));
+		}
+		if (PresentRt::Get().enabled && target.guest_mip_level == 0) {
+			PresentRt::NoteTarget(target.image_id, target.desc.info.data.address,
+			                      target.desc.info.extent.width, target.desc.info.extent.height,
+			                      static_cast<uint32_t>(target.desc.info.pixel_format),
+			                      target.target_slot);
+		}
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
@@ -641,6 +1357,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		if (metadata.kind == ImageMetadataKind::Htile) {
+			HtileWatch::NoteDepthBind(depth.desc.info.data.address, metadata.range.address,
+			                          depth.desc.view_info.base_layer, depth.depth_clear_enable,
+			                          meta_clear, depth.depth_clear_value, depth.depth_write_enable);
+		}
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -760,6 +1481,7 @@ struct DrawEmitInfo {
 	uint64_t gpu_instance_count_address = 0;
 	// With gpu_args_address: START_INST_LOC's user SGPR + 1 (0 = none), see DrawAutoArgs.
 	uint32_t start_instance_sgpr = 0;
+	const uint32_t* indirect_packet = nullptr;
 };
 
 struct DrawIndexBufferSource {
@@ -1001,17 +1723,19 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
-	auto& ctx    = buffer.GetRegisters();
-	auto& sh_ctx = buffer.GetShaders();
-
+// The programs of a draw for these registers (GetGraphicsPrograms with the SRT refresh).
+static void SelectDrawPrograms(RenderContext& context, const HW::Context& ctx, const HW::Shader& sh_ctx,
+                               const HW::UserConfig& ucfg, bool indexed, const char* name,
+                               uint32_t color_output_mask, bool ps_active,
+                               PipelineCache::GraphicsPrograms&      programs,
+                               std::array<ShaderVertexInputInfo, 3>& vertex_info,
+                               ShaderPixelInputInfo&                 ps_input_info) {
 	const auto& vertex_shader_info = sh_ctx.GetVs();
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
-	state.programs      = {};
-	state.ps_input_info = {};
+	programs      = {};
+	ps_input_info = {};
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -1023,13 +1747,140 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 			        .export_mapping;
 		}
 	}
-	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
+	auto& pipeline_cache = context.GetPipelineCache();
+	if (indexed) {
+		LogDrawPhase(name, "GetGraphicsPrograms");
 	}
-	state.programs = pipeline_cache.GetGraphicsPrograms(
-	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	programs = pipeline_cache.GetGraphicsPrograms(vertex_shader_info, pixel_shader_info, shader_regs,
+	                                              ctx, ucfg, target_export_mapping, ps_active,
+	                                              vertex_info, ps_input_info);
+}
+
+static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+                           uint32_t color_output_mask, DrawRenderState& state) {
+	// KYTY_DRAW_PIPE, on the draw thread: the command processor selected them for these registers.
+	if (const auto* prepared = DrawPipe::CurrentPrepared(); prepared != nullptr) {
+		EXIT_IF(prepared->ps_active != state.ps_active ||
+		        prepared->color_output_mask != color_output_mask);
+		state.programs      = prepared->programs;
+		state.vertex_info   = prepared->vertex_info;
+		state.ps_input_info = prepared->ps_input_info;
+		return;
+	}
+	SelectDrawPrograms(buffer.GetContext(), buffer.GetRegisters(), buffer.GetShaders(),
+	                   buffer.GetUserConfig(), draw.IsIndexed(), draw.Name(), color_output_mask,
+	                   state.ps_active, state.programs, state.vertex_info, state.ps_input_info);
+}
+
+void RenderExecutor::RunPipeDraw(uint64_t submit_id, CommandBuffer& buffer,
+                                 const DrawIndexArgs* index_args, const DrawAutoArgs* auto_args) {
+	if (index_args != nullptr) {
+		DrawIndex(submit_id, buffer, *index_args);
+	} else {
+		DrawAuto(submit_id, buffer, *auto_args);
+	}
+}
+
+// KYTY_DRAW_PIPE, the command processor: RefreshShaders for a draw the draw thread will run, with
+// copies of the snapshots the program cache will overwrite. False: no valid vertex shader.
+bool RenderExecutor::PrepareDrawProgramsForPipe(RenderContext& context, const HW::Context& ctx,
+                                                const HW::Shader& sh_ctx, const HW::UserConfig& ucfg,
+                                                DrawPipe::PreparedPrograms& out) {
+	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return false;
+	}
+	const auto& shader_regs = ctx.GetShaderRegisters();
+	out.color_output_mask   = DrawColorOutputMask(ctx);
+	out.ps_active           = sh_ctx.GetPs().ps_regs.data_addr != 0 &&
+	                (out.color_output_mask != 0 || PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	{
+		// Off the renderer mutex the draw thread holds: guest reads of bytes no GPU work wrote are
+		// served from memory, the rest takes the mutex (ReadShaderGuestMemory).
+		RenderContext::MarkOffLock(true);
+		SelectDrawPrograms(context, ctx, sh_ctx, ucfg, false, "pipe", out.color_output_mask,
+		                   out.ps_active, out.programs, out.vertex_info, out.ps_input_info);
+		RenderContext::MarkOffLock(false);
+	}
+	const auto writes = [](const ShaderStageRuntime& runtime) {
+		return runtime.program != nullptr &&
+		       (HasShaderBufferWrites(runtime) || runtime.program->has_address_writes ||
+		        std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
+			        return image.written;
+		        }));
+	};
+	// The guest bytes the stage's buffer writes can reach: the store extent inside a written V#
+	// (as NativeStorageBuffer marks them), else the whole V#. Image writes, image atomics and
+	// raw-pointer stores have no range.
+	const auto add_ranges = [&out](const ShaderStageRuntime& runtime) {
+		if (runtime.program == nullptr) {
+			return;
+		}
+		const auto& program   = *runtime.program;
+		const auto& resources = *runtime.resources;
+		if (program.has_address_writes ||
+		    std::ranges::any_of(program.info.images, [](const auto& image) {
+			    return image.written || image.atomic || image.atomic64;
+		    })) {
+			out.writes_unbounded = true;
+		}
+		const auto count = std::min(program.info.buffers.size(), resources.buffers.size());
+		for (size_t i = 0; i < count; i++) {
+			const auto& buffer = program.info.buffers[i];
+			if (!buffer.written && !buffer.atomic) {
+				continue;
+			}
+			const auto& value = resources.buffers[i];
+			if (value.dword_count < 4) {
+				out.writes_unbounded = true;
+				continue;
+			}
+			ShaderBufferResource descriptor;
+			std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
+			const uint64_t address = descriptor.Base48();
+			const uint64_t size    = descriptor.GetSize();
+			if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
+				continue; // bound as null: the writes are dropped
+			}
+			uint64_t begin = 0;
+			uint64_t end   = size;
+			if (!buffer.atomic && i < resources.buffer_write_extents.size()) {
+				if (const auto& extent = resources.buffer_write_extents[i]; extent.valid) {
+					begin = std::min(extent.begin, size);
+					end   = std::min(extent.end, size);
+				}
+			}
+			if (end > begin) {
+				out.write_ranges.emplace_back(address + begin, address + end);
+			}
+		}
+	};
+	out.writes_memory    = false;
+	out.writes_unbounded = false;
+	out.write_ranges.clear();
+	for (uint32_t i = 0; i < 3; i++) {
+		auto& stage = out.vertex_info[i].stage;
+		if (stage.resources != nullptr) {
+			out.resources[i] = *stage.resources;
+			stage.resources  = &out.resources[i];
+			if (writes(stage)) {
+				out.writes_memory = true;
+				add_ranges(stage);
+			}
+		}
+	}
+	if (auto& stage = out.ps_input_info.stage; stage.resources != nullptr) {
+		out.resources[3]  = *stage.resources;
+		stage.resources   = &out.resources[3];
+		if (writes(stage)) {
+			out.writes_memory = true;
+			add_ranges(stage);
+		}
+	}
+	// writes() counts image writes but not image atomics; HasShaderBufferWrites counts both.
+	if (out.writes_memory && out.write_ranges.empty() && !out.writes_unbounded) {
+		out.writes_unbounded = true; // writes nothing a range names: keep the old drain
+	}
+	return true;
 }
 
 bool DrawPrepHasVertexShader(const HW::Shader& sh_ctx) {
@@ -1146,10 +1997,11 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 				const auto  writer = GetGsSlotLastWriter();
 				const auto& users  = sh.GetVs().gs_user_sgpr.value;
 				std::fprintf(stderr,
-				             "[gs-seq] draw frame=%llu count=%u user_sgpr=%u s36=%08x last=#%llu src=%u value=%08x"
+				             "[gs-seq] draw frame=%llu flip=%llu count=%u user_sgpr=%u s24=%08x s36=%08x last=#%llu src=%u value=%08x"
 				             " at=%p now=%08x set=%u+%u\n",
-				             static_cast<unsigned long long>(buffer.GetContext().GetGpu().GetFrameNum()), count,
-				             static_cast<uint32_t>(sh.GetVs().gs_regs.rsrc2.user_sgpr), users[28],
+				             static_cast<unsigned long long>(buffer.GetContext().GetGpu().GetFrameNum()),
+				             static_cast<unsigned long long>(Sync::GuestFlipCount()), count,
+				             static_cast<uint32_t>(sh.GetVs().gs_regs.rsrc2.user_sgpr), users[16], users[28],
 				             static_cast<unsigned long long>(writer.seq), writer.source, writer.value,
 				             static_cast<const void*>(writer.where),
 				             writer.where != nullptr ? *writer.where : 0u, writer.start, writer.count);
@@ -1324,7 +2176,15 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 			LOGF("Draw census: triggered at frame %" PRIu64 "\n", frame);
 		}
 	}
-	if (!triggered || frame < setting.first_frame ||
+	// KYTY_LOG_DRAWS_FLIP=<guest flip>: start at that guest flip instead of the GPU frame.
+	static const uint64_t first_flip = [] {
+		const char* value = std::getenv("KYTY_LOG_DRAWS_FLIP");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+	}();
+	if (first_flip != 0 && Sync::GuestFlipCount() < first_flip) {
+		return;
+	}
+	if (!triggered || (first_flip == 0 && frame < setting.first_frame) ||
 	    used.fetch_add(1, std::memory_order_relaxed) >= setting.count) {
 		return;
 	}
@@ -1337,19 +2197,57 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 	             "Draw census: frame=%" PRIu64 " %s es=%016" PRIx64 " gs=%016" PRIx64
 	             " ps=%016" PRIx64 " count=%u instances=%u vs_program=%d ps_program=%d ps_active=%d"
 	             " ls=%016" PRIx64 " hs=%016" PRIx64 " rt_mask=0x%x z=%d zw=%d zfunc=%u"
-	             " zbase=0x%" PRIx64 " zfmt=%u\n",
+	             " zbase=0x%" PRIx64 " zfmt=%u se=%d sf=%u/%u sops=%u%u%u ref=%u mask=%x wmask=%x opval=%u"
+	             " sbase=0x%" PRIx64 " swbase=0x%" PRIx64 " sfmt=%u htile=0x%" PRIx64 "\n",
 	             frame, kind, hash(sh_ctx.GetVs().es_regs.data_addr),
 	             hash(sh_ctx.GetVs().gs_regs.data_addr), hash(sh_ctx.GetPs().ps_regs.data_addr),
 	             count, instances, vs_program, ps_program, ps_active,
 	             hash(sh_ctx.GetVs().ls_regs.data_addr), hash(sh_ctx.GetVs().hs_regs.data_addr),
 	             regs.GetRenderTargetMask(), dc.z_enable ? 1 : 0, dc.z_write_enable ? 1 : 0,
 	             static_cast<unsigned>(dc.zfunc), drt.z_read_base_addr,
-	             static_cast<unsigned>(drt.z_info.format));
+	             static_cast<unsigned>(drt.z_info.format), dc.stencil_enable ? 1 : 0,
+	             static_cast<unsigned>(dc.stencilfunc), static_cast<unsigned>(dc.stencilfunc_bf),
+	             static_cast<unsigned>(regs.GetStencilControl().stencil_fail),
+	             static_cast<unsigned>(regs.GetStencilControl().stencil_zpass),
+	             static_cast<unsigned>(regs.GetStencilControl().stencil_zfail),
+	             static_cast<unsigned>(regs.GetStencilMask().stencil_testval),
+	             static_cast<unsigned>(regs.GetStencilMask().stencil_mask),
+	             static_cast<unsigned>(regs.GetStencilMask().stencil_writemask),
+	             static_cast<unsigned>(regs.GetStencilMask().stencil_opval),
+	             drt.stencil_read_base_addr, drt.stencil_write_base_addr,
+	             static_cast<unsigned>(drt.stencil_info.format), drt.htile_data_base_addr);
 	std::fflush(stderr);
 }
 
+void SeqNote(char kind, uint64_t shader_addr, int queue, uint64_t frame, uint64_t presented); // graphicsRun.cpp
+
+// KYTY_FULL_BARRIER_PS=<hex,...> (experiment): draws of those pixel shaders get a full memory
+// barrier (all commands, all memory) before and after them, outside the render pass. Shows
+// whether a draw reads or writes something a missing barrier leaves racing.
+static bool FullBarrierPs(uint64_t hash) {
+	static const std::string list = [] {
+		const char* value = std::getenv("KYTY_FULL_BARRIER_PS");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	return !list.empty() && hash != 0 &&
+	       (list == "all" || list.find(fmt::format("{:016x}", hash)) != std::string::npos);
+}
+
+static void FullMemoryBarrier(const CommandRecorder& vk_buffer) {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
+	                          0, nullptr);
+}
+
+
 static void LogDrawCensus(CommandBuffer& buffer, const DrawCallInfo& draw,
                           const DrawRenderState& state) {
+	SeqNote('D', buffer.GetShaders().GetPs().ps_regs.data_addr, 0,
+	        static_cast<uint64_t>(buffer.GetContext().GetGpu().GetFrameNum()),
+	        buffer.GetContext().GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	LogDrawCensusLine(buffer, draw.Name(), draw.index_count, draw.instance_count,
 	                  state.programs.vertex[0] ? 1 : 0, state.programs.pixel ? 1 : 0,
 	                  state.ps_active ? 1 : 0);
@@ -1379,6 +2277,7 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	const CpuCost::Phase cpu_phase_("PrepareDrawRenderState");
 	KYTY_PROFILER_FUNCTION();
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
@@ -1416,7 +2315,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 
-	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
+	// A draw that writes nothing still counts its samples for an occlusion query (the game's
+	// reference draw with depth testing off): it rasterizes without attachments.
+	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active &&
+	    !Occlusion::CountsDraw(buffer)) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
 		return false;
@@ -1583,11 +2485,57 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// KYTY_WATCH_STENCIL_PS=<hex,...>: while the KYTY_WATCH_SHADER_TRIGGER file exists, after each draw
+// of a listed pixel shader (first 12 frames) the stencil plane of its depth target is copied out
+// to _ShaderDump/wimg_<frame>_<hash>_host.bin.
+static void WatchStencilAfterDraw(RenderContext& context, const CommandBuffer& buffer,
+                                  const DrawRenderState& state) {
+	static const std::string hashes = [] {
+		const char* value = std::getenv("KYTY_WATCH_STENCIL_PS");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	static const char* trigger = std::getenv("KYTY_WATCH_SHADER_TRIGGER");
+	if (hashes.empty() || trigger == nullptr || !state.depth_info.image_id) {
+		return;
+	}
+	const auto ps = buffer.GetShaders().GetPs().ps_regs.data_addr;
+	if (ps == 0) {
+		return;
+	}
+	const auto hash = ShaderDeclaredHash(ps);
+	const auto name = fmt::format("{:016x}", hash);
+	if (hashes.find(name) == std::string::npos) {
+		return;
+	}
+	const auto frame = context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	static uint64_t checked = UINT64_MAX;
+	static bool     on      = false;
+	static uint64_t first   = 0;
+	if (checked != frame) {
+		checked = frame;
+		std::error_code error;
+		const bool now_on = std::filesystem::exists(trigger, error);
+		if (now_on && !on) {
+			first = frame;
+		}
+		on = now_on;
+	}
+	if (!on || frame >= first + 12) {
+		return;
+	}
+	auto& cache = context.GetTextureCache();
+	if (!cache.GetImage(state.depth_info.image_id).info.HasStencil()) {
+		return;
+	}
+	cache.WatchImageDump(state.depth_info.image_id, frame, ("_" + name.substr(0, 8)).c_str());
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	const CpuCost::Phase cpu_phase_("ExecutePreparedDraw");
 	KYTY_PROFILER_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
@@ -1629,12 +2577,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	vk::Buffer     mesh_command_buffer = nullptr;
 	vk::DeviceSize mesh_command_offset = 0;
+	Buffer*        gpu_args_buffer = nullptr;
 	if (emit.gpu_args_address != 0) {
 		KYTY_PROFILER_BLOCK("Draw::GpuArgs");
 		// The mesh shader reads the start vertex there, and the counts are copied from there:
 		// synchronize and register the arguments like the guest indices below.
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    emit.gpu_args_address, 16u, false, false, {}, true);
+		gpu_args_buffer = args_buffer;
 		if (mesh_active && args_buffer != nullptr && args_buffer->HasDeviceAddress()) {
 			// The counts become the mesh-tasks command on the GPU, validated against the device's
 			// limits (MeshIndirectArgs), before the draw's bindings are committed.
@@ -1669,11 +2619,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+		const auto& clip               = state.vertex_info[i].clip_space;
+		bindings.vertex[i].clip_space = {clip.scale[0],  clip.scale[1],       clip.offset[0],
+		                                 clip.offset[1], clip.half_extent[0], clip.half_extent[1]};
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
 	}
 	if (state.ps_active) {
 		if (!bindings.pixel) bindings.pixel.emplace();
+		auto& mapping = bindings.pixel->export_mapping;
+		mapping       = {0u, 0u};
+		for (uint32_t target = 0; target < 8u; target++) {
+			mapping[target / 4u] |= static_cast<uint32_t>(state.ps_input_info.target_export_mapping[target].packed)
+			                        << ((target % 4u) * 8u);
+		}
 		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
@@ -1689,6 +2648,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+	}
+	// KYTY_REBIND_AFTER_JOIN: a lookup after the bindings (another stage's, the vertex or index
+	// range) joined a buffer they resolved; resolve them and the per-draw ranges again.
+	if (RebindAfterJoin(stages, m_rebind_epoch, "draw") && !mesh_active) {
+		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		(void)RebindAfterJoin(stages, m_rebind_epoch, "draw (after its vertex/index ranges)");
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
@@ -1716,10 +2682,196 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
 		    primitive_restart_enable, state.programs, may_defer);
 	}();
+	// Only the generic meshlet shader has the user-data layout LogMeshNear walks; other mesh shaders
+	// would make it read through unrelated descriptors.
+	if (static const bool mesh_near = std::getenv("KYTY_MESH_NEAR") != nullptr;
+	    mesh_near && mesh_active && state.vertex_info[0].stage.program->shader_hash == 0x8fb896cb9412ab56ull) {
+		const auto& vs = buffer.GetShaders().GetVs();
+		LogMeshNear(Sync::GuestFlipCount(), vs.gs_user_sgpr.value, vs.gs_user_sgpr.count, draw.index_count,
+		            draw.first_instance, state.vertex_info[0].stage.program->shader_hash,
+		            state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
+	}
+	// KYTY_LOG_PS_DRAWS=<ps hash> (diagnostics): every draw of that pixel shader, with the guest
+	// flip, its counts, whether the GPU reads its arguments, and the NGG user data slots 16..18
+	// (30 lines a flip at most).
+	if (static const std::string log_ps = [] {
+		    const char* value = std::getenv("KYTY_LOG_PS_DRAWS");
+		    return value != nullptr ? std::string(value) : std::string();
+	    }();
+	    !log_ps.empty() && state.ps_active &&
+	    log_ps.find(fmt::format("{:016x}", state.ps_input_info.stage.program->shader_hash)) !=
+	        std::string::npos) {
+		static std::atomic<uint64_t> last_flip {0};
+		static std::atomic<uint32_t> lines {0};
+		const auto                   flip = Sync::GuestFlipCount();
+		if (last_flip.exchange(flip) != flip) lines.store(0);
+		if (lines.fetch_add(1) < 30) {
+			const auto& users = buffer.GetShaders().GetVs().gs_user_sgpr.value;
+			std::fprintf(stderr,
+			             "[ps-draw] flip=%llu %s count=%u instances=%u first_instance=%u gpu_args=0x%llx "
+			             "start_sgpr=%u vs=%016llx mesh=%d s16=%08x s17=%08x s18=%08x\n",
+			             static_cast<unsigned long long>(flip), draw.Name(), draw.index_count,
+			             draw.instance_count, draw.first_instance,
+			             static_cast<unsigned long long>(emit.gpu_args_address), emit.start_instance_sgpr,
+			             static_cast<unsigned long long>(state.vertex_info[0].stage.program->shader_hash),
+			             mesh_active ? 1 : 0, users[16], users[17], users[18]);
+			{
+				const auto& regs = buffer.GetRegisters();
+				const auto& dc   = regs.GetDepthControl();
+				const auto& mc   = regs.GetModeControl();
+				const auto& po   = regs.GetPolyOffset();
+				const auto& drt  = regs.GetDepthRenderTarget();
+				const auto& ds   = state.depth_info;
+				std::fprintf(stderr,
+				             "[ps-draw-ds] flip=%llu z=%d zw=%d zfunc=%u bounds=%d stencil=%d sfunc=%u/%u "
+				             "cull=%d/%d face=%d poly_off=%d/%d scale=%g/%g offset=%g/%g clamp=%g "
+				             "neg_bits=%d float=%d zbase=0x%llx zfmt=%u host_zfmt=%u test=%d write=%d op=%u "
+				             "minmax=%g/%g\n",
+				             static_cast<unsigned long long>(flip), dc.z_enable ? 1 : 0,
+				             dc.z_write_enable ? 1 : 0, static_cast<unsigned>(dc.zfunc),
+				             dc.depth_bounds_enable ? 1 : 0, dc.stencil_enable ? 1 : 0,
+				             static_cast<unsigned>(dc.stencilfunc), static_cast<unsigned>(dc.stencilfunc_bf),
+				             mc.cull_front ? 1 : 0, mc.cull_back ? 1 : 0, mc.face ? 1 : 0,
+				             mc.poly_offset_front_enable ? 1 : 0, mc.poly_offset_back_enable ? 1 : 0,
+				             po.front_scale, po.back_scale, po.front_offset, po.back_offset, po.clamp,
+				             po.neg_num_db_bits, po.db_is_float_fmt ? 1 : 0,
+				             static_cast<unsigned long long>(drt.z_read_base_addr),
+				             static_cast<unsigned>(drt.z_info.format),
+				             static_cast<unsigned>(ds.desc.view_info.format), ds.depth_test_enable ? 1 : 0,
+				             ds.depth_write_enable ? 1 : 0, static_cast<unsigned>(ds.depth_compare_op),
+				             ds.depth_min_bounds, ds.depth_max_bounds);
+				for (uint32_t i = 0; i < 8; i++) {
+					const auto& rt = regs.GetRenderTarget(i);
+					const auto& bc = regs.GetBlendControl(i);
+					if (rt.base.addr == 0 || ((regs.GetRenderTargetMask() >> (i * 4u)) & 0xfu) == 0) continue;
+					std::fprintf(stderr,
+					             "[ps-draw-rt] flip=%llu rt%u addr=0x%llx fmt=%u nfmt=%u %ux%u mask=%x bypass=%d "
+					             "blend=%d src=%u dst=%u comb=%u sep=%d asrc=%u adst=%u acomb=%u\n",
+					             static_cast<unsigned long long>(flip), i,
+					             static_cast<unsigned long long>(rt.base.addr),
+					             static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
+					             rt.attrib2.width + 1, rt.attrib2.height + 1,
+					             (regs.GetRenderTargetMask() >> (i * 4u)) & 0xfu, rt.info.blend_bypass ? 1 : 0,
+					             bc.enable ? 1 : 0, bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
+					             bc.separate_alpha_blend ? 1 : 0, bc.alpha_srcblend, bc.alpha_destblend,
+					             bc.alpha_comb_fcn);
+				}
+			}
+			const auto& ps_regs  = buffer.GetShaders().GetPs();
+			const auto& ps_users = ps_regs.ps_user_sgpr.value;
+			std::fprintf(stderr,
+			             "[ps-draw-ud] flip=%llu n=%u rsrc2=%u s24..31: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			             static_cast<unsigned long long>(flip), ps_regs.ps_user_sgpr.count,
+			             static_cast<uint32_t>(ps_regs.ps_regs.rsrc2.user_sgpr), ps_users[24], ps_users[25],
+			             ps_users[26], ps_users[27], ps_users[28], ps_users[29], ps_users[30], ps_users[31]);
+			// What each stage binds, and the dwords of its first (small, per-draw) buffer.
+			{
+				auto& cache = m_context.GetTextureCache();
+				for (const auto* stage: stages) {
+					if (stage == nullptr || stage->runtime == nullptr || stage->runtime->program == nullptr) continue;
+					std::string text;
+					for (const auto& binding: stage->images) {
+						const auto* image = cache.TryGetImage(binding.image_id);
+						if (image == nullptr) continue;
+						text += fmt::format(" img{}:{:x}:{}x{}:f{}", 
+						                    binding.desc.type == TextureCache::BindingType::Storage ? "S" : "T",
+						                    image->info.data.address, image->info.extent.width,
+						                    image->info.extent.height, static_cast<uint32_t>(image->backing.format));
+					}
+					for (const auto& src: stage->buffer_sources) {
+						text += fmt::format(" buf:{:x}+{:x}", src.address, src.size);
+					}
+					if (!stage->buffer_sources.empty() && stage->buffer_sources[0].size <= 0x100 &&
+					    stage->buffer_sources[0].address != 0) {
+						const auto* words =
+						    reinterpret_cast<const uint32_t*>(stage->buffer_sources[0].address);
+						text += " |";
+						for (uint64_t i = 0; i < stage->buffer_sources[0].size / 4; i++) {
+							text += fmt::format(" {:08x}", words[i]);
+						}
+					}
+					std::fprintf(stderr, "[ps-draw-res] flip=%llu sh=%016llx%s\n",
+					             static_cast<unsigned long long>(flip),
+					             static_cast<unsigned long long>(stage->runtime->program->shader_hash),
+					             text.c_str());
+				}
+			}
+			if (mesh_active && MeshWalkEnabled()) {
+				const auto& vs = buffer.GetShaders().GetVs();
+				LogMeshWalk(flip, vs.gs_user_sgpr.value, vs.gs_user_sgpr.count, draw.index_count,
+				            draw.first_instance, m_context.GetBufferCache());
+			}
+			// KYTY_WATCH_DRAW=<flip>:<ES user sgpr>:<offset> (dec:hex:hex): at the first logged draw
+			// from that guest flip on, put a hardware write watch on the buffer the V# in that user
+			// sgpr pair points at, + offset (who on the CPU writes this draw's constants).
+			if (static const char* watch_draw = std::getenv("KYTY_WATCH_DRAW"); watch_draw != nullptr) {
+				static std::atomic_bool done {false};
+				unsigned long long      from = 0;
+				unsigned                sgpr = 0;
+				unsigned long long      off  = 0;
+				if (!done.load() && std::sscanf(watch_draw, "%llu:%x:%llx", &from, &sgpr, &off) == 3 &&
+				    flip >= from) {
+					const auto& vs = buffer.GetShaders().GetVs();
+					if (sgpr + 1 < vs.gs_user_sgpr.count && !done.exchange(true)) {
+						const uint64_t base = vs.gs_user_sgpr.value[sgpr] |
+						                      (static_cast<uint64_t>(vs.gs_user_sgpr.value[sgpr + 1] & 0xffffu) << 32u);
+						Common::TracePoints::SetWatch(base + off, 4, 0x60);
+					}
+				}
+			}
+			if (!SlotDumps().empty()) {
+				const auto& vs = buffer.GetShaders().GetVs();
+				LogSlotDumps(flip, vs.gs_user_sgpr.value, vs.gs_user_sgpr.count,
+				             m_context.GetBufferCache());
+			}
+		}
+	}
+	if (const auto watched = RtDrawLog::Address(); watched != 0) {
+		uint32_t slots = 0;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			if (state.color_info[i].desc.info.data.address == watched) {
+				slots |= 1u << state.color_info[i].target_slot;
+			}
+		}
+		if (slots != 0) {
+			const auto& d  = state.depth_info;
+			const auto& sf = d.stencil_front;
+			char        text[320];
+			std::snprintf(
+			    text, sizeof(text),
+			    "slots=%x n=%u depth=0x%llx test=%d write=%d op=%d bounds=%d stencil=%d cmp=%d "
+			    "ref=%u rmask=%x wmask=%x pass=%d fail=%d zfail=%d %s",
+			    slots, state.color_count,
+			    static_cast<unsigned long long>(d.desc.info.data.address), d.depth_test_enable ? 1 : 0,
+			    d.depth_write_enable ? 1 : 0, static_cast<int>(d.depth_compare_op),
+			    d.depth_bounds_test_enable ? 1 : 0, d.stencil_test_enable ? 1 : 0,
+			    static_cast<int>(sf.compareOp), sf.reference, sf.compareMask, sf.writeMask,
+			    static_cast<int>(sf.passOp), static_cast<int>(sf.failOp),
+			    static_cast<int>(sf.depthFailOp), draw.Name());
+			uint64_t state_hash = 1469598103934665603ull;
+			for (const char* c = text; *c != '\0'; c++) {
+				state_hash = (state_hash ^ static_cast<uint8_t>(*c)) * 1099511628211ull;
+			}
+			RtDrawLog::NoteDraw(state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+			                    state_hash, deferred_pipeline == nullptr, text);
+		}
+	}
 	if (deferred_pipeline == nullptr) {
+		if (Common::FrameSkips::Enabled()) {
+			Common::FrameSkips::Skip(Common::FrameSkips::NoPipeline);
+			if (state.ps_active && Common::FrameSkips::Watched(state.ps_input_info.stage.program->shader_hash)) {
+				Common::FrameSkips::g_watched_nopipe.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		return;
 	}
 	auto& pipeline = *deferred_pipeline;
+	if (Common::FrameSkips::Enabled()) {
+		Common::FrameSkips::g_draws.fetch_add(1, std::memory_order_relaxed);
+		if (state.ps_active && Common::FrameSkips::Watched(state.ps_input_info.stage.program->shader_hash)) {
+			Common::FrameSkips::g_watched.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = [&] {
 		KYTY_PROFILER_BLOCK("Draw::AcquireRenderTargets");
@@ -1739,6 +2891,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
+	// KYTY_GPL: a linked pipeline (independent-sets layout) is bound before its sets and push
+	// constants too: they were recorded against the previous pipeline (often a monolithic one
+	// with an incompatible layout), and linked pipelines read garbage set addresses (v436q,
+	// fixed-address faults). KYTY_GPL_BIND_FIRST=0 restores the old order.
+	static const bool bind_first = [] {
+		const char* value = std::getenv("KYTY_GPL_BIND_FIRST");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (bind_first && pipeline.independent_sets) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Bound());
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
 		// GPU arguments: dword 3 = 0xFFFFFFFF tells the fast-launch entry to read the start vertex
@@ -1756,14 +2919,67 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    0u};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
+		                        pipeline.push_stages ? pipeline.push_stages
+		                                             : vk::ShaderStageFlagBits::eMeshEXT |
+		                                                   vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	// Diagnostics: KYTY_LOG_TESS_DRAWS=1 prints each distinct tessellated draw once ([tess-draw]:
+	// every vertex-stage hash, the pixel shader, depth state, colour targets, sizes), then counts
+	// per combination every 10 s, to find all passes that draw a tessellated surface.
+	if (static const bool log_tess = std::getenv("KYTY_LOG_TESS_DRAWS") != nullptr;
+	    log_tess && buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		std::string stages_text;
+		for (const auto& stage: vertex_stages) {
+			stages_text += fmt::format(
+			    "{}{:016x}", stages_text.empty() ? "" : "/",
+			    stage.stage.program != nullptr ? stage.stage.program->shader_hash : 0ull);
+		}
+		const uint64_t ps = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                        ? state.ps_input_info.stage.program->shader_hash
+		                        : 0ull;
+		const auto& depth = state.depth_info;
+		const auto  key   = fmt::format("vs={} ps={:016x} ztest={} zwrite={} zop={} colors={} "
+		                                "idx={} inst={}",
+		                                stages_text, ps, depth.depth_test_enable ? 1 : 0,
+		                                depth.depth_write_enable ? 1 : 0,
+		                                static_cast<int>(depth.depth_compare_op), state.color_count,
+		                                draw.index_count, draw.instance_count);
+		static std::mutex                               tess_mutex;
+		static std::map<std::string, uint64_t>          tess_counts;
+		static int64_t                                  tess_printed_ms = 0;
+		std::lock_guard                                 lock(tess_mutex);
+		if (tess_counts[key]++ == 0) {
+			std::fprintf(stderr, "[tess-draw] new %s\n", key.c_str());
+		}
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (now - tess_printed_ms > 10000) {
+			tess_printed_ms = now;
+			for (auto& [text, count]: tess_counts) {
+				if (count != 0) {
+					std::fprintf(stderr, "[tess-draw] %llu x %s\n",
+					             static_cast<unsigned long long>(count), text.c_str());
+				}
+			}
+		}
+	}
+	LogAndDiagnoseFacing(buffer, vk_buffer,
+	                     state.ps_active && state.ps_input_info.stage.program != nullptr
+	                         ? state.ps_input_info.stage.program->shader_hash
+	                         : 0ull);
+	if (state.ps_active) {
+		if (const int paint = PaintDraws::Index(state.ps_input_info.stage.program->shader_hash);
+		    paint >= 0) {
+			const auto color = PaintDraws::Color(paint);
+			vk_buffer.setBlendConstants(color.data());
+		}
+	}
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
@@ -1861,6 +3077,29 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                          nullptr, 0, nullptr);
 	}
 
+	const bool full_barrier =
+	    state.ps_active && FullBarrierPs(state.ps_input_info.stage.program->shader_hash);
+	if (full_barrier) {
+		m_context.GetCommandScheduler().EndRendering();
+		FullMemoryBarrier(vk_buffer);
+	}
+	if (SyncToggle::NoGuestBarriers()) {
+		// Without the guest's global barriers (upstream 70668fbd), a draw whose shaders write
+		// buffers waits for earlier accesses to that memory, as dispatches do.
+		vk::PipelineStageFlags hazard_stages = {};
+		for (const auto& stage: vertex_stages) {
+			if (HasShaderBufferWrites(stage.stage)) {
+				hazard_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+			}
+		}
+		if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+			hazard_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+		}
+		if (hazard_stages) {
+			m_context.GetCommandScheduler().EndRendering();
+			ShaderWriteHazardBarrier(vk_buffer, hazard_stages);
+		}
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -1869,14 +3108,56 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'D',
 	             vertex_stages.back().stage.program->shader_hash,
 	             state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
+	if (ImageHistory::Enabled()) {
+		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		const auto hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+		for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+			ImageHistory::NoteBindView(static_cast<VkImageView>(rendering.color_attachments[i].image_view),
+			                           tick, hash, 'A');
+		}
+		if (rendering.depth_stencil_attachment.image_view) {
+			ImageHistory::NoteBindView(static_cast<VkImageView>(rendering.depth_stencil_attachment.image_view),
+			                           tick, hash, 'Z');
+		}
+	}
+	if (static const bool fault_map = EnvSwitchOn("KYTY_FAULT_MAP"); fault_map) {
+		std::array<uint64_t, 24> views {};
+		size_t                   count = 0;
+		for (const auto& info: m_descriptor_images) {
+			if (count < views.size()) views[count++] = reinterpret_cast<uint64_t>(static_cast<VkImageView>(info.imageView));
+		}
+		for (uint32_t i = 0; i < rendering.num_color_attachments && count < views.size(); i++) {
+			views[count++] = reinterpret_cast<uint64_t>(static_cast<VkImageView>(rendering.color_attachments[i].image_view));
+		}
+		if (rendering.depth_stencil_attachment.image_view && count < views.size()) {
+			views[count++] = reinterpret_cast<uint64_t>(static_cast<VkImageView>(rendering.depth_stencil_attachment.image_view));
+		}
+		std::array<uint32_t, 6> regions {};
+		size_t                  num_regions = 0;
+		for (const auto& stage: m_draw_bindless_regions) {
+			if (num_regions < regions.size()) regions[num_regions++] = stage;
+		}
+		NoteTickWorkViews(views.data(), count, regions.data(), num_regions);
+		NoteFaultMapBindings(false);
+	}
+	DrawStats::Prepare(m_context, buffer);
+	Occlusion::Prepare(m_context, buffer);
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Bound());
+	if (pipeline.eds3_raster) {
+		const auto raster = DrawDynamicRaster(
+		    buffer.GetRegisters(), Prospero::IsRectList(buffer.GetUserConfig().GetPrimType()));
+		vk_buffer.setDepthClipEnableEXT(raster.depth_clip_enable ? VK_TRUE : VK_FALSE);
+		vk_buffer.setDepthClipNegativeOneToOneEXT(raster.negative_one_to_one ? VK_TRUE : VK_FALSE);
+		vk_buffer.setPolygonModeEXT(raster.polygon_mode);
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	// KYTY_RT_SIZES=1: draws per first color target size, every 10 s ([rt-sizes]): the game's
-	// internal render resolution.
-	if (static const bool log = std::getenv("KYTY_RT_SIZES") != nullptr; log) {
+	// internal render resolution. Counts full draws only (a replayed multi-draw sub-draw shares its
+	// base's targets), so it no longer turns replay off (v438c).
+	if (static const bool log = EnvSwitchOn("KYTY_RT_SIZES"); log) {
 		static std::mutex                             mutex;
 		static std::unordered_map<uint64_t, uint32_t> sizes;
 		static auto                                   last = std::chrono::steady_clock::now();
@@ -1951,6 +3232,67 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	SetNextDrawSafe(draw_safe);
+	// KYTY_XRAY_PS=<hash+...>|blend|all (diagnostics; changes the picture): these pixel shaders'
+	// draws (blend: every draw that blends into its first target) skip the depth and stencil
+	// tests and culling, to see an effect that draws but is hidden or rejected.
+	// KYTY_XRAY_VS=<hash+...>: also requires the vertex stage's program to be listed.
+	// KYTY_XRAY_MODE=<bits>: 1 depth test, 2 stencil test, 4 culling (default 7: all).
+	// Every 100 guest flips [xray] lists the (vs, ps) pairs X-rayed in that flip with their draws.
+	if (static const std::string xray = [] {
+		    const char* value = std::getenv("KYTY_XRAY_PS");
+		    return value != nullptr ? std::string(value) : std::string();
+	    }();
+	    !xray.empty() && state.ps_active) {
+		static const std::string xray_vs = [] {
+			const char* value = std::getenv("KYTY_XRAY_VS");
+			return value != nullptr ? std::string(value) : std::string();
+		}();
+		const uint64_t vs_hash = vertex_stages.back().stage.program->shader_hash;
+		const uint64_t ps_hash = state.ps_input_info.stage.program->shader_hash;
+		bool           match =
+		    xray == "all" ||
+		    (xray == "blend" ? buffer.GetRegisters().GetBlendControl(0).enable
+		                     : xray.find(fmt::format("{:016x}", ps_hash)) != std::string::npos);
+		if (match && !xray_vs.empty()) {
+			match = xray_vs.find(fmt::format("{:016x}", vs_hash)) != std::string::npos;
+		}
+		static const uint32_t mode = [] {
+			const char* value = std::getenv("KYTY_XRAY_MODE");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 7u;
+		}();
+		if (match) {
+			if ((mode & 1u) != 0) vk_buffer.setDepthTestEnable(VK_FALSE);
+			if ((mode & 2u) != 0) vk_buffer.setStencilTestEnable(VK_FALSE);
+			if ((mode & 4u) != 0 && PipelineDynamicRasterStateEnabled()) {
+				vk_buffer.setCullMode(vk::CullModeFlagBits::eNone);
+			}
+			static std::mutex                                                census_mutex;
+			static std::map<std::pair<uint64_t, uint64_t>, std::pair<uint32_t, uint64_t>> census;
+			static uint64_t                                                  census_flip = ~0ull;
+			const auto flip = Sync::GuestFlipCount();
+			std::lock_guard lock(census_mutex);
+			if (flip / 100 != census_flip / 100) {
+				if (!census.empty()) {
+					std::string text;
+					for (const auto& [key, value]: census) {
+						text += fmt::format(" {:016x}/{:016x}:{}x{}", key.first, key.second,
+						                    value.first, value.second);
+					}
+					std::fprintf(stderr, "[xray] flip=%llu%s\n",
+					             static_cast<unsigned long long>(census_flip), text.c_str());
+					census.clear();
+				}
+				census_flip = flip;
+			}
+			if (flip == census_flip) {
+				auto& entry = census[{vs_hash, ps_hash}];
+				entry.first++;
+				entry.second = draw.index_count;
+			}
+		}
+	}
+	DrawStats::Begin(m_context, buffer);
+	Occlusion::Begin(m_context, buffer);
 	if (mesh_active) {
 		if (mesh_indirect_buffer) {
 			vk_buffer.drawMeshTasksIndirectEXT(mesh_indirect_buffer, mesh_indirect_offset, 1, 16u);
@@ -1971,8 +3313,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				if (groups_done != 0) {
 					// The same stages as the draw dwords' push above (the layout's range).
 					vk_buffer.pushConstants(pipeline.pipeline_layout,
-					                        vk::ShaderStageFlagBits::eMeshEXT |
-					                            vk::ShaderStageFlagBits::eFragment,
+					                        pipeline.push_stages ? pipeline.push_stages
+					                                             : vk::ShaderStageFlagBits::eMeshEXT |
+					                                                   vk::ShaderStageFlagBits::eFragment,
 					                        base_offset, sizeof(groups_done), &groups_done);
 				}
 				vk_buffer.drawMeshTasksEXT(groups, draw.instance_count, 1);
@@ -1984,7 +3327,41 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	Occlusion::End(m_context, buffer);
+	if (DrawStats::Enabled()) {
+		DrawStats::Info info;
+		info.vs        = vertex_stages.back().stage.program->shader_hash;
+		info.ps        = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+		info.kind      = draw.Name();
+		info.count     = draw.index_count;
+		info.instances = draw.instance_count;
+		info.gpu_args  = static_cast<bool>(mesh_indirect_buffer) || static_cast<bool>(vertex_indirect_buffer);
+		if (state.color_count > 0 && state.color_info[0].image_id) {
+			const auto& image = m_context.GetTextureCache().GetImage(state.color_info[0].image_id);
+			info.rt0   = image.info.data.address;
+			info.rt0_w = image.info.extent.width;
+			info.rt0_h = image.info.extent.height;
+		}
+		const auto& bc = buffer.GetRegisters().GetBlendControl(0);
+		info.blend     = bc.enable;
+		info.blend_src = static_cast<uint32_t>(bc.color_srcblend);
+		info.blend_dst = static_cast<uint32_t>(bc.color_destblend);
+		DrawStats::End(m_context, buffer, info);
+	}
 	SetNextDrawSafe(false);
+	if (RtSnap::Enabled()) {
+		RtSnap::AfterCommand(m_context, "draw", stages);
+	}
+	if (RtSnap::ProbeEnabled()) {
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX> probe_colors {};
+		for (uint32_t i = 0; i < state.color_count && i < probe_colors.size(); i++) {
+			probe_colors[i] = state.color_info[i].image_id;
+		}
+		RtSnap::ProbeAfterDraw(m_context, std::span {probe_colors.data(), state.color_count},
+		                       state.depth_info.image_id, vertex_stages.back().stage.program->shader_hash,
+		                       state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+		                       draw.Name());
+	}
 	Profiler::Add(Profiler::Counter::Draws);
 	GpuProfiler::End(buffer, gpu_zone);
 	GpuTiming::After(m_context, buffer,
@@ -2010,9 +3387,47 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const char* value = std::getenv("KYTY_DRAW_WRITE_BARRIER");
 		return value == nullptr || value[0] != '0';
 	}();
-	if (shader_write_stages && draw_write_barrier) {
+	if (shader_write_stages && draw_write_barrier && !SyncToggle::SkipDrawWriteBarrier()) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+	}
+	if (full_barrier) {
+		m_context.GetCommandScheduler().EndRendering();
+		FullMemoryBarrier(vk_buffer);
+	}
+	if (m_replay.active ||
+	    (RenderStats::IndirectReplayActive() && emit.gpu_args_address != 0)) {
+		bool writes = shader_write_stages || full_barrier ||
+		              (state.ps_active && (writes_memory(state.ps_input_info.stage) ||
+		                                   state.ps_input_info.stage.program->has_address_writes));
+		for (const auto& stage: vertex_stages) {
+			writes = writes || writes_memory(stage.stage) || stage.stage.program->has_address_writes;
+		}
+		const auto& run = MeshArgsRun();
+		// Captured only while replay is active, so the toggle's off windows pay nothing for it.
+		const bool indirect_base = !m_replay.active && emit.gpu_args_address != 0 &&
+		                           RenderStats::IndirectReplayActive() &&
+		                           state.vertex_info[0].mesh.fast_launch &&
+		                           mesh_indirect_buffer != nullptr && emit.indirect_packet != nullptr &&
+		                           run.last_used_packet == emit.indirect_packet &&
+		                           run.last_used_generation == run.generation;
+		const bool cpu_base = emit.gpu_args_address == 0 && m_replay.active && !mesh_indirect_buffer;
+		if (mesh_active && !draw.IsIndexed() && (cpu_base || indirect_base) &&
+		    vertex_stages.size() == 1 && buffer.IsRendering() &&
+		    buffer.CurrentRenderState() == rendering) {
+			CaptureReplayBase(buffer, draw, state, emit, pipeline.pipeline_layout, writes,
+			                 mesh_indirect_buffer, mesh_indirect_offset, gpu_args_buffer);
+		} else {
+			if (emit.gpu_args_address != 0) {
+				const auto reason = !mesh_active || !state.vertex_info[0].mesh.fast_launch
+				                        ? RenderStats::IndirectReplayNote::BaseNotFastLaunch
+				                        : RenderStats::IndirectReplayNote::BaseArgsRun;
+				m_replay.indirect_invalid_reason = static_cast<uint32_t>(reason);
+				RenderStats::NoteIndirectReplay(reason);
+			} else {
+				RenderStats::NoteReplay(RenderStats::ReplayNote::BaseNotMesh);
+			}
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
@@ -2023,6 +3438,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	m_replay.valid = false;
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2053,6 +3469,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return;
+	}
+	if (ReuseProbe::Enabled()) {
+		ReuseProbe::NoteDraw(sh_ctx, buffer.GetRegisters(), ucfg, args.render_target_slice_offset, 2u);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -2116,6 +3535,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		Common::FrameSkips::Skip(Common::FrameSkips::PrepFailed);
 		ResetBindings();
 		return;
 	}
@@ -2136,12 +3556,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
+	WatchStencilAfterDraw(m_context, buffer, state);
 	ResetBindings();
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	m_replay.valid = false;
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2200,6 +3622,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return;
 	}
+	if (ReuseProbe::Enabled()) {
+		ReuseProbe::NoteDraw(sh_ctx, buffer.GetRegisters(), ucfg, args.render_target_slice_offset, 1u);
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		LOGF("GraphicsRenderDrawIndexAuto():Shader:\n");
@@ -2228,6 +3653,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+		Common::FrameSkips::Skip(Common::FrameSkips::PrepFailed);
 		ResetBindings();
 		return;
 	}
@@ -2335,12 +3761,526 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.gpu_args_address = drawn.gpu_args_address;
 	emit.gpu_instance_count_address = drawn.gpu_instance_count_address;
 	emit.start_instance_sgpr = drawn.gpu_args_address != 0 ? drawn.start_instance_sgpr : 0u;
+	emit.indirect_packet = drawn.gpu_args_address != 0 ? drawn.indirect_packet : nullptr;
 	LogWatchedDraw(drawn_info, state, ucfg.GetIndexOffset(), 0, drawn.first_vertex,
 	               static_cast<int32_t>(emit.first_vertex), emit.first_instance, indirect);
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, drawn_info, state, topology, emit, index_source, false);
+	WatchStencilAfterDraw(m_context, buffer, state);
 	ResetBindings();
+}
+
+void RenderExecutor::BeginMultiDraw() {
+	m_replay.active = true;
+	m_replay.valid  = false;
+}
+
+void RenderExecutor::EndMultiDraw() {
+	m_replay.active = false;
+	m_replay.valid  = false;
+}
+
+// Per-draw diagnostics that a replayed draw would skip: the replay is off while any runs.
+// The shader registers as bytes for indirect replay, with the GS and PS user SGPR values zeroed:
+// replay checks those itself (vertex parameters and the plan's resource words, PS user data), and
+// compares everything else (programs, resource registers, SGPR types and counts) exactly.
+static void ShaderBytesForReplay(const HW::Shader& sh, std::vector<uint8_t>& out) {
+	out.resize(sizeof(sh));
+	std::memcpy(out.data(), &sh, sizeof(sh));
+	const auto* base = reinterpret_cast<const uint8_t*>(&sh);
+	const auto  zero = [&](const void* field, size_t size) {
+		std::memset(out.data() + (reinterpret_cast<const uint8_t*>(field) - base), 0, size);
+	};
+	zero(sh.GetVs().gs_user_sgpr.value, sizeof(sh.GetVs().gs_user_sgpr.value));
+	zero(sh.GetPs().ps_user_sgpr.value, sizeof(sh.GetPs().ps_user_sgpr.value));
+}
+
+// KYTY_LOG_INDIRECT_DRAWS (graphicsRun.cpp) logs per indirect draw: replay would skip those lines.
+static bool LogIndirectDraw() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LOG_INDIRECT_DRAWS");
+		return value != nullptr && std::strtoul(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+// A diagnostic switch is on when set to anything but empty or "0" (fps plan 11-15: KYTY_FAULT_MAP=0
+// in the fps launchers counted as set and turned multi-draw replay off in every run).
+static bool EnvSwitchOn(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+static bool ReplayDiagnosticsActive(const CommandBuffer& buffer, const DrawRenderState& state) {
+	static const bool env_diagnostics = [] {
+		for (const char* name: {"KYTY_FAULT_MAP", "KYTY_XRAY_PS", "KYTY_XRAY_VS",
+		                        "KYTY_LOG_PS_DRAWS", "KYTY_LOG_TESS_DRAWS",
+		                        "KYTY_MESH_NEAR", "KYTY_WATCH_STENCIL_PS", "KYTY_WATCH_DRAW",
+		                        "KYTY_LOG_FACE_STATE", "KYTY_FACE_CENSUS", "KYTY_LOG_DRAWS",
+		                        "KYTY_LOG_DRAWS_WITH_COUNT", "KYTY_LOG_GS_SLOTS",
+		                        "KYTY_TRACE_GS_SLOT_SEQ", "KYTY_TRACE_GS_SLOT",
+		                        "KYTY_TRACE_GS_SLOT_VALUE", "KYTY_LOG_DRAW_PAIRS",
+		                        "KYTY_LOG_DRAWS_FLIP", "KYTY_FULL_BARRIER_PS",
+		                        "KYTY_DRAW_WRITE_BARRIER", "KYTY_LOG_GPU_ARGS_DRAWS",
+		                        "KYTY_ARGS_DEBUG", "KYTY_DIAG_FLIP_TESS_FACE_FILE",
+		                        "KYTY_DIAG_FLIP_ALL_FACE_FILE", "KYTY_LOG_DRAWS_TRIGGER",
+		                        "KYTY_WATCH_SHADER_TRIGGER", "KYTY_XRAY_MODE"}) {
+			if (EnvSwitchOn(name)) {
+				return true;
+			}
+		}
+		return false;
+	}();
+	return env_diagnostics || graphics_debug_dump_enabled() || DrawStats::Enabled() ||
+	       Profiler::g_counters || RtSnap::Enabled() || ImageHistory::Enabled() ||
+	       GpuTiming::Detail::g_active.load(std::memory_order_relaxed) || BarrierSinkEnabled() ||
+	       Occlusion::CountsDraw(buffer) || RtDrawLog::Address() != 0 ||
+	       Common::FrameSkips::Enabled() || !SlotDumps().empty() || MeshWalkEnabled() ||
+	       ImgRef::Address() != 0 || LogIndirectDraw() || SyncToggle::ForceUpload() ||
+	       (state.ps_active && PaintDraws::Index(state.ps_input_info.stage.program->shader_hash) >= 0);
+}
+
+void RenderExecutor::CaptureReplayBase(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                       const DrawRenderState& state, const DrawEmitInfo& emit,
+                                       vk::PipelineLayout layout, bool writes,
+                                       vk::Buffer mesh_indirect_buffer,
+                                       vk::DeviceSize mesh_indirect_offset,
+                                       const void* gpu_args_buffer) {
+	(void)draw;
+	auto& base = m_replay;
+	base.valid = false;
+	base.indirect = false;
+	base.indirect_invalid_reason = static_cast<uint32_t>(RenderStats::IndirectReplayNote::NoBase);
+	if (writes) {
+		if (emit.gpu_args_address != 0) {
+			base.indirect_invalid_reason = static_cast<uint32_t>(RenderStats::IndirectReplayNote::BaseWrites);
+			RenderStats::NoteIndirectReplay(RenderStats::IndirectReplayNote::BaseWrites);
+		} else {
+			RenderStats::NoteReplay(RenderStats::ReplayNote::BaseWrites);
+		}
+		return;
+	}
+	if (ReplayDiagnosticsActive(buffer, state)) {
+		if (emit.gpu_args_address != 0) {
+			base.indirect_invalid_reason = static_cast<uint32_t>(RenderStats::IndirectReplayNote::Diagnostics);
+			RenderStats::NoteIndirectReplay(RenderStats::IndirectReplayNote::Diagnostics);
+		} else {
+			RenderStats::NoteReplay(RenderStats::ReplayNote::BaseDiagnostics);
+		}
+		return;
+	}
+	if (emit.gpu_args_address != 0 &&
+	    (mesh_indirect_buffer == nullptr || gpu_args_buffer == nullptr || emit.indirect_packet == nullptr ||
+	     MeshArgsRun().last_used_packet != emit.indirect_packet ||
+	     MeshArgsRun().last_used_generation != MeshArgsRun().generation)) {
+		base.indirect_invalid_reason = static_cast<uint32_t>(RenderStats::IndirectReplayNote::BaseArgsRun);
+		RenderStats::NoteIndirectReplay(RenderStats::IndirectReplayNote::BaseArgsRun);
+		return;
+	}
+	const auto& vs_stage  = state.vertex_info[0].stage;
+	uint64_t    mask      = ~0ull;
+	uint32_t    plan_base = 0;
+	if (!PipelineCache::PlanUserDataReads(vs_stage.resources, mask, plan_base) ||
+	    plan_base != vs_stage.program->user_data_base) {
+		if (emit.gpu_args_address != 0) {
+			base.indirect_invalid_reason = static_cast<uint32_t>(RenderStats::IndirectReplayNote::BasePlanUnknown);
+			RenderStats::NoteIndirectReplay(RenderStats::IndirectReplayNote::BasePlanUnknown);
+		} else {
+			RenderStats::NoteReplay(RenderStats::ReplayNote::BasePlanUnknown);
+		}
+		return;
+	}
+	// The user data exactly as the draw's refresh saw it (PrepareProgram is what
+	// GetGraphicsPrograms describes the stage with); a mismatch means the comparison below would
+	// not be the refresh's own input.
+	auto&                 sh = buffer.GetShaders();
+	ShaderVertexInputInfo described;
+	const auto params = PrepareProgram(sh.GetVs(), buffer.GetRegisters(), buffer.GetUserConfig(),
+	                                   described);
+	const auto& snapshot_user_data = vs_stage.resources->user_data;
+	if (params.user_data_count != snapshot_user_data.size() ||
+	    params.user_data_count > base.vs_user.size() ||
+	    !std::equal(snapshot_user_data.begin(), snapshot_user_data.end(), params.user_data.begin())) {
+		if (emit.gpu_args_address != 0) {
+			base.indirect_invalid_reason = static_cast<uint32_t>(RenderStats::IndirectReplayNote::BaseUserData);
+			RenderStats::NoteIndirectReplay(RenderStats::IndirectReplayNote::BaseUserData);
+		} else {
+			RenderStats::NoteReplay(RenderStats::ReplayNote::BaseUserData);
+		}
+		return;
+	}
+	const auto& ps      = sh.GetPs();
+	base.ps_user_count  = std::min<uint32_t>(ps.ps_regs.rsrc2.user_sgpr, base.ps_user.size());
+	std::copy_n(ps.ps_user_sgpr.value, base.ps_user_count, base.ps_user.begin());
+	base.vs_user_count  = params.user_data_count;
+	std::copy_n(params.user_data.begin(), params.user_data_count, base.vs_user.begin());
+	base.vs_params_hash = params.hash;
+	base.vs_plan_reads  = mask;
+	base.vs_program     = vs_stage.program;
+	base.vs_shader_hash = vs_stage.program->shader_hash;
+	base.ps_active      = state.ps_active;
+	base.ps_shader_hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+	base.vs_shader_data = m_graphics_bindings.vertex[0].shader_data;
+	base.bound_data     = base.vs_shader_data;
+	base.tick           = m_context.GetCommandScheduler().CurrentTick();
+	base.buffer         = &buffer;
+	base.rendering      = buffer.CurrentRenderState();
+	base.commit_generation = m_last_commit.generation;
+	base.layout         = layout;
+	base.mesh           = state.vertex_info[0].mesh;
+	base.indirect       = emit.gpu_args_address != 0;
+	base.args_run_generation = base.indirect ? MeshArgsRun().generation : 0;
+	base.buffer_unregister_epoch = m_context.GetBufferCache().UnregisterEpoch();
+	base.gpu_args_buffer = base.indirect ? gpu_args_buffer : nullptr;
+	base.mesh_indirect_buffer = base.indirect ? mesh_indirect_buffer : nullptr;
+	base.mesh_indirect_offset = base.indirect ? mesh_indirect_offset : 0;
+	base.start_instance_sgpr = base.indirect ? emit.start_instance_sgpr : 0;
+	base.indirect_invalid_reason = static_cast<uint32_t>(RenderStats::IndirectReplayNote::NoBase);
+	base.valid          = true;
+	if (base.indirect) {
+		const auto& ctx  = buffer.GetRegisters();
+		const auto& ucfg = buffer.GetUserConfig();
+		base.ctx_snapshot.resize(sizeof(ctx));
+		std::memcpy(base.ctx_snapshot.data(), &ctx, sizeof(ctx));
+		base.ucfg_snapshot.resize(sizeof(ucfg));
+		std::memcpy(base.ucfg_snapshot.data(), &ucfg, sizeof(ucfg));
+		ShaderBytesForReplay(buffer.GetShaders(), base.sh_snapshot);
+		RenderStats::g_indirect_base_maybe.store(true, std::memory_order_relaxed);
+	}
+	if (base.indirect) {
+		RenderStats::NoteIndirectReplay(RenderStats::IndirectReplayNote::BaseCaptured);
+	} else {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::BaseCaptured);
+	}
+}
+
+void RenderExecutor::InvalidateIndirectReplay(uint32_t reason) {
+	if (m_replay.valid && m_replay.indirect) {
+		m_replay.valid = false;
+		m_replay.indirect_invalid_reason = reason;
+	}
+	RenderStats::g_indirect_base_maybe.store(false, std::memory_order_relaxed);
+}
+
+static bool ReplayIndirectDiagnosticsActive(const CommandBuffer& buffer, bool ps_active,
+                                           uint64_t ps_shader_hash) {
+	static const bool env_diagnostics = [] {
+		for (const char* name: {"KYTY_FAULT_MAP", "KYTY_XRAY_PS", "KYTY_XRAY_VS",
+		                        "KYTY_LOG_PS_DRAWS", "KYTY_LOG_TESS_DRAWS",
+		                        "KYTY_MESH_NEAR", "KYTY_WATCH_STENCIL_PS", "KYTY_WATCH_DRAW",
+		                        "KYTY_LOG_FACE_STATE", "KYTY_FACE_CENSUS", "KYTY_LOG_DRAWS",
+		                        "KYTY_LOG_DRAWS_WITH_COUNT", "KYTY_LOG_GS_SLOTS",
+		                        "KYTY_TRACE_GS_SLOT_SEQ", "KYTY_TRACE_GS_SLOT",
+		                        "KYTY_TRACE_GS_SLOT_VALUE", "KYTY_LOG_DRAW_PAIRS",
+		                        "KYTY_LOG_DRAWS_FLIP", "KYTY_FULL_BARRIER_PS",
+		                        "KYTY_DRAW_WRITE_BARRIER", "KYTY_LOG_GPU_ARGS_DRAWS",
+		                        "KYTY_ARGS_DEBUG", "KYTY_DIAG_FLIP_TESS_FACE_FILE",
+		                        "KYTY_DIAG_FLIP_ALL_FACE_FILE", "KYTY_LOG_DRAWS_TRIGGER",
+		                        "KYTY_WATCH_SHADER_TRIGGER", "KYTY_XRAY_MODE"}) {
+			if (EnvSwitchOn(name)) return true;
+		}
+		return false;
+	}();
+	return env_diagnostics || graphics_debug_dump_enabled() || DrawStats::Enabled() ||
+	       Profiler::g_counters || RtSnap::Enabled() || ImageHistory::Enabled() ||
+	       GpuTiming::Detail::g_active.load(std::memory_order_relaxed) || BarrierSinkEnabled() ||
+	       Occlusion::CountsDraw(buffer) || RtDrawLog::Address() != 0 ||
+	       Common::FrameSkips::Enabled() || !SlotDumps().empty() || MeshWalkEnabled() ||
+	       ImgRef::Address() != 0 || LogIndirectDraw() || SyncToggle::ForceUpload() ||
+	       (ps_active && PaintDraws::Index(ps_shader_hash) >= 0);
+}
+
+bool RenderExecutor::ReplayIndirectDraw(uint64_t submit_id, CommandBuffer& buffer,
+                                        uint64_t gpu_args_address, uint32_t start_instance_sgpr,
+                                        const uint32_t* packet) {
+	auto& base = m_replay;
+	if (!base.valid || !base.indirect) {
+		const auto reason = base.indirect_invalid_reason <
+		                            static_cast<uint32_t>(RenderStats::IndirectReplayNote::Count)
+		                        ? static_cast<RenderStats::IndirectReplayNote>(base.indirect_invalid_reason)
+		                        : RenderStats::IndirectReplayNote::NoBase;
+		RenderStats::NoteIndirectReplay(reason);
+		return false;
+	}
+	auto fail = [&](RenderStats::IndirectReplayNote reason) {
+		base.valid = false;
+		base.indirect_invalid_reason = static_cast<uint32_t>(reason);
+		RenderStats::NoteIndirectReplay(reason);
+		return false;
+	};
+	if (gpu_args_address == 0 || start_instance_sgpr != base.start_instance_sgpr) {
+		return fail(RenderStats::IndirectReplayNote::StartInstance);
+	}
+	if (packet == nullptr || MeshArgsRun().packet != packet ||
+	    MeshArgsRun().generation != base.args_run_generation) {
+		return fail(RenderStats::IndirectReplayNote::ArgsRun);
+	}
+	const auto* entry = MeshArgsRun().Peek(packet);
+	if (entry == nullptr || entry->args != gpu_args_address || entry->buffer == nullptr ||
+	    entry->buffer != base.mesh_indirect_buffer) {
+		return fail(RenderStats::IndirectReplayNote::ArgsRun);
+	}
+	EXIT_IF(buffer.IsInvalid());
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.PopPendingOperations();
+	Common::LockGuard lock = [&]() -> Common::LockGuard {
+		KYTY_PROFILER_BLOCK("Renderer mutex wait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
+	if (scheduler.CurrentTick() != base.tick || &buffer != base.buffer ||
+	    !buffer.IsRendering() || !(buffer.CurrentRenderState() == base.rendering)) {
+		return fail(RenderStats::IndirectReplayNote::CommandChanged);
+	}
+	if (m_last_commit.generation != base.commit_generation) {
+		return fail(RenderStats::IndirectReplayNote::CommitChanged);
+	}
+	if (ReplayIndirectDiagnosticsActive(buffer, base.ps_active, base.ps_shader_hash)) {
+		return fail(RenderStats::IndirectReplayNote::Diagnostics);
+	}
+	auto& cache = m_context.GetBufferCache();
+	const auto [args_buffer, args_offset] =
+	    cache.ObtainBuffer(gpu_args_address, 16u, false, false, {}, true);
+	(void)args_offset;
+	if (args_buffer == nullptr || args_buffer != base.gpu_args_buffer ||
+	    !args_buffer->HasDeviceAddress()) {
+		return fail(RenderStats::IndirectReplayNote::ArgsBuffer);
+	}
+	if (cache.UnregisterEpoch() != base.buffer_unregister_epoch) {
+		return fail(RenderStats::IndirectReplayNote::BufferCacheChanged);
+	}
+	// ObtainBuffer can wait, and a wait may run another queue's slice that invalidates the base.
+	if (!base.valid || !base.indirect) {
+		return fail(RenderStats::IndirectReplayNote::PacketBoundary);
+	}
+	// Context/user-config register packets may sit between the draws (the command processor keeps
+	// the base across them); the full path derives pipeline, render targets and render state from
+	// these registers, so they must be byte-identical to the base's (a padding difference only
+	// costs a fallback).
+	{
+		const auto& ctx  = buffer.GetRegisters();
+		const auto& ucfg = buffer.GetUserConfig();
+		if (base.ctx_snapshot.size() != sizeof(ctx) || base.ucfg_snapshot.size() != sizeof(ucfg) ||
+		    std::memcmp(base.ctx_snapshot.data(), &ctx, sizeof(ctx)) != 0 ||
+		    std::memcmp(base.ucfg_snapshot.data(), &ucfg, sizeof(ucfg)) != 0) {
+			return fail(RenderStats::IndirectReplayNote::ContextChanged);
+		}
+		thread_local std::vector<uint8_t> sh_bytes;
+		ShaderBytesForReplay(buffer.GetShaders(), sh_bytes);
+		if (sh_bytes != base.sh_snapshot) {
+			return fail(RenderStats::IndirectReplayNote::ContextChanged);
+		}
+	}
+	if (scheduler.CurrentTick() != base.tick || &buffer != base.buffer ||
+	    !buffer.IsRendering() || !(buffer.CurrentRenderState() == base.rendering)) {
+		return fail(RenderStats::IndirectReplayNote::CommandChanged);
+	}
+	if (m_last_commit.generation != base.commit_generation) {
+		return fail(RenderStats::IndirectReplayNote::CommitChanged);
+	}
+	auto&       sh = buffer.GetShaders();
+	const auto& ps = sh.GetPs();
+	if (std::min<uint32_t>(ps.ps_regs.rsrc2.user_sgpr, base.ps_user.size()) != base.ps_user_count ||
+	    !std::equal(base.ps_user.begin(), base.ps_user.begin() + base.ps_user_count,
+	                ps.ps_user_sgpr.value)) {
+		return fail(RenderStats::IndirectReplayNote::PsUserData);
+	}
+	ShaderVertexInputInfo described;
+	const auto params = PrepareProgram(sh.GetVs(), buffer.GetRegisters(), buffer.GetUserConfig(),
+	                                   described);
+	if (params.hash != base.vs_params_hash || params.user_data_count != base.vs_user_count) {
+		return fail(RenderStats::IndirectReplayNote::VsProgram);
+	}
+	uint64_t changed = 0;
+	for (uint32_t i = 0; i < params.user_data_count; i++) {
+		if (params.user_data[i] != base.vs_user[i]) changed |= 1ull << i;
+	}
+	if ((changed & base.vs_plan_reads) != 0) {
+		return fail(RenderStats::IndirectReplayNote::PlanReads);
+	}
+	const std::vector<uint32_t>* data = &base.vs_shader_data;
+	if (changed != 0) {
+		base.scratch = base.vs_shader_data;
+		const auto& registers = base.vs_program->bindings.user_data_registers;
+		const auto  data_base = base.vs_program->user_data_base;
+		bool        any = false;
+		for (size_t i = 0; i < registers.size() && i < base.scratch.size(); i++) {
+			if (registers[i] < data_base || registers[i] - data_base >= params.user_data_count) continue;
+			const auto index = registers[i] - data_base;
+			if (((changed >> index) & 1u) != 0) {
+				base.scratch[i] = params.user_data[index];
+				any = true;
+			}
+		}
+		if (any) data = &base.scratch;
+	}
+	if (*data != base.bound_data) {
+		if (!RecommitShaderData(buffer, *data)) {
+			return fail(RenderStats::IndirectReplayNote::CommandChanged);
+		}
+		base.bound_data = *data;
+	}
+	const auto* consumed = MeshArgsRun().Take(packet);
+	if (consumed == nullptr || consumed->args != gpu_args_address ||
+	    consumed->buffer != entry->buffer || consumed->offset != entry->offset) {
+		return fail(RenderStats::IndirectReplayNote::ArgsRun);
+	}
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
+	                    0, 0, 0, 0, 0);
+	const auto vk_buffer = buffer.Recorder();
+	const uint32_t draw_data[] {0u,
+	                            0u,
+	                            start_instance_sgpr,
+	                            0xFFFFFFFFu,
+	                            static_cast<uint32_t>(gpu_args_address),
+	                            static_cast<uint32_t>(gpu_args_address >> 32u),
+	                            0u};
+	static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+	// The commit's stages (a linked pipeline's push range names every graphics stage).
+	const auto mesh_push_stages = m_last_commit.push_stages;
+	vk_buffer.pushConstants(base.layout, mesh_push_stages, 0, sizeof(draw_data), draw_data);
+	vk_buffer.drawMeshTasksIndirectEXT(consumed->buffer, consumed->offset, 1, 16u);
+	NoteTickWork(scheduler.CurrentTick(), 'D', base.vs_shader_hash,
+	             base.ps_shader_hash);
+	SetNextDrawSafe(false);
+	Profiler::Add(Profiler::Counter::Draws);
+	RenderStats::NoteIndirectReplay(RenderStats::IndirectReplayNote::Replayed);
+	return true;
+}
+
+bool RenderExecutor::ReplayMultiDraw(uint64_t submit_id, CommandBuffer& buffer,
+                                     uint32_t vertex_count, uint32_t instance_count,
+                                     uint32_t first_vertex, uint32_t first_instance) {
+	auto& base = m_replay;
+	if (!base.active || !base.valid) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::NoBase);
+		return false;
+	}
+	EXIT_IF(buffer.IsInvalid());
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.PopPendingOperations();
+	Common::LockGuard lock = [&]() -> Common::LockGuard {
+		KYTY_PROFILER_BLOCK("Renderer mutex wait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
+	// As DrawAuto: a draw without vertices or instances records nothing.
+	if (vertex_count == 0 || instance_count == 0) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::Empty);
+		return true;
+	}
+	if (scheduler.CurrentTick() != base.tick || &buffer != base.buffer || !buffer.IsRendering() ||
+	    !(buffer.CurrentRenderState() == base.rendering)) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::CommandChanged);
+		base.valid = false;
+		return false;
+	}
+	if (m_last_commit.generation != base.commit_generation) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::CommitChanged);
+		base.valid = false;
+		return false;
+	}
+	if (GpuTiming::Detail::g_active.load(std::memory_order_relaxed)) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::BaseDiagnostics);
+		return false;
+	}
+	auto&       sh = buffer.GetShaders();
+	const auto& ps = sh.GetPs();
+	if (std::min<uint32_t>(ps.ps_regs.rsrc2.user_sgpr, base.ps_user.size()) != base.ps_user_count ||
+	    !std::equal(base.ps_user.begin(), base.ps_user.begin() + base.ps_user_count,
+	                ps.ps_user_sgpr.value)) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::PsUserData);
+		return false;
+	}
+	ShaderVertexInputInfo described;
+	const auto params = PrepareProgram(sh.GetVs(), buffer.GetRegisters(), buffer.GetUserConfig(),
+	                                   described);
+	if (params.hash != base.vs_params_hash || params.user_data_count != base.vs_user_count) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::VsProgram);
+		return false;
+	}
+	uint64_t changed = 0;
+	for (uint32_t i = 0; i < params.user_data_count; i++) {
+		if (params.user_data[i] != base.vs_user[i]) {
+			changed |= 1ull << i;
+		}
+	}
+	// A resource the refresh would resolve differently: the draw needs its own refresh.
+	if ((changed & base.vs_plan_reads) != 0) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::PlanReads);
+		return false;
+	}
+	const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+	if (instance_count > limits.maxMeshWorkGroupCount[1]) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::Limits);
+		return false; // the full path reports it
+	}
+	const auto primitives = base.mesh.InputPrimitiveCount(vertex_count);
+	if (primitives == 0) {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::Empty);
+		return true; // as ExecutePreparedDraw: nothing is recorded
+	}
+	// The shader data PrepareBindings would build: the base's, with the user-data words that
+	// changed taken from the registers now.
+	const std::vector<uint32_t>* data = &base.vs_shader_data;
+	if (changed != 0) {
+		base.scratch           = base.vs_shader_data;
+		const auto& registers  = base.vs_program->bindings.user_data_registers;
+		const auto  data_base  = base.vs_program->user_data_base;
+		bool        any        = false;
+		for (size_t i = 0; i < registers.size() && i < base.scratch.size(); i++) {
+			if (registers[i] < data_base || registers[i] - data_base >= params.user_data_count) {
+				continue;
+			}
+			const auto index = registers[i] - data_base;
+			if (((changed >> index) & 1u) != 0) {
+				base.scratch[i] = params.user_data[index];
+				any             = true;
+			}
+		}
+		if (any) {
+			data = &base.scratch;
+		}
+	}
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
+	                    vertex_count, 0, first_vertex, instance_count, first_instance);
+	if (*data != base.bound_data) {
+		if (!RecommitShaderData(buffer, *data)) {
+			RenderStats::NoteReplay(RenderStats::ReplayNote::UploadMoved);
+			base.valid = false;
+			return false;
+		}
+		base.bound_data = *data;
+		RenderStats::NoteReplay(RenderStats::ReplayNote::Replayed);
+	} else {
+		RenderStats::NoteReplay(RenderStats::ReplayNote::ReplayedSameData);
+	}
+	const auto vk_buffer = buffer.Recorder();
+	// ExecutePreparedDraw's draw dwords for a non-indexed draw with CPU arguments.
+	const uint32_t draw_data[] {vertex_count, first_vertex, first_instance, 0u, 0u, 0u, 0u};
+	static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+	// The commit's stages (a linked pipeline's push range names every graphics stage).
+	const auto mesh_push_stages = m_last_commit.push_stages;
+	vk_buffer.pushConstants(base.layout, mesh_push_stages, 0, sizeof(draw_data), draw_data);
+	NoteTickWork(scheduler.CurrentTick(), 'D', base.vs_shader_hash, base.ps_shader_hash);
+	const uint32_t mesh_groups = (primitives - 1u) / base.mesh.primitives_per_group + 1u;
+	constexpr auto base_offset =
+	    (ShaderRecompiler::IR::PushData::MeshDrawDwordCount - 1u) * sizeof(uint32_t);
+	const auto per_draw = std::min<uint64_t>(
+	    limits.maxMeshWorkGroupCount[0],
+	    std::max<uint64_t>(1u, limits.maxMeshWorkGroupTotalCount / std::max(instance_count, 1u)));
+	uint32_t groups_done = 0;
+	do {
+		const auto groups =
+		    static_cast<uint32_t>(std::min<uint64_t>(mesh_groups - groups_done, per_draw));
+		if (groups_done != 0) {
+			vk_buffer.pushConstants(base.layout, mesh_push_stages, base_offset, sizeof(groups_done),
+			                        &groups_done);
+		}
+		vk_buffer.drawMeshTasksEXT(groups, instance_count, 1);
+		groups_done += groups;
+	} while (groups_done < mesh_groups);
+	Profiler::Add(Profiler::Counter::Draws);
+	return true;
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {

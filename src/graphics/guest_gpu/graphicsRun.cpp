@@ -1,4 +1,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/drawPipe.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "common/floorStats.h"
+#include "common/fpsLog.h"
 
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
@@ -11,15 +15,22 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/drawPrepScanner.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
+#include "graphics/host_gpu/renderer/syncToggle.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/imgRef.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "common/sampler.h"
+#include "graphics/host_gpu/renderer/barrierMerge.h"
 #include "graphics/host_gpu/renderer/barrierSink.h"
 #include "graphics/host_gpu/renderer/dispatchRun.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompileProgress.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderStats.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -36,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <fmt/format.h>
 #include <map>
 #include <string>
@@ -49,12 +61,16 @@
 
 namespace Libs::Graphics {
 
+// renderContext.cpp: the CPU epoch of the submission the GPU thread is running (PrepareBda).
+extern std::atomic<uint64_t> g_bda_submission_cpu_epoch;
+
 // bufferCache.cpp (KYTY_UPLOAD_WORKER).
 uint64_t UploadWorkerPushed();
 void     WaitUploadWorker(uint64_t upto);
 // Before the command processor writes guest memory itself: upload reads queued before must not
 // see the bytes it writes (they belong to work recorded earlier).
 static void SettleUploadReads() {
+	DrainProtectionHelper(ProtectDrainReason::GuestWrite);
 	if (const auto pushed = UploadWorkerPushed(); pushed != 0) {
 		WaitUploadWorker(pushed);
 	}
@@ -66,11 +82,176 @@ static std::atomic<uint64_t> g_cmd_from_sync {0};
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
-static const uint32_t*                g_run_expected_next = nullptr; // KYTY_DISPATCH_RUNS
+static thread_local const uint32_t*   g_run_expected_next = nullptr; // KYTY_DISPATCH_RUNS
 static std::atomic<uint64_t> g_compute_submissions {0};
 static std::atomic<uint64_t> g_compute_submission_dw {0};
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+static thread_local bool              g_draw_pipe_thread  = false; // KYTY_DRAW_PIPE stage B
+
+// KYTY_ASYNC_THREAD=1: the compute queues run on a second command-processor thread. The renderer
+// is shared: each thread takes the renderer mutex (recursive) for every packet that can touch it
+// (all but register writes) and for the renderer work around its slices.
+// KYTY_GFX_PRIORITY=1 (experiment, off by default): the GPU thread takes the graphics queue's next
+// submission whenever it can run, before the compute queues' (which keep their round-robin among
+// themselves). On the PS5 the queues run concurrently: the graphics queue never waits behind a
+// compute queue's slice unless it synchronizes with it. The game paces its frames on a label the
+// graphics queue writes (PushBuffer::WaitForFrame). KYTY_SYNC_TOGGLE_MODE=gfxprio: on in the
+// toggle's on windows only.
+static bool GfxPriority() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_GFX_PRIORITY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return always || SyncToggle::GfxPriorityWindow();
+}
+
+static bool AsyncThreadAlways() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_THREAD");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// The async-compute thread exists: KYTY_ASYNC_THREAD=1, or KYTY_SYNC_TOGGLE_MODE=async (on in the
+// toggle's on windows only; in the off windows the GPU thread runs every queue as without it, still
+// taking the renderer mutex, so both windows pay for the mutex).
+static bool AsyncThreadEnabled() {
+	static const bool enabled = AsyncThreadAlways() || SyncToggle::AsyncConfigured();
+	return enabled;
+}
+// The compute queues run on the async-compute thread now.
+static bool AsyncThreadActive() {
+	return AsyncThreadAlways() || SyncToggle::AsyncWindow();
+}
+// G4 stage 1 (docs/g4_split_plan_20261102.md): on the async-compute thread, direct dispatches are
+// prepared without the renderer mutex and queued; the mutex is taken once for each run of other
+// packets (a segment), which first records the queued dispatches. KYTY_ASYNC_BATCH=0: every
+// non-register packet takes the mutex, as in the prototype.
+static bool AsyncBatchEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_BATCH");
+		return !(value != nullptr && value[0] == '0');
+	}();
+	return enabled;
+}
+// KYTY_ASYNC_BATCH_INDIRECT=1 (with the batch): DISPATCH_INDIRECT is queued the same way.
+static bool AsyncBatchIndirect() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_BATCH_INDIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// The async thread holds the renderer mutex for a segment.
+static thread_local bool t_segment_held = false;
+// Dispatches queued before they are recorded, at most (KYTY_ASYNC_BATCH_MAX, default 128): with
+// graphics right of way the queue is recorded in one go, which the graphics thread waits out.
+static size_t AsyncBatchMaxValue() {
+	static const size_t value = [] {
+		const char* env = std::getenv("KYTY_ASYNC_BATCH_MAX");
+		const size_t n  = env != nullptr ? std::strtoull(env, nullptr, 10) : 128u;
+		return n == 0 ? size_t {1} : n;
+	}();
+	return value;
+}
+// The command processor whose registers the scheduler's command buffer is bound to (renderer
+// mutex): a thread that takes the mutex binds its own first.
+static CommandProcessor* g_bound_cp = nullptr;
+// The renderer mutex while the async thread runs, nothing otherwise.
+class RendererScope {
+public:
+	explicit RendererScope(RenderContext& renderer)
+	    : m_renderer(AsyncThreadEnabled() ? &renderer : nullptr) {
+		if (m_renderer != nullptr) {
+			m_renderer->LockRenderer();
+		}
+	}
+	~RendererScope() {
+		if (m_renderer != nullptr) {
+			m_renderer->UnlockRenderer();
+		}
+	}
+	KYTY_CLASS_NO_COPY(RendererScope);
+
+private:
+	RenderContext* m_renderer;
+};
+
+static void InvalidateReplayBase(RenderContext& renderer, RenderStats::IndirectReplayNote reason) {
+	if (!RenderStats::g_indirect_base_maybe.load(std::memory_order_relaxed)) {
+		return;
+	}
+	RendererScope scope(renderer);
+	renderer.GetRenderExecutor().InvalidateIndirectReplay(static_cast<uint32_t>(reason));
+}
+// Packets that only write the command processor's own registers run without the renderer mutex.
+static bool RegisterOnlyPacket(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE: return true;
+		default: return false;
+	}
+}
+
+// KYTY_DRAW_PIPE: packets stage A runs while the draw thread still has draws (no renderer, no
+// GPU-written memory): register writes, argument bases, calls and chains of command buffers, and
+// NOPs that only skip or name. Everything else drains the draw thread first.
+static bool DrawPipeDrawPacket(uint32_t opcode) {
+	return opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
+	       opcode == Pm4::IT_DRAW_INDEX_AUTO;
+}
+
+static bool DrawPipeSafePacket(uint32_t opcode, const uint32_t* packet) {
+	if (RegisterOnlyPacket(opcode)) {
+		return true;
+	}
+	const auto header = packet[0];
+	switch (opcode) {
+		case Pm4::IT_SET_BASE: return true;
+		// Memory the CP reads directly: safe unless a queued draw writes it (those bytes are not
+		// marked GPU-written until the draw thread records it, so no fault would drain).
+		case Pm4::IT_INDIRECT_BUFFER: {
+			if (KYTY_PM4_LEN(header) != 4u) {
+				return false;
+			}
+			const uint64_t address = packet[1] | (static_cast<uint64_t>(packet[2]) << 32u);
+			return !DrawPipe::PendingWriteOverlaps(address, uint64_t {packet[3] & 0xfffffu} * 4u);
+		}
+		case Pm4::IT_SET_SH_REG_INDIRECT: {
+			if (KYTY_PM4_LEN(header) != 5u) {
+				return false;
+			}
+			const uint64_t address =
+			    (packet[1] & 0xfffffffcu) | (static_cast<uint64_t>(packet[2]) << 32u);
+			return !DrawPipe::PendingWriteOverlaps(address, uint64_t {packet[4] & 0x3fffu} * 8u);
+		}
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return !DrawPipe::HasPendingWrites();
+		case Pm4::IT_CLEAR_STATE: return true;
+		// No-ops with dispatch sync on (dispatches carry their own barriers).
+		case Pm4::IT_ACQUIRE_MEM: return DispatchSyncEnabled();
+		// Barriers: queued for the draw thread (CommandProcessor::TriggerEvent).
+		case Pm4::IT_EVENT_WRITE: return DrawPipe::DeferrableEvent(packet[1] & 0x3fu);
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(header);
+			if (r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER || r == Pm4::R_CONTEXT_STATE) {
+				return true;
+			}
+			if (r == Pm4::R_ACQUIRE_MEM) {
+				return DispatchSyncEnabled();
+			}
+			return r == Pm4::R_ZERO && (KYTY_PM4_LEN(header) < 2u || (packet[1] & 0xffff0000u) != 0x68750000u);
+		}
+		default: return false;
+	}
+}
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -198,6 +379,10 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 		     DrawPrep::VerifyMode());
 	}
 	m_thread = std::jthread(ThreadRun, this);
+	if (AsyncThreadEnabled()) {
+		LOGF("GPU: compute queues run on their own thread (KYTY_ASYNC_THREAD)\n");
+		m_async_thread = std::jthread(ThreadRunRole, this, 1u);
+	}
 }
 
 GuestGpu::~GuestGpu() {
@@ -214,9 +399,13 @@ void GuestGpu::Shutdown() {
 		m_accepting = false;
 		m_stopping  = true;
 		m_work_available.SignalAll();
+		m_async_work.SignalAll();
 	}
 	if (m_thread.joinable()) {
 		m_thread.join();
+	}
+	if (m_async_thread.joinable()) {
+		m_async_thread.join();
 	}
 	m_draw_prep.reset();
 	m_shutdown_complete = true;
@@ -271,7 +460,7 @@ bool GuestGpu::LabelsAtCompletion() {
 		const char* value = std::getenv("KYTY_LABELS_AT_COMPLETION");
 		return value != nullptr && value[0] == '1';
 	}();
-	return enabled;
+	return enabled || SyncToggle::LabelsAtCompletion();
 }
 
 void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) {
@@ -284,6 +473,7 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	m_renderer.GetCommandScheduler().DeferPriorityOperation([this, address, value, size,
 	                                                         sequence] {
 		(void)TrySendCommand([this, address, value, size, sequence] {
+			DrainProtectionHelper(ProtectDrainReason::GuestWrite);
 			Timeline::Mark("label", address, value);
 			std::memcpy(reinterpret_cast<void*>(address), &value, size);
 			const auto pending = m_pending_labels.find(address);
@@ -310,6 +500,9 @@ template uint64_t GuestGpu::ReadLabel<uint64_t>(const volatile uint64_t*) const;
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		DrawPipe::Drain(DrawPipe::Reason::Commands);
+	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -319,6 +512,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		RendererScope renderer_scope(m_renderer);
 		command();
 	}
 }
@@ -429,6 +623,9 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
+	if (RenderStats::IndirectReplayConfigured()) {
+		InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketBoundary);
+	}
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
@@ -472,10 +669,17 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 }
 
 void CommandProcessor::BufferInit() {
+	if (RenderStats::IndirectReplayConfigured()) {
+		InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketBoundary);
+	}
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
+	g_bound_cp = this;
 }
 
 void CommandProcessor::BufferFlush() {
+	if (RenderStats::IndirectReplayConfigured()) {
+		InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketBoundary);
+	}
 	// Downloads of the windows the game threads keep reading back, behind this submission's
 	// writes, in the recording about to be submitted (BufferCache::EagerDownloads).
 	m_renderer.GetBufferCache().EagerDownloads();
@@ -492,10 +696,17 @@ void CommandProcessor::CompleteReleaseMemInterrupt() {
 }
 
 void CommandProcessor::CompleteDraw() {
+	const auto tick = GetScheduler().CurrentTick();
 	GetScheduler().CompleteDraw();
+	if (RenderStats::IndirectReplayConfigured() && GetScheduler().CurrentTick() != tick) {
+		InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketBoundary);
+	}
 }
 
 void CommandProcessor::BufferWait() {
+	if (RenderStats::IndirectReplayConfigured()) {
+		InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketBoundary);
+	}
 	BufferInit();
 	(KYTY_SUBMIT_REASON(), GetScheduler().Finish());
 }
@@ -556,15 +767,174 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+static thread_local uint32_t g_stat_queue = 0;
+// KYTY_QUEUE_STATS=1 (stage 1 of an async-compute thread): per guest queue, the GPU thread's
+// processing time, its dispatches' time split into program lookup (no cache bindings) and the
+// rest, and its label waits split by which queue last wrote the label ([queue-stats], 5 s).
+static bool QueueStatsEnabled() {
+	static const bool enabled = std::getenv("KYTY_QUEUE_STATS") != nullptr;
+	return enabled;
+}
+constexpr uint32_t QueueStatsCount = 1 + 7 * 8; // GuestGpu::QueueCount (private)
+struct QueueStats {
+	uint64_t process_ns[QueueStatsCount] {};
+	uint64_t calls[QueueStatsCount] {};
+	uint64_t incomplete[QueueStatsCount] {};
+	uint64_t dispatches[QueueStatsCount] {};
+	uint64_t dispatch_ns[QueueStatsCount] {};
+	uint64_t program_ns[QueueStatsCount] {};
+	// waits: [queue][writer class]: 0 same queue, 1 other GPU queue, 2 never written by a queue (CPU)
+	uint64_t waits[QueueStatsCount][3] {};
+	uint64_t waits_blocked[QueueStatsCount][3] {};
+	uint64_t label_writes[QueueStatsCount] {};
+	uint64_t prepare_ns[QueueStatsCount] {}, record_ns[QueueStatsCount] {};
+	uint64_t dispatch_on_async[QueueStatsCount] {};
+	uint64_t process_async_ns[QueueStatsCount] {};
+	uint64_t same_shader[QueueStatsCount] {}, same_bindings[QueueStatsCount] {}, same_all[QueueStatsCount] {};
+	uint64_t last_shader[QueueStatsCount] {}, last_bindings[QueueStatsCount] {}, last_srt[QueueStatsCount] {};
+	// cross-queue waits by (waiting queue, writer queue), blocked only
+	std::unordered_map<uint32_t, uint64_t> cross_pairs;
+};
+static QueueStats                                 g_queue_stats;
+static std::unordered_map<uint64_t, uint8_t>      g_label_writer;
+// Both command-processor threads with the async-compute thread.
+static std::mutex                                 g_queue_stats_mutex;
+static void QueueStatsNoteLabelWrite(uint64_t address) {
+	if (!QueueStatsEnabled()) return;
+	std::lock_guard stats_lock(g_queue_stats_mutex);
+	g_label_writer[address & ~uint64_t {3}] = static_cast<uint8_t>(g_stat_queue);
+	g_queue_stats.label_writes[g_stat_queue % QueueStatsCount]++;
+}
+static void QueueStatsNoteWait(uint64_t address, bool blocked) {
+	if (!QueueStatsEnabled()) return;
+	std::lock_guard stats_lock(g_queue_stats_mutex);
+	const auto q  = g_stat_queue % QueueStatsCount;
+	const auto it = g_label_writer.find(address & ~uint64_t {3});
+	const int  writer_class = it == g_label_writer.end() ? 2 : (it->second == q ? 0 : 1);
+	g_queue_stats.waits[q][writer_class]++;
+	if (blocked) {
+		g_queue_stats.waits_blocked[q][writer_class]++;
+		if (writer_class == 1) {
+			g_queue_stats.cross_pairs[(q << 8u) | it->second]++;
+		}
+	}
+}
+void QueueStatsNoteBindings(uint64_t shader_hash, uint64_t bindings_hash, uint64_t srt_hash) {
+	if (!QueueStatsEnabled()) return;
+	std::lock_guard stats_lock(g_queue_stats_mutex);
+	auto&      st = g_queue_stats;
+	const auto q  = g_stat_queue % QueueStatsCount;
+	if (st.last_shader[q] == shader_hash) {
+		st.same_shader[q]++;
+		if (st.last_bindings[q] == bindings_hash) {
+			st.same_bindings[q]++;
+			if (st.last_srt[q] == srt_hash) st.same_all[q]++;
+		}
+	}
+	st.last_shader[q]   = shader_hash;
+	st.last_bindings[q] = bindings_hash;
+	st.last_srt[q]      = srt_hash;
+}
+void QueueStatsNoteDispatch(uint64_t program_ns, uint64_t total_ns) {
+	if (!QueueStatsEnabled()) return;
+	std::lock_guard stats_lock(g_queue_stats_mutex);
+	const auto q = g_stat_queue % QueueStatsCount;
+	g_queue_stats.dispatches[q]++;
+	g_queue_stats.dispatch_ns[q] += total_ns;
+	g_queue_stats.program_ns[q] += program_ns;
+	g_queue_stats.dispatch_on_async[q] += GuestGpu::IsAsyncThread() ? 1u : 0u;
+}
+// A direct dispatch's parts after the program lookup (renderCompute.cpp): preparing the bindings
+// (PrepareBindings to BindSharedMemory), and binding, committing and recording.
+void QueueStatsNoteDispatchParts(uint64_t prepare_ns, uint64_t record_ns) {
+	if (!QueueStatsEnabled()) return;
+	std::lock_guard stats_lock(g_queue_stats_mutex);
+	const auto q = g_stat_queue % QueueStatsCount;
+	g_queue_stats.prepare_ns[q] += prepare_ns;
+	g_queue_stats.record_ns[q] += record_ns;
+}
+static void QueueStatsReport(double seconds) {
+	if (!QueueStatsEnabled()) return;
+	std::lock_guard stats_lock(g_queue_stats_mutex);
+	auto& st = g_queue_stats;
+	for (uint32_t q = 0; q < QueueStatsCount; q++) {
+		if (st.calls[q] == 0 && st.dispatches[q] == 0 && st.label_writes[q] == 0) continue;
+		std::fprintf(stderr,
+		             "[queue-stats] q=%u process=%.0f ms/s calls=%.0f/s incomplete=%.0f/s | dispatches=%.0f/s "
+		             "%.0f ms/s (program %.0f ms/s) | label writes=%.0f/s | waits same=%.0f/%.0f other=%.0f/%.0f "
+		             "cpu=%.0f/%.0f (/s, total/blocked) | repeat of previous dispatch: shader %.0f/s, +bindings %.0f/s, "
+		             "+srt %.0f/s\n",
+		             q, st.process_ns[q] / 1e6 / seconds, st.calls[q] / seconds, st.incomplete[q] / seconds,
+		             st.dispatches[q] / seconds, st.dispatch_ns[q] / 1e6 / seconds,
+		             st.program_ns[q] / 1e6 / seconds, st.label_writes[q] / seconds,
+		             st.waits[q][0] / seconds, st.waits_blocked[q][0] / seconds, st.waits[q][1] / seconds,
+		             st.waits_blocked[q][1] / seconds, st.waits[q][2] / seconds,
+		             st.waits_blocked[q][2] / seconds, st.same_shader[q] / seconds, st.same_bindings[q] / seconds,
+		             st.same_all[q] / seconds);
+		if (st.dispatches[q] != 0 || st.process_async_ns[q] != 0) {
+			std::fprintf(stderr,
+			             "[queue-stats2] q=%u direct dispatch parts: prepare %.0f ms/s, bind+commit+record %.0f ms/s | "
+			             "on the async thread: dispatches %.0f/s, process %.0f ms/s\n",
+			             q, st.prepare_ns[q] / 1e6 / seconds, st.record_ns[q] / 1e6 / seconds,
+			             st.dispatch_on_async[q] / seconds, st.process_async_ns[q] / 1e6 / seconds);
+		}
+	}
+	for (const auto& [key, count]: st.cross_pairs) {
+		std::fprintf(stderr, "[queue-stats] blocked cross wait: q=%u waits on q=%u %.1f/s\n", key >> 8u,
+		             key & 0xffu, count / seconds);
+	}
+	std::fflush(stderr);
+	QueueStats next;
+	std::copy(std::begin(st.last_shader), std::end(st.last_shader), std::begin(next.last_shader));
+	std::copy(std::begin(st.last_bindings), std::end(st.last_bindings), std::begin(next.last_bindings));
+	std::copy(std::begin(st.last_srt), std::end(st.last_srt), std::begin(next.last_srt));
+	st = std::move(next);
+}
+
+// KYTY_HOT_LABEL_DEDUPE=0 turns this off. A wait loop polls the same label over and over until the
+// CPU changes it, and every poll of a CPU-dirty page used to start a hot generation: ~57 a frame,
+// each one making every hot page upload itself again on its next use. Only the read that sees a
+// value the previous read did not is a new signal, so the unchanged polls start no generation. A
+// label that went back to an earlier value between two polls would be missed here, but the game
+// has to submit for that, and a submission starts a generation of its own.
+static bool NoteLabelRead(uint64_t address, uint64_t value) {
+	static const bool dedupe = [] {
+		const char* text = std::getenv("KYTY_HOT_LABEL_DEDUPE");
+		return text == nullptr || text[0] != '0';
+	}();
+	if (!dedupe) {
+		return true;
+	}
+	struct Entry {
+		uint64_t address = 0;
+		uint64_t value   = 0;
+		bool     valid   = false;
+	};
+	// The GPU thread alone reads labels; direct-mapped, so a label never evicts itself.
+	static thread_local std::array<Entry, 64> cache {};
+	auto&                                     entry = cache[(address >> 2u) & 63u];
+	if (entry.valid && entry.address == address && entry.value == value) {
+		g_hot_stats.label_skips.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	entry = Entry {address, value, true};
+	g_hot_stats.label_bumps.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
 template <typename T>
 T CommandProcessor::ReadLabel(const volatile T* addr) const {
+	const T value = GuestGpu::LabelsDeferred() ? m_renderer.GetGpu().ReadLabel(addr) : *addr;
 	// A label the CPU wrote (its page is CPU-dirty) may follow data it wrote (KYTY_HOT_PAGES);
 	// the GPU's own labels (end-of-pipe writes) do not start a generation.
-	if (HotPagesEnabled() && m_renderer.GetBufferCache().IsRegionCpuModified(
-	                             reinterpret_cast<uint64_t>(addr) & ~uint64_t {3}, sizeof(T))) {
-		BumpHotGeneration();
+	if (HotPagesEnabled()) {
+		const auto address = reinterpret_cast<uint64_t>(addr) & ~uint64_t {3};
+		if (m_renderer.GetBufferCache().IsRegionCpuModified(address, sizeof(T)) &&
+		    NoteLabelRead(address, static_cast<uint64_t>(value))) {
+			BumpHotGeneration();
+		}
 	}
-	return GuestGpu::LabelsDeferred() ? m_renderer.GetGpu().ReadLabel(addr) : *addr;
+	return value;
 }
 
 template uint32_t CommandProcessor::ReadLabel<uint32_t>(const volatile uint32_t*) const;
@@ -579,8 +949,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
+	const bool passed = TestWaitRegMemValue(ReadLabel(addr), ref, mask, func);
+	QueueStatsNoteWait(reinterpret_cast<uint64_t>(addr), !passed);
+	if (!passed) {
 		SuspendPm4();
+	} else {
+		g_bda_resync_seq.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
@@ -622,6 +996,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	QueueStatsNoteLabelWrite(reinterpret_cast<uint64_t>(write_one_address ? dst : dst + dw_num - 1));
+	g_bda_resync_seq.fetch_add(1, std::memory_order_relaxed);
 	SettleUploadReads();
 	if (CpWriteTraced(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * 4u)) {
 		std::fprintf(stderr, "[cp-writers] WRITE_DATA dst=0x%012" PRIx64 " dwords=%u first=%08x one_addr=%d\n",
@@ -653,7 +1029,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
-	const auto value = Sync::ReadReferenceClock();
+	const auto value = Sync::ReadGpuTimestamp();
 	SettleUploadReads();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -733,6 +1109,9 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	// Every page the guest dirtied before submitting has bumped the epoch by now (write faults
+	// run on the writing thread).
+	submission.cpu_epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	if (m_draw_prep != nullptr) {
@@ -755,22 +1134,31 @@ void GuestGpu::Enqueue(Submission submission) {
 			recent.pop_front();
 		}
 	}
+	const auto role = RoleOf(submission.queue_id);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
-	m_work_available.Signal();
+	m_role_count[role]++;
+	if (role == 1) {
+		m_async_work.Signal();
+		if (!AsyncThreadAlways()) {
+			m_work_available.Signal(); // the GPU thread runs it outside the toggle's on windows
+		}
+	} else {
+		m_work_available.Signal();
+	}
 }
 
 void GuestGpu::WaitForIdle() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
-	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+	while (m_processing[0] || m_processing[1] || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
 }
 
 // KYTY_SRT_DEFER: the tick the dispatch just suspended waits for; GuestGpu::ThreadRun moves it
 // to the submission (GPU thread only).
-static uint64_t g_srt_wait_tick = 0;
+static thread_local uint64_t g_srt_wait_tick = 0;
 
 struct SrtDeferStats {
 	uint64_t deferred   = 0; // dispatches suspended
@@ -790,16 +1178,15 @@ struct SrtDeferStats {
 	uint64_t blocked_waits = 0, cmd_count = 0;
 	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
-static SrtDeferStats g_srt_defer_stats;
-static uint32_t      g_stat_queue = 0;
+static thread_local SrtDeferStats g_srt_defer_stats;
 struct SuspendSite {
 	uint64_t count = 0;
 	uint32_t queue = 0;
 	uint32_t dw[8] {};
 };
-static std::unordered_map<const uint32_t*, SuspendSite> g_suspend_sites;
+static thread_local std::unordered_map<const uint32_t*, SuspendSite> g_suspend_sites;
 static void NoteSuspendSite(const uint32_t* packet, uint32_t remaining_dw) {
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::FpsLogDiagnostics();
 	if (!log) return;
 	auto& site = g_suspend_sites[packet];
 	if (site.count++ == 0) {
@@ -814,13 +1201,16 @@ static void ReportSrtDeferStats() {
 	if (now - st.last < std::chrono::seconds(5)) {
 		return;
 	}
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	// KYTY_GPU_THREAD_STATS=1 (v312): these lines without the rest of the KYTY_FPS_LOG
+	// diagnostics (KYTY_FPS_ONLY=0 also changes the shader disk cache key).
+	static const bool log = Common::FpsLogDiagnostics() || std::getenv("KYTY_GPU_THREAD_STATS") != nullptr;
 	if (log) {
 		const double s = std::chrono::duration<double>(now - st.last).count();
 		std::fprintf(stderr,
-		             "[gpu-thread] window=%.2fs iters=%llu ms/s: loop=%.0f lock=%.0f empty=%.0f blocked=%.0f process=%.0f commands=%.0f | "
+		             "[%s] window=%.2fs iters=%llu ms/s: loop=%.0f lock=%.0f empty=%.0f blocked=%.0f process=%.0f commands=%.0f | "
 		             "srt-defer deferred=%.0f/s other-queue slices=%.0f/s idle=%.0f ms/s\n",
-		             s, static_cast<unsigned long long>(st.iters),
+		             g_gpu_state != nullptr ? "gpu-thread" : "async-thread", s,
+		             static_cast<unsigned long long>(st.iters),
 		             static_cast<double>(st.loop_us) / 1e6 / s,
 		             static_cast<double>(st.lock_us) / 1e6 / s,
 		             static_cast<double>(st.empty_us) / 1e6 / s,
@@ -829,6 +1219,17 @@ static void ReportSrtDeferStats() {
 		             static_cast<double>(st.command_us) / 1e6 / s,
 		             static_cast<double>(st.deferred) / s, static_cast<double>(st.ran_other) / s,
 		             static_cast<double>(st.idle_us) / 1e6 / s);
+	}
+	if ((log || QueueStatsEnabled()) && AsyncThreadEnabled()) {
+		const double s     = std::chrono::duration<double>(now - st.last).count();
+		const auto   locks = RenderContext::TakeLockStats();
+		std::fprintf(stderr,
+		             "[%s-lock] renderer mutex: %.0f acquires/s, %.0f contended/s, waited %.0f ms/s, "
+		             "off-lock windows %.0f ms/s\n",
+		             g_gpu_state != nullptr ? "gpu" : "async", static_cast<double>(locks.acquires) / s,
+		             static_cast<double>(locks.contended) / s,
+		             static_cast<double>(locks.wait_ns) / 1e6 / s,
+		             static_cast<double>(locks.released_ns) / 1e6 / s);
 	}
 	if (log) {
 		const double s = std::chrono::duration<double>(now - st.last).count();
@@ -856,20 +1257,165 @@ static void ReportSrtDeferStats() {
 		std::fprintf(stderr, "[suspend] distinct sites=%zu\n", sites.size());
 	}
 	g_suspend_sites.clear();
+	if (g_gpu_state != nullptr) {
+		QueueStatsReport(std::chrono::duration<double>(now - st.last).count());
+	}
 	st = {};
 	st.last = now;
+}
+
+// The startup precompile (the shader ledger's replay, then the pipeline recipes) finishes before
+// the GPU thread runs the game's first command: everything known is built before gameplay instead
+// of the first time it is drawn (Mac 11-02; the overlay shows the progress meanwhile).
+// KYTY_PRECOMPILE_WAIT=0: the game starts at once, as before.
+static void WaitForStartupPrecompile() {
+	struct Done { // play starts when this returns, by any path (zero-compile accounting)
+		~Done() { GetShaderPrecompileProgress().startup_wait_done.store(true, std::memory_order_release); }
+	} done_on_return;
+	static const bool wait = [] {
+		const char* value = std::getenv("KYTY_PRECOMPILE_WAIT");
+		return !(value != nullptr && value[0] == '0');
+	}();
+	if (!wait) {
+		return;
+	}
+	auto&      progress = GetShaderPrecompileProgress();
+	const auto begin    = std::chrono::steady_clock::now();
+	const auto elapsed  = [&] { return std::chrono::steady_clock::now() - begin; };
+	// Step D4: the pipeline libraries of the shader list too, so a first start only links during
+	// play (KYTY_GPL_WARM_WAIT=0: they are made in the background while the game runs).
+	static const bool wait_libraries = [] {
+		const char* value = std::getenv("KYTY_GPL_WARM_WAIT");
+		return !(value != nullptr && value[0] == '0');
+	}();
+	const auto busy = [&] {
+		// The replay's thread may not have started yet. (Checked even when there are no pipeline
+		// recipes: their thread then reports finished at once, before the replay ran.)
+		const auto finished_at = progress.finished_at.load(std::memory_order_acquire);
+		if (progress.active.load(std::memory_order_acquire) || progress.importing.load(std::memory_order_acquire) ||
+		    (elapsed() < std::chrono::seconds(1) && finished_at == 0)) {
+			return true;
+		}
+		// The recipes are built after the replay.
+		if (progress.pipelines_known.load(std::memory_order_acquire) &&
+		    !progress.pipelines_finished.load(std::memory_order_acquire)) {
+			return true;
+		}
+		return wait_libraries && finished_at != 0 && !progress.gpl_warm_finished.load(std::memory_order_acquire);
+	};
+	if (!busy()) {
+		return;
+	}
+	LOGF("GPU: waiting for the startup shader and pipeline precompile (KYTY_PRECOMPILE_WAIT=0: don't)\n");
+	progress.skip_offered.store(true, std::memory_order_release);
+	struct SkipOff {
+		~SkipOff() {
+			auto& p = GetShaderPrecompileProgress();
+			p.skip_offered.store(false, std::memory_order_release);
+			p.skip_state.store(0, std::memory_order_release);
+		}
+	} skip_off;
+	// A first start with the shipped list compiles for a long time: wait while it advances, and
+	// stop waiting only after 10 minutes without progress (it was a fixed 30 minutes).
+	auto last_count    = ~uint64_t {0};
+	auto last_progress = std::chrono::steady_clock::now();
+	while (busy()) {
+		if (progress.skip_state.load(std::memory_order_acquire) == 2) {
+			// The player skipped (Esc, then Y): the rest is made in the background during play.
+			progress.skipped.store(true, std::memory_order_release);
+			LOGF("GPU: startup precompile skipped by the player; the rest continues in the background\n");
+			std::fprintf(stderr, "[precompile-skip] skipped by the player after %.1f s\n",
+			             std::chrono::duration<double>(elapsed()).count());
+			break;
+		}
+		const uint64_t count = uint64_t {progress.done.load()} + progress.import_done.load() +
+		                       progress.pipelines_done.load() + progress.gpl_warm_done.load();
+		const auto now = std::chrono::steady_clock::now();
+		if (count != last_count) {
+			last_count    = count;
+			last_progress = now;
+		} else if (now - last_progress > std::chrono::minutes(10)) {
+			LOGF("GPU: startup precompile made no progress for 10 minutes; the game starts\n");
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
+	const auto seconds = std::chrono::duration<double>(elapsed()).count();
+	LOGF("GPU: startup precompile done after %.1f s (shaders %u of %u, %u compiled; pipelines %u of %u; libraries %u of %u)\n",
+	     seconds, progress.done.load(), progress.total.load(), progress.compiled.load(),
+	     progress.pipelines_done.load(), progress.pipelines_total.load(), progress.gpl_warm_done.load(),
+	     progress.gpl_warm_total.load());
+	std::fprintf(stderr, "[precompile-wait] %.1f s\n", seconds);
+}
+
+uint32_t GuestGpu::RoleOf(uint32_t queue_id) noexcept {
+	return AsyncThreadEnabled() && queue_id != 0 ? 1u : 0u;
 }
 
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
-	KYTY_PROFILER_THREAD("Thread_Gpu");
-	Common::PreferPerformanceCores("GPU thread");
+	ThreadRunRole(gpu, 0);
+}
+
+void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
+	EXIT_IF(gpu == nullptr || role > 1);
+	if (role == 0) {
+		KYTY_PROFILER_THREAD("Thread_Gpu");
+		Common::PreferPerformanceCores("GPU thread");
+		Profiler::t_gpu_thread = true;
+		g_gpu_state            = gpu; // commands run on role 0 only
+		Common::Sampler::RegisterCurrentThread("gpu");
+		WaitForStartupPrecompile();
+	} else {
+		KYTY_PROFILER_THREAD("Thread_GpuAsync");
+		Common::PreferPerformanceCores("GPU async-compute thread");
+		Common::Sampler::RegisterCurrentThread("gpu-async");
+	}
 	Common::RaiseGpuThreadPriority();
-	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
-	g_gpu_state  = gpu;
-	Common::Sampler::RegisterCurrentThread("gpu");
+	SetBarrierMergeThread();
+	const bool     async       = AsyncThreadEnabled();
+	// KYTY_SYNC_TOGGLE_MODE=async: which thread runs the compute queues changes with the toggle
+	// window, so idle waits are short (the toggle wakes nobody).
+	const bool     toggled     = async && !AsyncThreadAlways();
+	// The queues this role runs: [first_queue, first_queue + queue_count). Role 1 runs the compute
+	// queues while the async thread is active; role 0 runs the graphics queue, and the compute
+	// queues too while it is not.
+	const uint32_t first_queue = role == 1 ? 1u : 0u;
+	const auto     queue_count_now = [async, role] {
+		if (role == 1) {
+			return AsyncThreadActive() ? QueueCount - 1u : 0u;
+		}
+		return async && AsyncThreadActive() ? 1u : QueueCount;
+	};
+	auto&          work        = role == 1 ? gpu->m_async_work : gpu->m_work_available;
+	// Under m_queue_mutex: commands (role 0) or submissions of this role's queues are waiting.
+	const auto has_work = [gpu, role, async] {
+		if (role == 1) {
+			return AsyncThreadActive() && gpu->m_role_count[1] != 0;
+		}
+		return gpu->m_role_count[0] != 0 || !gpu->m_commands.empty() ||
+		       (async && !AsyncThreadActive() && gpu->m_role_count[1] != 0);
+	};
+	const auto wait_work = [&work, gpu, toggled] {
+		if (toggled) {
+			work.WaitFor(&gpu->m_queue_mutex, 10);
+		} else {
+			work.Wait(&gpu->m_queue_mutex);
+		}
+	};
+	// Under m_queue_mutex: a completed slice may have written labels the other role waits for.
+	const auto unblock_all = [gpu, async, role] {
+		for (auto& queue: gpu->m_queues) {
+			if (!queue.empty()) {
+				queue.front().blocked = false;
+			}
+		}
+		if (async) {
+			(role == 0 ? gpu->m_async_work : gpu->m_work_available).Signal();
+		}
+	};
 
 	auto loop_mark = std::chrono::steady_clock::now();
 	for (;;) {
@@ -891,35 +1437,58 @@ void GuestGpu::ThreadRun(void* data) {
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(
 			        std::chrono::steady_clock::now() - lock_begin)
 			        .count());
-			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
-				gpu->m_processing = false;
+			while (!has_work() && !gpu->m_stopping) {
+				gpu->m_processing[role] = false;
 				gpu->m_idle.Signal();
 				Timeline::Mark("gpu-idle");
 				const auto empty_begin = std::chrono::steady_clock::now();
-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
-				g_srt_defer_stats.empty_us += static_cast<uint64_t>(
-				    std::chrono::duration_cast<std::chrono::nanoseconds>(
-				        std::chrono::steady_clock::now() - empty_begin)
-				        .count());
+				wait_work();
+				{
+					const auto empty_ns = static_cast<uint64_t>(
+					    std::chrono::duration_cast<std::chrono::nanoseconds>(
+					        std::chrono::steady_clock::now() - empty_begin)
+					        .count());
+					g_srt_defer_stats.empty_us += empty_ns;
+					if (Common::FloorStats::Enabled() && g_gpu_state != nullptr) {
+						Common::FloorStats::Add(Common::FloorStats::Get().thread_empty_ns, empty_ns);
+					}
+				}
 				Timeline::Mark("gpu-wake");
 			}
-			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
-				gpu->m_processing = false;
+			if (gpu->m_stopping && !has_work()) {
+				gpu->m_processing[role] = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
-			} else if (!gpu->m_commands.empty()) {
+			} else if (role == 0 && !gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
-				gpu->m_processing = true;
+				gpu->m_processing[role] = true;
 			} else {
+				const uint32_t queue_count = queue_count_now();
+				if (queue_count == 0) {
+					continue; // the window changed since has_work()
+				}
 				int      selected_queue = -1;
 				bool     tick_pending   = false;
 				uint64_t pending_tick   = UINT64_MAX;
 				auto& scheduler     = gpu->m_renderer.GetCommandScheduler();
-				for (uint32_t offset = 0; offset < QueueCount; offset++) {
-					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (gpu->m_queues[id].empty()) {
+				// KYTY_GFX_PRIORITY (GfxPriority): the graphics queue is looked at first, then the
+				// compute queues round-robin as before.
+				const bool gfx_first = first_queue == 0 && queue_count > 1 && GfxPriority();
+				for (uint32_t offset = 0; offset < queue_count; offset++) {
+					uint32_t id = 0;
+					if (gfx_first) {
+						if (offset != 0) {
+							// Round-robin over queues 1..queue_count-1 from where it stopped.
+							const auto others = queue_count - 1u;
+							const auto start  = gpu->m_next_queue[role] == 0 ? 0u : gpu->m_next_queue[role] - 1u;
+							id = 1u + (start + offset - 1u) % others;
+						}
+					} else {
+						id = first_queue + (gpu->m_next_queue[role] - first_queue + offset) % queue_count;
+					}
+					if (gpu->m_queues[id].empty() || gpu->m_queue_busy[id]) {
 						continue;
 					}
 					auto& front = gpu->m_queues[id].front();
@@ -941,7 +1510,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0 && tick_pending) {
 					// Nothing else to run: poll for the downloads (and new submissions).
-					gpu->m_processing = false;
+					gpu->m_processing[role] = false;
 					const auto wait_begin = std::chrono::steady_clock::now();
 					// Wait for the GPU itself (2 ms slices, the queue unlocked so the guest can
 					// submit), not for a new submission: nothing signals m_work_available when a
@@ -952,10 +1521,11 @@ void GuestGpu::ThreadRun(void* data) {
 						return value != nullptr && value[0] == '1';
 					}();
 					if (legacy_idle || pending_tick == UINT64_MAX) {
-						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 50);
+						work.WaitFor(&gpu->m_queue_mutex, 50);
 					} else {
 						gpu->m_queue_mutex.Unlock();
 						if (scheduler.Active() && pending_tick >= scheduler.CurrentTick()) {
+							RendererScope renderer_scope(gpu->m_renderer);
 							(KYTY_SUBMIT_REASON(), scheduler.Flush()); // the download is still in the open command buffer
 						}
 						(void)scheduler.WaitFor(pending_tick, 2'000'000);
@@ -972,17 +1542,24 @@ void GuestGpu::ThreadRun(void* data) {
 					g_srt_defer_stats.ran_other++;
 				}
 				if (selected_queue < 0) {
-					gpu->m_processing = false;
+					gpu->m_processing[role] = false;
 					Timeline::Mark("gpu-blocked");
 					const auto blocked_begin = std::chrono::steady_clock::now();
 					g_srt_defer_stats.blocked_waits++;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
-					g_srt_defer_stats.blocked_us += static_cast<uint64_t>(
-					    std::chrono::duration_cast<std::chrono::nanoseconds>(
-					        std::chrono::steady_clock::now() - blocked_begin)
-					        .count());
+					work.WaitFor(&gpu->m_queue_mutex, toggled ? 10 : 100);
+					{
+						const auto blocked_ns = static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::nanoseconds>(
+						        std::chrono::steady_clock::now() - blocked_begin)
+						        .count());
+						g_srt_defer_stats.blocked_us += blocked_ns;
+						if (Common::FloorStats::Enabled() && g_gpu_state != nullptr) {
+							Common::FloorStats::Add(Common::FloorStats::Get().thread_blocked_ns, blocked_ns);
+						}
+					}
 					Timeline::Mark("gpu-unblocked");
-					for (auto& queue: gpu->m_queues) {
+					for (uint32_t id = first_queue; id < first_queue + queue_count; id++) {
+						auto& queue = gpu->m_queues[id];
 						if (!queue.empty()) {
 							queue.front().blocked = false;
 						}
@@ -993,13 +1570,21 @@ void GuestGpu::ThreadRun(void* data) {
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
-				gpu->m_processing = true;
-				has_submission    = true;
+				gpu->m_role_count[RoleOf(static_cast<uint32_t>(selected_queue))]--;
+				gpu->m_queue_busy[static_cast<uint32_t>(selected_queue)] = true;
+				// With the graphics queue first, the compute round-robin keeps its own place.
+				if (!(gfx_first && selected_queue == 0)) {
+					gpu->m_next_queue[role] = static_cast<uint32_t>(selected_queue) + 1u;
+				}
+				gpu->m_processing[role] = true;
+				has_submission          = true;
 			}
 		}
 		if (should_stop) {
-			gpu->m_gfx_cp->BufferWait();
+			if (role == 0) {
+				RendererScope renderer_scope(gpu->m_renderer);
+				gpu->m_gfx_cp->BufferWait();
+			}
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;
@@ -1008,18 +1593,31 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			const auto command_begin = std::chrono::steady_clock::now();
-			command();
+			{
+				RendererScope renderer_scope(gpu->m_renderer);
+				command();
+			}
 			g_srt_defer_stats.cmd_count++;
-			g_srt_defer_stats.command_us += static_cast<uint64_t>(
-			    std::chrono::duration_cast<std::chrono::nanoseconds>(
-			        std::chrono::steady_clock::now() - command_begin)
-			        .count());
+			{
+				const auto command_ns = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        std::chrono::steady_clock::now() - command_begin)
+				        .count());
+				g_srt_defer_stats.command_us += command_ns;
+				if (Common::FloorStats::Enabled() && g_gpu_state != nullptr) {
+					Common::FloorStats::Add(Common::FloorStats::Get().thread_command_ns, command_ns);
+				}
+			}
 			ReportSrtDeferStats();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			gpu->m_processing = false;
-			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			gpu->m_processing[role] = false;
+			if (!has_work()) {
 				gpu->m_idle.SignalAll();
+			}
+			// A label write (they run as commands) may release the async thread's waits.
+			if (async) {
+				unblock_all();
 			}
 			continue;
 		}
@@ -1033,13 +1631,25 @@ void GuestGpu::ThreadRun(void* data) {
 		g_srt_wait_tick     = 0;
 		const auto process_begin = std::chrono::steady_clock::now();
 		g_stat_queue = submission.queue_id;
+		GpuTiming::SetQueue(submission.queue_id);
 		const bool complete = gpu->Process(submission);
 		{
 			const auto ns = static_cast<uint64_t>(
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(
 			        std::chrono::steady_clock::now() - process_begin)
 			        .count());
+			if (QueueStatsEnabled()) {
+				std::lock_guard stats_lock(g_queue_stats_mutex);
+				const auto q = submission.queue_id % QueueCount;
+				g_queue_stats.process_ns[q] += ns;
+				g_queue_stats.calls[q]++;
+				if (!complete) g_queue_stats.incomplete[q]++;
+				if (role == 1) g_queue_stats.process_async_ns[q] += ns;
+			}
 			g_srt_defer_stats.process_us += ns;
+			if (Common::FloorStats::Enabled() && g_gpu_state != nullptr) {
+				Common::FloorStats::Add(Common::FloorStats::Get().thread_process_ns, ns);
+			}
 			const bool progress = submission.command_execution.MadeProgress() ||
 			                      submission.constant_execution.MadeProgress();
 			if (progress) {
@@ -1060,20 +1670,23 @@ void GuestGpu::ThreadRun(void* data) {
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(
 		        std::chrono::steady_clock::now() - lock2_begin)
 		        .count());
+		gpu->m_queue_busy[submission.queue_id] = false;
 		if (!complete) {
 			submission.blocked       = true;
 			submission.srt_wait_tick = srt_tick;
-			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+			const auto queue_id      = submission.queue_id;
+			gpu->m_queues[queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
-		} else {
-			for (auto& queue: gpu->m_queues) {
-				if (!queue.empty()) {
-					queue.front().blocked = false;
-				}
+			gpu->m_role_count[RoleOf(queue_id)]++;
+			if (toggled) {
+				// The other thread may run this queue now (the window changed).
+				unblock_all();
 			}
+		} else {
+			unblock_all();
 		}
-		gpu->m_processing = false;
-		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+		gpu->m_processing[role] = false;
+		if (!has_work()) {
 			gpu->m_idle.SignalAll();
 		}
 	}
@@ -1122,10 +1735,11 @@ static void HotPagesSlice(bool first_slice) {
 		last_epoch = now;
 		g_hot_epoch.fetch_add(1, std::memory_order_relaxed);
 	}
-	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+	if (static const bool log = Common::FpsLogDiagnostics(); log) {
 		std::fprintf(stderr,
 		             "[hot-pages] faults %.0f/s, promoted %.0f/s, uploads %.0f/s, repeats skipped "
-		             "%.0f/s, demoted by GPU writes %.0f/s, generations %.0f/s\n",
+		             "%.0f/s, demoted by GPU writes %.0f/s, generations %.0f/s | label bumps %.0f/s "
+		             "polls skipped %.0f/s\n",
 		             g_hot_stats.faults.exchange(0) / s, g_hot_stats.promoted.exchange(0) / s,
 		             g_hot_stats.uploads.exchange(0) / s, g_hot_stats.repeats.exchange(0) / s,
 		             g_hot_stats.demoted_by_gpu.exchange(0) / s,
@@ -1135,7 +1749,9 @@ static void HotPagesSlice(bool first_slice) {
 			             const auto      delta    = current - previous;
 			             previous                 = current;
 			             return delta / s;
-		             }());
+		             }(),
+		             g_hot_stats.label_bumps.exchange(0) / s,
+		             g_hot_stats.label_skips.exchange(0) / s);
 	}
 }
 
@@ -1153,21 +1769,25 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 	} end_mark {submission};
 
-	if (first_slice) {
-		g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
-		// Texture-heap entries the guest wrote before submitting are visible to all of this
-		// submission's draws, as on the console.
-		m_renderer.GetRenderExecutor().SyncBindlessHeaps();
-	}
+	{
+		RendererScope renderer_scope(m_renderer);
+		g_bda_submission_cpu_epoch.store(submission.cpu_epoch, std::memory_order_relaxed);
+		if (first_slice) {
+			g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
+			// Texture-heap entries the guest wrote before submitting are visible to all of this
+			// submission's draws, as on the console.
+			m_renderer.GetRenderExecutor().SyncBindlessHeaps();
+		}
 
-	if (first_slice) {
-		submission.started = true;
-		cp.SetSubmitId(++m_submit_id);
-		cp.ResetDeCe();
-		cp.SetFlip({});
-	}
+		if (first_slice) {
+			submission.started = true;
+			cp.SetSubmitId(++m_submit_id);
+			cp.ResetDeCe();
+			cp.SetFlip({});
+		}
 
-	cp.BufferInit();
+		cp.BufferInit();
+	}
 	bool complete = true;
 
 	switch (submission.type) {
@@ -1196,6 +1816,7 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			RendererScope renderer_scope(m_renderer);
 			if (progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
@@ -1228,6 +1849,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			RendererScope renderer_scope(m_renderer);
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
@@ -1241,18 +1863,22 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			break;
 		}
-		case SubmissionType::FlipPreparation:
+		case SubmissionType::FlipPreparation: {
+			RendererScope renderer_scope(m_renderer);
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint:
-			cp.EmitGlobalBarrier();
+		}
+		case SubmissionType::SuspendPoint: {
+			RendererScope renderer_scope(m_renderer);
+			cp.EmitGuestBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			SetSubmitReason("suspend point");
 			cp.BufferFlush();
 			cp.Reset();
 			break;
+		}
 	}
 
 	return complete;
@@ -1263,6 +1889,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
+	if (RenderStats::IndirectReplayConfigured()) {
+		InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketBoundary);
+	}
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
 	}
@@ -1285,6 +1914,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	if (t_segment_held || RenderExecutor::QueuedDispatchCount() != 0) {
+		AsyncSegmentLeave();
+	}
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -1341,7 +1973,69 @@ void CommandProcessor::EndDispatchDefer() {
 	SuspendPm4();
 }
 
+static bool IndirectReplayPacketKeepsBase(const uint32_t* packet, uint32_t remaining_dw) {
+	const auto header = packet[0];
+	if (header == 0x80000000u) return true;
+	if ((header >> 30u) != 3u || (header & 1u) != 0) return false;
+	const auto packet_dw = KYTY_PM4_LEN(header);
+	if (packet_dw < 2u || packet_dw > remaining_dw) return false;
+	const auto opcode = (header >> 8u) & 0xffu;
+	if (opcode == Pm4::IT_NOP) {
+		const auto subop = KYTY_PM4_R(header);
+		return subop == Pm4::R_ZERO || subop == Pm4::R_PUSH_MARKER ||
+		       subop == Pm4::R_POP_MARKER;
+	}
+	if (opcode == Pm4::IT_DRAW_INDIRECT) {
+		return GpuIndirectDraws() && header == 0xc0032400u && packet_dw == 5u &&
+		       (packet[4] & ~0x20u) == 2u;
+	}
+	// v326: context register writes (direct or from memory) change only the Context, which replay
+	// compares byte for byte with the base's; primitive/index type writes change the user config
+	// (compared) or the index type (unused by these non-indexed draws); SET_BASE changes argument
+	// bases, and replay checks each draw's converted arguments by address.
+	if (opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT) {
+		return true;
+	}
+	// User-config writes (direct, indexed or from memory) change only the UserConfig (compared) or
+	// ignore the value, except VGT_INDEX_TYPE, which sets the command processor's index type
+	// (unused by these non-indexed draws; an indexed draw is never replayed).
+	if (opcode == Pm4::IT_SET_UCONFIG_REG || opcode == Pm4::IT_SET_UCONFIG_REG_INDEX ||
+	    opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) {
+		return true;
+	}
+	if (opcode == Pm4::IT_SET_BASE) {
+		return packet_dw == 4u && (packet[1] & 0xfu) == 1u;
+	}
+	// v328: SH register loads from memory change only the shader registers (cp.GetShCtx()), which
+	// replay compares (user SGPR values through its own checks, the rest byte for byte).
+	if (opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+	    (opcode == Pm4::IT_SET_SH_REG && KYTY_PM4_R(header) == Pm4::R_ZERO)) {
+		return true;
+	}
+	if (opcode != Pm4::IT_SET_SH_REG || KYTY_PM4_R(header) != Pm4::R_ZERO) return false;
+	const auto reg = packet[1];
+	const auto count = packet_dw - 2u;
+	if (count == 0) return false;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto current = reg + i;
+		const bool ps_user = current >= Pm4::SPI_SHADER_USER_DATA_PS_0 &&
+		                     current <= Pm4::SPI_SHADER_USER_DATA_PS_31;
+		const bool gs_user = current >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
+		                     current <= Pm4::SPI_SHADER_USER_DATA_GS_31;
+		if (!ps_user && !gs_user) return false;
+	}
+	return true;
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	// KYTY_DRAW_PIPE: what runs between slices (submission ends, other queues) needs the renderer.
+	struct DrawPipeSliceEnd {
+		~DrawPipeSliceEnd() {
+			DrawPipe::SetDrawPacket(false);
+			DrawPipe::Drain(DrawPipe::Reason::Slice);
+		}
+	} draw_pipe_slice_end;
+	const bool draw_pipe = DrawPipe::Enabled();
 	const bool draw_prep = execution.m_prep_seq != 0 && DrawPrep::Enabled();
 	if (DrawPrep::Enabled() && !draw_prep) {
 		DrawPrep::ClearCurrent();
@@ -1353,6 +2047,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
 		if (cursor.offset_dw == cursor.commands.size()) {
+			if (RenderStats::IndirectReplayConfigured()) {
+				InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketBoundary);
+			}
 			execution.m_buffer_stack.pop_back();
 			continue;
 		}
@@ -1384,6 +2081,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				     packet_header, packet_dw, total_dw - remaining_dw);
 			}
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			if (RenderStats::IndirectReplayConfigured()) {
+				InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketState);
+			}
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
@@ -1433,6 +2133,31 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
+		}
+		if (RenderStats::IndirectReplayConfigured() && !RenderStats::IndirectReplayActive()) {
+			InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketState);
+		} else if (RenderStats::IndirectReplayConfigured() &&
+		           !IndirectReplayPacketKeepsBase(packet, remaining_dw)) {
+			if (RenderStats::g_indirect_base_maybe.load(std::memory_order_relaxed)) {
+				// Which packets end a replay base ([indirect-replay] stops=...): opcode, and the first
+				// register of register writes.
+				const uint32_t op  = (packet[0] >> 8u) & 0xffu;
+				const bool     reg = op == Pm4::IT_SET_SH_REG || op == Pm4::IT_SET_CONTEXT_REG ||
+				                 op == Pm4::IT_SET_UCONFIG_REG || op == Pm4::IT_SET_UCONFIG_REG_INDEX;
+				RenderStats::NoteIndirectReplayStop(
+				    (op << 16u) | (reg && remaining_dw > 1 ? (packet[1] & 0xffffu)
+				                   : op == Pm4::IT_NOP ? KYTY_PM4_R(packet[0])
+				                                       : 0u));
+			}
+			InvalidateReplayBase(m_renderer, RenderStats::IndirectReplayNote::PacketState);
+		}
+
+		if (draw_pipe) {
+			const bool draw_packet = DrawPipeDrawPacket(opcode);
+			if (!draw_packet && !DrawPipeSafePacket(opcode, packet)) {
+				DrawPipe::Drain(DrawPipe::Reason::Packet, opcode);
+			}
+			DrawPipe::SetDrawPacket(draw_packet);
 		}
 
 		auto handler = g_cp_op_func[opcode];
@@ -1486,9 +2211,53 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				command_zone.emplace(location);
 			}
 		}
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		uint32_t packet_dw = 0;
+		// Graphics right of way: the async thread hands the mutex over at this packet boundary
+		// (after recording what it queued) instead of holding it for the rest of its segment.
+		if (t_segment_held && RenderContext::PoliteAsync() && RenderContext::GraphicsWaiting()) {
+			AsyncSegmentLeave();
+		}
+		if (AsyncBatchEnabled() && GuestGpu::IsAsyncThread() && !RegisterOnlyPacket(opcode)) {
+			if ((opcode == Pm4::IT_DISPATCH_DIRECT ||
+			     (opcode == Pm4::IT_DISPATCH_INDIRECT && AsyncBatchIndirect())) &&
+			    (packet_header & 1u) == 0) {
+				// Prepared and queued without the mutex (CommandProcessor::DispatchDirect). Another
+				// shader's dispatch records the queue first: its preparation reads guest memory
+				// (the SRT walk) as of what has been recorded, and a producer/consumer pair with no
+				// packet between them is two shaders (runs of one shader stay batched).
+				if (RenderExecutor::QueuedDispatchCount() != 0 &&
+				    RenderExecutor::LastQueuedShader() != m_sh_ctx.GetCs().cs_regs.data_addr) {
+					AsyncSegmentEnter();
+				}
+				if (t_segment_held && RenderExecutor::QueuedDispatchCount() == 0) {
+					m_renderer.UnlockRenderer();
+					t_segment_held = false;
+				}
+				// The whole packet runs off-lock: a fault on a tracked page takes the mutex itself.
+				RenderContext::MarkOffLock(true);
+				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+				RenderContext::MarkOffLock(false);
+				if (RenderExecutor::QueuedDispatchCount() >= AsyncBatchMaxValue()) {
+					AsyncSegmentEnter();
+				}
+			} else {
+				AsyncSegmentEnter();
+				packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+			}
+		} else if (AsyncThreadEnabled() && !RegisterOnlyPacket(opcode)) {
+			// The other command-processor thread may have bound its registers since.
+			RendererScope renderer_scope(m_renderer);
+			if (g_bound_cp != this) {
+				BufferInit();
+			}
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		} else {
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
+		if (draw_pipe) {
+			DrawPipe::SetDrawPacket(false);
+		}
 		if (execution.m_suspended) {
 			NoteSuspendSite(packet, remaining_dw);
 			return;
@@ -1549,6 +2318,11 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			if (static std::atomic<uint32_t> logged {0}; logged.fetch_add(1) < 4) {
+				std::fprintf(stderr, "[occl-real] predication on a query at 0x%016" PRIx64
+				             " (wait %u, condition %u)\n",
+				             reinterpret_cast<uint64_t>(address), wait_op, condition);
+			}
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
@@ -1589,20 +2363,150 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// KYTY_LOG_DRAW_PACKET_ES=<hash> (diagnostics): every indexed draw (direct and indirect) whose
+// ES, GS or PS has that hash: its arguments, the CP's START_INST_LOC, GS user data 12..20, the
+// command dwords around the current packet and, for indirect packets, the argument dwords.
+// KYTY_LOG_DRAW_PACKET_COUNT=<n>: only draws of n indices. KYTY_LOG_DRAW_PACKET_EVERY=<n>: only
+// every n-th guest flip (default 30), 120 lines on it at most.
+struct LoggedDraw {
+	const char* kind;
+	uint32_t    count;
+	uint32_t    instances;
+	uint32_t    first_instance;
+	int32_t     base_vertex;
+	int         source;
+	uint64_t    gpu_args;
+};
+static void LogIndexedDraw(CommandProcessor& cp, const LoggedDraw& args, uint32_t start_inst_reg,
+                           uint64_t indirect_base, std::span<const uint32_t> commands,
+                           int64_t at) {
+	static const std::string watch = [] {
+		const char* value = std::getenv("KYTY_LOG_DRAW_PACKET_ES");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	if (watch.empty()) {
+		return;
+	}
+	static const uint32_t only_count = [] {
+		const char* value = std::getenv("KYTY_LOG_DRAW_PACKET_COUNT");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	static const uint64_t every = [] {
+		const char* value = std::getenv("KYTY_LOG_DRAW_PACKET_EVERY");
+		const auto  n     = value != nullptr ? std::strtoull(value, nullptr, 10) : 30ull;
+		return n == 0 ? 1ull : n;
+	}();
+	if (only_count != 0 && args.count != only_count) {
+		return;
+	}
+	const auto flip = Sync::GuestFlipCount();
+	if (flip % every != 0) {
+		return;
+	}
+	const auto& vs   = cp.GetShCtx().GetVs();
+	const auto& ps   = cp.GetShCtx().GetPs();
+	const auto  hash = [](uint64_t a) { return a != 0 ? ShaderDeclaredHash(a) : 0ull; };
+	const auto  listed = [&](uint64_t h) {
+		return h != 0 && watch.find(fmt::format("{:016x}", h)) != std::string::npos;
+	};
+	if (!listed(hash(vs.es_regs.data_addr)) && !listed(hash(vs.gs_regs.data_addr)) &&
+	    !listed(hash(ps.ps_regs.data_addr))) {
+		return;
+	}
+	static std::atomic<uint64_t> last_flip {~0ull};
+	static std::atomic<uint32_t> lines {0};
+	if (last_flip.exchange(flip) != flip) lines.store(0);
+	if (lines.fetch_add(1) >= 120) {
+		return;
+	}
+	std::string text = fmt::format(
+	    "[idx-draw] flip={} {} count={} inst={} first_inst={} base_vtx={} src={} gpu_args=0x{:x} "
+	    "start_inst_reg=0x{:x} ps={:016x} gs12..20:",
+	    flip, args.kind, args.count, args.instances, args.first_instance, args.base_vertex,
+	    args.source, args.gpu_args, start_inst_reg, hash(ps.ps_regs.data_addr));
+	for (uint32_t i = 12; i <= 20; i++) {
+		text += fmt::format(" {:08x}", vs.gs_user_sgpr.value[i]);
+	}
+	if (!commands.empty()) {
+		const auto  size = static_cast<int64_t>(commands.size());
+		const auto* data = commands.data();
+		text += fmt::format(" | at={} pkt:", at);
+		for (int64_t i = at; i < std::min(size, at + 10); i++) {
+			text += fmt::format(" {:08x}", data[i]);
+		}
+		text += " | before:";
+		for (int64_t i = std::max<int64_t>(0, at - 40); i < at; i++) {
+			text += fmt::format(" {:08x}", data[i]);
+		}
+		if (at < size && indirect_base != 0) {
+			const uint32_t header = data[at];
+			if ((header == 0xc0032500u || header == 0xc0083800u || header == 0xc0032400u ||
+			     header == 0xc0082c00u) &&
+			    at + 1 < size) {
+				const auto* words =
+				    reinterpret_cast<const uint32_t*>(indirect_base + data[at + 1]);
+				text += " | args:";
+				for (int i = 0; i < 10; i++) {
+					text += fmt::format(" {:08x}", words[i]);
+				}
+			}
+		}
+	}
+	std::fprintf(stderr, "%s\n", text.c_str());
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	const CpuCost::Scope cpu_cost('D');
+	Libs::Graphics::SyncToggle::GpuSlowSpin();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
+	}
+	{
+		const LoggedDraw logged {"DrawIndex", args.index_count, args.instance_count,
+		                         args.first_instance, args.base_vertex,
+		                         static_cast<int>(args.offset_source), 0};
+		if (g_current_execution != nullptr && !g_current_execution->m_buffer_stack.empty()) {
+			const auto& cursor = g_current_execution->m_buffer_stack.back();
+			LogIndexedDraw(*this, logged, m_start_instance_register, m_draw_indirect_args_base_addr,
+			               cursor.commands, cursor.offset_dw);
+		} else {
+			LogIndexedDraw(*this, logged, m_start_instance_register, m_draw_indirect_args_base_addr,
+			               {}, 0);
+		}
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
+	if (ImgRef::Address() != 0) {
+		const auto frame = m_renderer.GetGpu().GetFrameNum();
+		const auto& ps   = m_sh_ctx.GetPs();
+		ImgRef::Scan("draw-ps", ps.ps_regs.data_addr, ps.ps_user_sgpr, frame, ps.ps_regs.user_data_addr);
+		const auto& vs = m_sh_ctx.GetVs();
+		ImgRef::Scan("draw-gs", vs.gs_regs.data_addr, vs.gs_user_sgpr, frame);
+		ImgRef::Scan("draw-hs", vs.hs_regs.data_addr, vs.hs_user_sgpr, frame);
+		static const char* const kRt[8] = {"draw-rt0", "draw-rt1", "draw-rt2", "draw-rt3",
+		                                   "draw-rt4", "draw-rt5", "draw-rt6", "draw-rt7"};
+		for (uint32_t slot = 0; slot < 8; slot++) {
+			ImgRef::Target(kRt[slot], ps.ps_regs.data_addr, m_ctx.GetRenderTarget(slot).base.addr, frame);
+		}
+		const auto& depth = m_ctx.GetDepthRenderTarget();
+		ImgRef::Target("draw-z", ps.ps_regs.data_addr, depth.z_write_base_addr, frame);
+		ImgRef::Target("draw-stencil", ps.ps_regs.data_addr, depth.stencil_write_base_addr, frame);
+		ImgRef::Target("draw-htile", ps.ps_regs.data_addr, depth.htile_data_base_addr, frame);
+	}
+	if (DrawPipe::DrawPacket() && PipeDraw(DrawPipe::Kind::DrawIndex, &args, nullptr)) {
+		return;
+	}
+	Occlusion::NoteGuestDraw();
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	CompleteDraw();
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
+	const CpuCost::Scope cpu_cost('O');
+	Libs::Graphics::SyncToggle::GpuSlowSpin();
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
 		case 0: index_size = 2; break;
@@ -1654,7 +2558,7 @@ static void PrepareMeshArgsRun(const CommandProcessor& cp, const uint32_t* packe
 	                collected = 0, multi = 0;
 	static uint32_t last_header = 0, last_prev = 0, last_stop = 0;
 	static auto     last_log    = std::chrono::steady_clock::now();
-	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && MeshArgsRunsEnabled()) {
+	if (static const bool log = Common::FpsLogDiagnostics(); log && MeshArgsRunsEnabled()) {
 		calls++;
 		const auto now = std::chrono::steady_clock::now();
 		if (now - last_log >= std::chrono::seconds(5)) {
@@ -1690,6 +2594,14 @@ static void PrepareMeshArgsRun(const CommandProcessor& cp, const uint32_t* packe
 	if (run.Contains(packet)) {
 		contained++;
 		return;
+	}
+	if (RenderStats::IndirectReplayConfigured()) {
+		run.upcoming.clear();
+		run.converted.clear();
+		run.next = 0;
+		run.generation++;
+		run.last_used_packet = nullptr;
+		run.last_used_generation = 0;
 	}
 	uint64_t base = cp.GetDrawIndirectArgsBaseAddress();
 	if (base == 0) {
@@ -1780,6 +2692,7 @@ static void PrepareMeshArgsRun(const CommandProcessor& cp, const uint32_t* packe
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
+	const CpuCost::Scope cpu_cost('R');
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -1823,10 +2736,20 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 				run_end            = cursor.commands.data() + cursor.commands.size();
 			}
 			PrepareMeshArgsRun(*this, run_packet, run_end);
+			if (RenderStats::IndirectReplayActive() &&
+			    m_renderer.GetRenderExecutor().ReplayIndirectDraw(
+			        m_submit_id, CurrentBuffer(), reinterpret_cast<uint64_t>(args_addr),
+			        start_instance_sgpr, run_packet)) {
+				Occlusion::NoteGuestDraw();
+				CompleteDraw();
+				MeshArgsRun().packet = nullptr;
+				return;
+			}
+			DrawIndexAuto({.offset_source       = DrawOffsetSource::IndirectArgs,
+			               .gpu_args_address    = reinterpret_cast<uint64_t>(args_addr),
+			               .start_instance_sgpr = start_instance_sgpr,
+			               .indirect_packet     = run_packet});
 		}
-		DrawIndexAuto({.offset_source       = DrawOffsetSource::IndirectArgs,
-		               .gpu_args_address    = reinterpret_cast<uint64_t>(args_addr),
-		               .start_instance_sgpr = start_instance_sgpr});
 		MeshArgsRun().packet = nullptr;
 		return;
 	}
@@ -1894,14 +2817,86 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, uint32_t draw_initiator,
                                          bool indexed, uint32_t draw_index_register) {
+	const CpuCost::Scope cpu_cost('M');
+	Libs::Graphics::SyncToggle::GpuSlowSpin();
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	// KYTY_MULTI_DRAW_SYNC=1: wait for the GPU's writes to the draw count and the argument
+	// records before reading them here (as the mesh path's CPU-read arguments do): a count a
+	// dispatch of this submission wrote may not have faulted into a readback yet.
+	static const bool sync_args = [] {
+		const char* value = std::getenv("KYTY_MULTI_DRAW_SYNC");
+		return value != nullptr && value[0] == '1';
+	}();
+	// KYTY_LOG_MULTI_COUNT=<first guest flip>[:<flips>]: every DRAW_(INDEX_)INDIRECT_MULTI of
+	// those flips with its count address: the count read here, the GPU's copy of it and of the
+	// first argument record, the write state of the count's page and the pixel shader.
+	static const auto log_window = [] {
+		std::pair<uint64_t, uint64_t> window {UINT64_MAX, 0};
+		if (const char* value = std::getenv("KYTY_LOG_MULTI_COUNT"); value != nullptr) {
+			unsigned long long first = 0, flips = 1;
+			if (std::sscanf(value, "%llu:%llu", &first, &flips) >= 1) {
+				window = {first, flips == 0 ? 1 : flips};
+			}
+		}
+		return window;
+	}();
+	const auto flip    = Sync::GuestFlipCount();
+	const bool log_now = flip >= log_window.first && flip - log_window.first < log_window.second;
+	auto&      cache   = m_renderer.GetBufferCache();
+	const auto args_base = m_draw_indirect_args_base_addr + data_offset;
+	const auto args_size_all =
+	    static_cast<uint64_t>(stride_in_bytes) * std::max<uint32_t>(max_count_or_count, 1u);
+	std::string log_before;
+	if (log_now && count_addr != nullptr) {
+		log_before = cache.DescribeWriteState(reinterpret_cast<uint64_t>(count_addr));
+	}
+	if (sync_args) {
+		if (count_addr != nullptr) {
+			cache.WaitSharedWrites(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
+		}
+		cache.WaitSharedWrites(args_base, std::min<uint64_t>(args_size_all, 1u << 20u));
+	}
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
+		}
+	}
+	if (log_now) {
+		static std::atomic<uint32_t> lines {0};
+		if (lines.fetch_add(1) < 4000) {
+			const auto& ps   = GetShCtx().GetPs();
+			const auto  hash = ps.ps_regs.data_addr != 0 ? ShaderDeclaredHash(ps.ps_regs.data_addr) : 0ull;
+			std::string gpu_count = "-";
+			std::string gpu_args  = "-";
+			std::vector<uint32_t> peek;
+			if (count_addr != nullptr &&
+			    cache.PeekGpuCopy(reinterpret_cast<uint64_t>(count_addr), 4, peek) && !peek.empty()) {
+				gpu_count = fmt::format("{}", peek[0]);
+			}
+			peek.clear();
+			if (cache.PeekGpuCopy(args_base, indexed ? 20u : 16u, peek)) {
+				gpu_args.clear();
+				for (const auto w: peek) {
+					gpu_args += fmt::format("{:08x} ", w);
+				}
+			}
+			std::string cpu_args;
+			for (uint32_t i = 0; i < (indexed ? 5u : 4u); i++) {
+				cpu_args += fmt::format("{:08x} ", reinterpret_cast<const uint32_t*>(args_base)[i]);
+			}
+			std::fprintf(stderr,
+			             "[multi-count] flip=%llu ps=%016llx indexed=%d count_addr=%llx cpu_count=%u "
+			             "max=%u gpu_count=%s stride=%u args=%llx cpu_args=%s gpu_args=%s state=%s\n",
+			             static_cast<unsigned long long>(flip), static_cast<unsigned long long>(hash),
+			             indexed ? 1 : 0,
+			             static_cast<unsigned long long>(reinterpret_cast<uint64_t>(count_addr)),
+			             count_addr != nullptr ? *count_addr : max_count_or_count, max_count_or_count,
+			             gpu_count.c_str(), stride_in_bytes, static_cast<unsigned long long>(args_base),
+			             cpu_args.c_str(), gpu_args.c_str(), log_before.c_str());
 		}
 	}
 	if (LogIndirectDraw()) {
@@ -1929,7 +2924,31 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	const bool probe       = RenderStats::MultiDrawProbeEnabled();
+	uint64_t   probe_first = 0;
+	uint32_t   probe_same  = 0;
+	// KYTY_MULTI_DRAW_REPLAY: the draws after the first replayed from the last one drawn in full
+	// (RenderExecutor::ReplayMultiDraw); per-draw diagnostics here keep every draw in full.
+	const bool replay = !indexed && !probe && draw_count > 1 && RenderStats::MultiDrawReplayActive() &&
+	                    ImgRef::Address() == 0 && !LogIndirectDraw();
+	auto&      executor = m_renderer.GetRenderExecutor();
+	uint32_t   replayed_in_packet = 0;
+	if (replay) {
+		executor.BeginMultiDraw();
+	}
 	for (uint32_t i = 0; i < draw_count; i++) {
+		if (probe && i > 0) {
+			// The previous draw's commit, compared with the first draw's.
+			const auto h = RenderStats::LastCommitHash();
+			if (i == 1) {
+				probe_first = h;
+			} else if (h == probe_first && h != 0) {
+				probe_same++;
+			}
+			RenderStats::NoteCommitHash(0);
+		} else if (probe) {
+			RenderStats::NoteCommitHash(0);
+		}
 		// DRAW_INDIRECT_MULTI writes DrawIndex before each draw, including draws
 		// with zero vertices/instances. It starts at zero for each packet.
 		if (draw_index_register != Pm4::SH_NOP) {
@@ -1946,6 +2965,28 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			m_num_instances = args->instance_count;
 			m_num_instances_args = 0;
 			WriteIndirectStartInstance(args->start_instance_location);
+			if (replay && i > 0 &&
+			    executor.ReplayMultiDraw(m_submit_id, CurrentBuffer(), args->vertex_count_per_instance,
+			                             args->instance_count, args->start_vertex_location,
+			                             args->start_instance_location)) {
+				Occlusion::NoteGuestDraw();
+				// Fps plan W1b (11-15): a replayed sub-draw does not count toward the draw-flush
+				// interval (one in 16 of a 1,900-draw packet was drawn in full again after the
+				// submit); the packet counts once, after its loop. KYTY_MULTI_DRAW_PACKET_FLUSH=0: per sub-draw.
+				static const bool per_packet = [] {
+					const char* value = std::getenv("KYTY_MULTI_DRAW_PACKET_FLUSH");
+					return value == nullptr || value[0] != '0';
+				}();
+				if (Common::FloorStats::Enabled()) {
+					Common::FloorStats::Add(Common::FloorStats::Get().replayed, 1);
+				}
+				if (per_packet) {
+					replayed_in_packet++;
+				} else {
+					CompleteDraw();
+				}
+				continue;
+			}
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,
@@ -1981,6 +3022,22 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		           .first_instance = args->start_instance_location,
 		           .offset_source  = DrawOffsetSource::IndirectArgs});
 	}
+	if (replay) {
+		executor.EndMultiDraw();
+		if (replayed_in_packet != 0) {
+			CompleteDraw(); // the packet's replayed sub-draws, once
+		}
+	}
+	if (probe) {
+		const auto h = RenderStats::LastCommitHash();
+		if (draw_count == 1) {
+			probe_first = h;
+		} else if (h == probe_first && h != 0) {
+			probe_same++;
+		}
+		RenderStats::NoteMultiDrawPacket(draw_count, probe_same, draw_index_register, indexed,
+		                                 probe_first);
+	}
 }
 
 // Profiling (KYTY_FPS_LOG): which queue each compute shader is dispatched from, with its first
@@ -2000,6 +3057,8 @@ static void NotePacket(const uint32_t* packet, bool async, uint64_t shader) {
 		bool     async  = false;
 	};
 	static std::unordered_map<const uint32_t*, Entry> counts;
+	static std::mutex                                 counts_mutex; // both command-processor threads
+	std::lock_guard                                   counts_lock(counts_mutex);
 	static auto start = std::chrono::steady_clock::now();
 	auto&       e     = counts[packet];
 	e.count++;
@@ -2028,7 +3087,7 @@ static void NotePacket(const uint32_t* packet, bool async, uint64_t shader) {
 }
 
 static void NoteDispatchQueue(uint64_t addr, bool async, uint32_t x, uint32_t y, uint32_t z) {
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::FpsLogDiagnostics();
 	if (!log) {
 		return;
 	}
@@ -2140,8 +3199,11 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 	}
 	// KYTY_FPS_LOG: run lengths by the shader of each dispatch (addr -> {dispatches, runs started}).
 	// (getenv once: on Windows each call locks and scans the environment, ~1 us a dispatch.)
-	static const bool run_log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool run_log = Common::FpsLogDiagnostics();
 	if (run_log) {
+		// Both command-processor threads (the async thread prepares dispatches without the mutex).
+		static std::mutex run_log_mutex;
+		std::lock_guard   run_log_lock(run_log_mutex);
 		static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> by_shader;
 		static uint64_t                                                   run_len = 0;
 		static auto last = std::chrono::steady_clock::now();
@@ -2174,6 +3236,13 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 	if (!indirect || run.converted.contains(packet)) {
 		return;
 	}
+	// Queued on the async thread (KYTY_ASYNC_BATCH_INDIRECT): the run's conversions happen when its
+	// first dispatch is recorded, from the list collected at the run's start, so the later
+	// dispatches of the run keep that list.
+	if (run.continues && !t_segment_held && AsyncBatchEnabled() && AsyncBatchIndirect() &&
+	    GuestGpu::IsAsyncThread()) {
+		return;
+	}
 	run.upcoming.clear();
 	std::array<uint32_t, 3> local {0, 0, 0};
 	for (const uint32_t* p = packet; p != nullptr && run.upcoming.size() < 1024;) {
@@ -2202,7 +3271,7 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 }
 
 static void ReportDispatchRuns() {
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::FpsLogDiagnostics();
 	if (!log || !DispatchRunsEnabled()) return;
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
@@ -2219,11 +3288,74 @@ static void ReportDispatchRuns() {
 	run.runs = run.members = run.skipped_barriers = run.batched = 0;
 }
 
+// KYTY_SEQ_HASHES=<hex,...> with KYTY_SEQ_TRIGGER=<file>: while the file exists, each dispatch of a
+// listed compute shader and each draw of a listed pixel shader prints one [seq] line, in the order
+// the command processors run them (q: 0 graphics, 1 async compute), up to 6000 lines.
+void SeqNote(char kind, uint64_t shader_addr, int queue, uint64_t frame, uint64_t presented) {
+	static const std::string hashes = [] {
+		const char* value = std::getenv("KYTY_SEQ_HASHES");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	static const char* trigger = std::getenv("KYTY_SEQ_TRIGGER");
+	// KYTY_SEQ_FLIP=<guest flip>: log from that guest flip on, instead of a trigger file.
+	static const uint64_t start_flip = [] {
+		const char* value = std::getenv("KYTY_SEQ_FLIP");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : UINT64_MAX;
+	}();
+	if (hashes.empty() || (trigger == nullptr && start_flip == UINT64_MAX) || shader_addr == 0) {
+		return;
+	}
+	static std::atomic<uint64_t> checked {UINT64_MAX};
+	static std::atomic_bool      on {false};
+	if (start_flip != UINT64_MAX) {
+		if (Sync::GuestFlipCount() < start_flip) {
+			return;
+		}
+	} else {
+		if (checked.exchange(frame) != frame) {
+			std::error_code error;
+			on = std::filesystem::exists(trigger, error);
+		}
+		if (!on) {
+			return;
+		}
+	}
+	const uint64_t hash = ShaderDeclaredHash(shader_addr);
+	// "allcs" in the list: every compute dispatch too (up to 400000 lines).
+	static const bool all_compute = hashes.find("allcs") != std::string::npos;
+	if (!(all_compute && (kind == 'X' || kind == 'I')) &&
+	    hashes.find(fmt::format("{:016x}", hash)) == std::string::npos) {
+		return;
+	}
+	static std::atomic<uint32_t> lines {0};
+	static std::atomic<uint64_t> sequence {0};
+	if (lines.fetch_add(1) >= (all_compute ? 60000u : 6000u)) {
+		return;
+	}
+	std::fprintf(stderr, "[seq] n=%llu f=%llu g=%llu %c q=%d %016llx p=%llu\n",
+	             static_cast<unsigned long long>(sequence.fetch_add(1)),
+	             static_cast<unsigned long long>(frame),
+	             static_cast<unsigned long long>(Sync::GuestFlipCount()), kind, queue,
+	             static_cast<unsigned long long>(hash), static_cast<unsigned long long>(presented));
+}
+
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	const CpuCost::Scope cpu_cost('X');
+	Libs::Graphics::SyncToggle::GpuSlowSpin();
+	if (Common::FloorStats::Enabled()) {
+		Common::FloorStats::Add(Common::FloorStats::Get().dispatches, 1);
+	}
+	if (ImgRef::Address() != 0) {
+		ImgRef::Scan("dispatch", m_sh_ctx.GetCs().cs_regs.data_addr, m_sh_ctx.GetCs().cs_user_sgpr,
+		             m_renderer.GetGpu().GetFrameNum());
+	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	NoteDispatchQueue(m_sh_ctx.GetCs().cs_regs.data_addr, IsAsyncComputeQueue(), thread_group_x,
 	                  thread_group_y, thread_group_z);
+	SeqNote('X', m_sh_ctx.GetCs().cs_regs.data_addr, IsAsyncComputeQueue() ? 1 : 0,
+	        static_cast<uint64_t>(m_renderer.GetGpu().GetFrameNum()),
+	        m_renderer.GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	NotePacket((g_current_execution != nullptr && !g_current_execution->m_buffer_stack.empty()
 	               ? g_current_execution->m_buffer_stack.back().commands.data() +
 	                     g_current_execution->m_buffer_stack.back().offset_dw
@@ -2251,7 +3383,10 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		const auto cpu_begin = std::chrono::steady_clock::now();
+		// The CPU time goes only to NoteDispatchQueue, which keeps it for KYTY_FPS_LOG diagnostics.
+		const bool time_dispatch = Common::FpsLogDiagnostics() || !SyncToggle::HotPath();
+		const auto cpu_begin     = time_dispatch ? std::chrono::steady_clock::now()
+		                                         : std::chrono::steady_clock::time_point {};
 		if (BeginDispatchDefer()) {
 			return;
 		}
@@ -2266,18 +3401,38 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			PrepareDispatchRun(*this, false, run_packet, run_end);
 		}
 		ReportDispatchRuns();
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
+		if (!t_segment_held && AsyncBatchEnabled() && GuestGpu::IsAsyncThread()) {
+			m_renderer.GetRenderExecutor().QueueDispatchDirect(m_submit_id, m_sh_ctx.GetCs(),
+			                                                   m_ctx.GetShaderRegisters(), thread_group_x,
+			                                                   thread_group_y, thread_group_z, mode);
+		} else {
+			m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+			                                              thread_group_y, thread_group_z, mode);
+		}
 		EndDispatchDefer();
-		NoteDispatchQueue(0, IsAsyncComputeQueue(), UINT32_MAX, 0,
-		                  static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-		                                            std::chrono::steady_clock::now() - cpu_begin)
-		                                            .count()));
+		if (time_dispatch) {
+			NoteDispatchQueue(0, IsAsyncComputeQueue(), UINT32_MAX, 0,
+			                  static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                            std::chrono::steady_clock::now() - cpu_begin)
+			                                            .count()));
+		}
 	}
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	const CpuCost::Scope cpu_cost('I');
+	Libs::Graphics::SyncToggle::GpuSlowSpin();
+	if (Common::FloorStats::Enabled()) {
+		Common::FloorStats::Add(Common::FloorStats::Get().dispatches, 1);
+	}
+	if (ImgRef::Address() != 0) {
+		ImgRef::Scan("dispatch", m_sh_ctx.GetCs().cs_regs.data_addr, m_sh_ctx.GetCs().cs_user_sgpr,
+		             m_renderer.GetGpu().GetFrameNum());
+	}
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
+	SeqNote('I', m_sh_ctx.GetCs().cs_regs.data_addr, IsAsyncComputeQueue() ? 1 : 0,
+	        static_cast<uint64_t>(m_renderer.GetGpu().GetFrameNum()),
+	        m_renderer.GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	// Thread counts are converted on the GPU. Reading them here drained the GPU for every
 	// dispatch, since the previous dispatch writes them; KYTY_INDIRECT_THREADS_ON_CPU=1 restores
 	// that path for A/B runs.
@@ -2331,7 +3486,10 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	               ? g_current_execution->m_buffer_stack.back().commands.data() +
 	                     g_current_execution->m_buffer_stack.back().offset_dw
 	               : nullptr), IsAsyncComputeQueue(), m_sh_ctx.GetCs().cs_regs.data_addr);
-	const auto cpu_begin = std::chrono::steady_clock::now();
+	// The CPU time goes only to NoteDispatchQueue, which keeps it for KYTY_FPS_LOG diagnostics.
+	const bool time_dispatch = Common::FpsLogDiagnostics() || !SyncToggle::HotPath();
+	const auto cpu_begin     = time_dispatch ? std::chrono::steady_clock::now()
+	                                         : std::chrono::steady_clock::time_point {};
 	if (BeginDispatchDefer()) {
 		return;
 	}
@@ -2347,16 +3505,24 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		                   run_packet, run_end);
 	}
 	ReportDispatchRuns();
-	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	if (!t_segment_held && AsyncBatchEnabled() && AsyncBatchIndirect() && GuestGpu::IsAsyncThread()) {
+		m_renderer.GetRenderExecutor().QueueDispatchIndirect(m_submit_id, m_sh_ctx.GetCs(),
+		                                                     m_ctx.GetShaderRegisters(), args_addr, mode);
+	} else {
+		m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	}
 	EndDispatchDefer();
-	NoteDispatchQueue(0, IsAsyncComputeQueue(), UINT32_MAX, 0,
-	                  static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-	                                            std::chrono::steady_clock::now() - cpu_begin)
-	                                            .count()));
+	if (time_dispatch) {
+		NoteDispatchQueue(0, IsAsyncComputeQueue(), UINT32_MAX, 0,
+		                  static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                            std::chrono::steady_clock::now() - cpu_begin)
+		                                            .count()));
+	}
 }
 
 uint32_t CommandProcessor::NumInstances() {
 	if (m_num_instances_args != 0) {
+		DrawPipe::Drain(DrawPipe::Reason::GpuState);
 		DrawIndirectArgs args {};
 		std::memcpy(&args, reinterpret_cast<const void*>(m_num_instances_args), sizeof(args));
 		m_num_instances      = args.instance_count;
@@ -2366,6 +3532,21 @@ uint32_t CommandProcessor::NumInstances() {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	const CpuCost::Scope cpu_cost('A');
+	Libs::Graphics::SyncToggle::GpuSlowSpin();
+	{
+		const LoggedDraw logged {"DrawIndexAuto", args.vertex_count, args.instance_count,
+		                         args.first_instance, static_cast<int32_t>(args.first_vertex),
+		                         static_cast<int>(args.offset_source), args.gpu_args_address};
+		if (g_current_execution != nullptr && !g_current_execution->m_buffer_stack.empty()) {
+			const auto& cursor = g_current_execution->m_buffer_stack.back();
+			LogIndexedDraw(*this, logged, m_start_instance_register, m_draw_indirect_args_base_addr,
+			               cursor.commands, cursor.offset_dw);
+		} else {
+			LogIndexedDraw(*this, logged, m_start_instance_register, m_draw_indirect_args_base_addr,
+			               {}, 0);
+		}
+	}
 	if (args.instance_count == 0 && args.gpu_args_address == 0) {
 		if (m_num_instances_args != 0 && GpuIndirectDraws()) {
 			// The instance count a DRAW_INDIRECT read on the GPU left: the GPU reads it too
@@ -2377,15 +3558,87 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 			args.instance_count = NumInstances();
 		}
 	}
+	if (ImgRef::Address() != 0) {
+		const auto frame = m_renderer.GetGpu().GetFrameNum();
+		const auto& ps   = m_sh_ctx.GetPs();
+		ImgRef::Scan("draw-ps", ps.ps_regs.data_addr, ps.ps_user_sgpr, frame, ps.ps_regs.user_data_addr);
+		const auto& vs = m_sh_ctx.GetVs();
+		ImgRef::Scan("draw-gs", vs.gs_regs.data_addr, vs.gs_user_sgpr, frame);
+		ImgRef::Scan("draw-hs", vs.hs_regs.data_addr, vs.hs_user_sgpr, frame);
+		static const char* const kRt[8] = {"draw-rt0", "draw-rt1", "draw-rt2", "draw-rt3",
+		                                   "draw-rt4", "draw-rt5", "draw-rt6", "draw-rt7"};
+		for (uint32_t slot = 0; slot < 8; slot++) {
+			ImgRef::Target(kRt[slot], ps.ps_regs.data_addr, m_ctx.GetRenderTarget(slot).base.addr, frame);
+		}
+		const auto& depth = m_ctx.GetDepthRenderTarget();
+		ImgRef::Target("draw-z", ps.ps_regs.data_addr, depth.z_write_base_addr, frame);
+		ImgRef::Target("draw-stencil", ps.ps_regs.data_addr, depth.stencil_write_base_addr, frame);
+		ImgRef::Target("draw-htile", ps.ps_regs.data_addr, depth.htile_data_base_addr, frame);
+	}
+	if (DrawPipe::DrawPacket() && args.gpu_args_address == 0 &&
+	    PipeDraw(DrawPipe::Kind::DrawAuto, nullptr, &args)) {
+		return;
+	}
+	Occlusion::NoteGuestDraw();
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	CompleteDraw();
+}
+
+// KYTY_DRAW_PIPE: hands a direct draw to the draw thread with a copy of the registers and its
+// programs, selected here. False: the draw thread has run dry and the caller draws as before.
+bool CommandProcessor::PipeDraw(DrawPipe::Kind kind, const DrawIndexArgs* index_args,
+                                const DrawAutoArgs* auto_args) {
+	auto& packet = DrawPipe::Acquire(m_renderer);
+	packet.kind      = kind;
+	packet.submit_id = m_submit_id;
+	packet.cp        = this;
+	packet.ctx       = m_ctx;
+	packet.ucfg      = m_ucfg;
+	packet.sh        = m_sh_ctx;
+	const bool empty = kind == DrawPipe::Kind::DrawIndex
+	                       ? index_args->index_count == 0 || index_args->instance_count == 0
+	                       : auto_args->vertex_count == 0 ||
+	                             (auto_args->instance_count == 0 &&
+	                              auto_args->gpu_instance_count_address == 0);
+	if (kind == DrawPipe::Kind::DrawIndex) {
+		packet.index_args = *index_args;
+	} else {
+		packet.auto_args = *auto_args;
+	}
+	if (empty || !RenderExecutor::PrepareDrawProgramsForPipe(m_renderer, packet.ctx, packet.sh,
+	                                                         packet.ucfg, packet.prepared)) {
+		DrawPipe::Cancel();
+		DrawPipe::Drain(DrawPipe::Reason::Unready);
+		DrawPipe::NoteSyncDraw();
+		return false;
+	}
+	// Writes the buffer V#s bound queue with their ranges (stage A drains when it reads one);
+	// image or raw-pointer writes have no range and drain here.
+	const bool writes = packet.prepared.writes_memory &&
+	                    (packet.prepared.writes_unbounded || !DrawPipe::RangesEnabled());
+	DrawPipe::Publish();
+	if (writes) {
+		DrawPipe::Drain(DrawPipe::Reason::Writes);
+	}
+	return true;
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
+	// The presenter completes flips under the renderer mutex (KYTY_ASYNC_THREAD holds it here).
+	const RenderContext::UnlockedScope unlocked(m_renderer);
+	const bool stats = RenderStats::Enabled();
+	const auto wait_begin = stats ? std::chrono::steady_clock::now()
+	                              : std::chrono::steady_clock::time_point {};
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
+	if (stats) {
+		RenderStats::NoteFlipWait(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(
+		        std::chrono::steady_clock::now() - wait_begin)
+		        .count()));
+	}
 }
 
 template <typename T>
@@ -2395,6 +3648,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         void* dst_gpu_addr, T value, uint32_t interrupt_selector,
                                         uint32_t interrupt_context_id) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
+	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 
 	auto& command = CurrentBuffer();
 
@@ -2439,6 +3693,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 	const bool at_completion = !with_interrupt && GuestGpu::LabelsAtCompletion();
 
+	QueueStatsNoteLabelWrite(reinterpret_cast<uint64_t>(dst_gpu_addr));
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
@@ -2498,7 +3753,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 			} else {
 				if (event_write_source == 0x04) {
-					value = Sync::ReadReferenceClock();
+					value = Sync::ReadGpuTimestamp();
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
@@ -2643,12 +3898,70 @@ void CommandProcessor::EmitGlobalBarrier(std::source_location site) {
 	CurrentBuffer().Recorder().pipelineBarrier2(dependency, site);
 }
 
+void CommandProcessor::EmitGuestBarrier(std::source_location site) {
+	if (SyncToggle::NoGuestBarriers()) {
+		return;
+	}
+	EmitGlobalBarrier(site);
+}
+
+void CommandProcessor::EmitPartialFlushBarrier(uint32_t event_type, std::source_location site) {
+	// Kept with SyncToggle::NoGuestBarriers(): dispatch runs (KYTY_DISPATCH_RUNS) record no barrier
+	// between dispatches and rely on the guest's partial flushes to order dependent ones (v331
+	// dropped them too: a device fault at boot).
+	static const bool precise_env = [] {
+		const char* value = std::getenv("KYTY_PRECISE_FLUSHES");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!precise_env && !SyncToggle::PreciseFlushWindow()) {
+		EmitGlobalBarrier(site);
+		return;
+	}
+	// The hardware's partial flush waits for the waves of one stage to finish; the cache
+	// writebacks and invalidations come with their own events. The barrier's source is that
+	// stage instead of every command, so other stages' work keeps running across it.
+	vk::PipelineStageFlags2 source {};
+	switch (event_type) {
+		case 0x00000007: source = vk::PipelineStageFlagBits2::eComputeShader; break; // CS
+		case 0x0000000f: source = vk::PipelineStageFlagBits2::ePreRasterizationShaders; break; // VS/GS
+		default: // PS: the pixel shader stage and its attachment writes
+			source = vk::PipelineStageFlagBits2::eFragmentShader |
+			         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+			         vk::PipelineStageFlagBits2::eLateFragmentTests |
+			         vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+			break;
+	}
+	Common::LockGuard lock(m_renderer.GetMutex());
+
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = source;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	if (BarrierSinkEnabled()) {
+		CurrentBuffer().Recorder().guestPipelineBarrier2(dependency, site);
+		return;
+	}
+	GetScheduler().EndRendering();
+	CurrentBuffer().Recorder().pipelineBarrier2(dependency, site);
+}
+
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), m_interrupt_event_id, interrupt_context_id);
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
+	// KYTY_DRAW_PIPE: a barrier behind the draws in flight runs on the draw thread, in order.
+	if (DrawPipe::InFlightHere() && DrawPipe::DeferrableEvent(event_type)) {
+		DrawPipe::QueueEvent(*this, event_type, event_index);
+		return;
+	}
+	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
@@ -2662,7 +3975,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: EmitGlobalBarrier(); break;
+		case 0x00000010: EmitPartialFlushBarrier(event_type); break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
 		case 0x00000016:
 		case 0x00000031:
@@ -2670,7 +3983,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			EmitGlobalBarrier();
+			EmitGuestBarrier();
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x0000002a:
@@ -2680,7 +3993,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			EmitGlobalBarrier();
+			EmitGuestBarrier();
 			break;
 		case 0x0000000d:
 		case 0x0000000e:
@@ -2701,6 +4014,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
 				     "\n",
 				     event_index, event_address);
+			}
+			if (Occlusion::Enabled()) {
+				Occlusion::Dump(m_renderer, CurrentBuffer(), event_address);
+				break;
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
@@ -2724,10 +4041,17 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				const char* v = std::getenv("KYTY_OCCLUSION_ZERO");
 				return v != nullptr && v[0] == '1';
 			}();
+			// KYTY_OCCLUSION_STEP=<n>: the synthetic counter advances by n per dump (default 1), so a
+			// query reads as n passed samples per DB; games that scale an effect by the visible
+			// fraction of a query see it as fully visible with a large n.
+			static const uint64_t occlusion_step = [] {
+				const char* v = std::getenv("KYTY_OCCLUSION_STEP");
+				return v != nullptr ? std::strtoull(v, nullptr, 10) : 1ull;
+			}();
 			if (!occlusion_zero) {
-				m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+				m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + occlusion_step) & counter_mask;
 			}
-			if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+			if (static const bool log = Common::FpsLogDiagnostics(); log) {
 				static auto     start = std::chrono::steady_clock::now();
 				static uint64_t dumps = 0;
 				dumps++;
@@ -2828,6 +4152,61 @@ void CommandProcessor::SynchronizeGpu() {
 
 bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
+}
+
+void CommandProcessor::AsyncSegmentEnter() {
+	if (!t_segment_held) {
+		// Graphics right of way: while the graphics thread waits for the mutex, the async thread
+		// does not take it (bounded, so the graphics thread's label waits on compute work cannot
+		// starve it).
+		if (RenderContext::PoliteAsync() && RenderContext::GraphicsWaiting()) {
+			const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+			while (RenderContext::GraphicsWaiting() && std::chrono::steady_clock::now() < until) {
+				std::this_thread::yield();
+			}
+		}
+		m_renderer.LockRenderer();
+		t_segment_held = true;
+	}
+	if (g_bound_cp != this) {
+		BufferInit();
+	}
+	if (RenderExecutor::QueuedDispatchCount() != 0) {
+		m_renderer.GetRenderExecutor().CommitQueuedDispatches(CurrentBuffer());
+	}
+}
+
+void CommandProcessor::AsyncSegmentLeave() {
+	if (RenderExecutor::QueuedDispatchCount() != 0) {
+		AsyncSegmentEnter();
+	}
+	if (t_segment_held) {
+		m_renderer.UnlockRenderer();
+		t_segment_held = false;
+	}
+}
+
+bool GuestGpu::AsyncThreadConfigured() noexcept {
+	return AsyncThreadEnabled();
+}
+
+bool GuestGpu::AsyncThreadActiveNow() noexcept {
+	return AsyncThreadEnabled() && AsyncThreadActive();
+}
+
+bool GuestGpu::IsAsyncThread() noexcept {
+	return g_gpu_thread && g_gpu_state == nullptr && !g_draw_pipe_thread;
+}
+
+void GuestGpu::MarkDrawPipeThread() noexcept {
+	g_gpu_thread       = true;
+	g_draw_pipe_thread = true;
+}
+
+void GuestGpu::RebindCurrentProcessor() {
+	if (g_current_processor != nullptr) {
+		g_current_processor->BufferInit();
+	}
 }
 
 } // namespace Libs::Graphics

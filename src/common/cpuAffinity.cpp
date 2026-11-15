@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
@@ -35,6 +36,40 @@ void RaiseGpuThreadPriority() {
 	SetThreadPriority(GetCurrentThread(), priority);
 #else
 	(void)level;
+#endif
+}
+
+void LowerBackgroundThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
+void OptOutOfPowerThrottling() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (const char* value = std::getenv("KYTY_POWER_THROTTLING"); value != nullptr && value[0] == '1') {
+		std::printf("CPU: power throttling left to the system (KYTY_POWER_THROTTLING=1)\n");
+		return;
+	}
+	// Values from the Windows SDK (processthreadsapi.h), defined here for older SDKs.
+	constexpr ULONG Version         = 1; // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+	constexpr ULONG ExecutionSpeed  = 0x1; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+	constexpr ULONG IgnoreTimerRes  = 0x4; // PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+	struct {
+		ULONG Version;
+		ULONG ControlMask;
+		ULONG StateMask;
+	} state {Version, ExecutionSpeed | IgnoreTimerRes, 0};
+	// ControlMask set with StateMask clear: never throttle, always honour timer resolution.
+	bool ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+	                                sizeof(state)) != 0;
+	if (!ok) {
+		// Before Windows 11 the timer-resolution bit is unknown; keep the execution-speed part.
+		state.ControlMask = ExecutionSpeed;
+		ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+		                           sizeof(state)) != 0;
+	}
+	std::printf("CPU: power throttling (EcoQoS) %s for the process\n", ok ? "off" : "opt-out failed");
 #endif
 }
 

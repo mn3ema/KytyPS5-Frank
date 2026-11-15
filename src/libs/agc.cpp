@@ -25,6 +25,11 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <functional>
+#include <cinttypes>
+#include <thread>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -95,6 +100,25 @@ void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_b
 		Pm4::DumpPm4PacketStream(&f, cmd_buffer, 0, num_dw);
 		f.Close();
 	}
+}
+
+// KYTY_SHADER_CREATE_LOG=1 (v418, the zero-stutter plan's census; defined here, outside
+// graphics/shader, so the switch is not part of the shader cache's session key): one line per shader the game
+// creates ([shader-create], with the creating thread and guest caller) and one at its first use
+// by a draw or dispatch ([shader-first-use]), both with seconds since the first creation, so a
+// log shows whether shaders are created at boot, at loading screens or while streaming in play,
+// and how long before their first use.
+bool ShaderCreateLogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_CREATE_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+double ShaderCreateLogSeconds() {
+	static const auto start = std::chrono::steady_clock::now();
+	return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
 namespace Gen5 {
@@ -697,6 +721,18 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	map.scratch_size_dwords = h->scratch_size_dw_per_thread;
 
 	ShaderMapUserData(base, map);
+	if (ShaderCreateLogEnabled()) {
+		// The guest caller (this is called from guest code with the SysV ABI).
+		const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		std::fprintf(stderr,
+		             "[shader-create] t=%.3f tid=%" PRIu64 " caller=%016" PRIx64 " hash=%016" PRIx64
+		             " type=%u bytes=%u header=%u cx=%u sh=%u inputs=%u outputs=%u scratch=%u\n",
+		             ShaderCreateLogSeconds(), static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id())),
+		             caller, ShaderDeclaredHash(base), static_cast<uint32_t>(h->type), h->shader_size, h->header_size,
+		             static_cast<uint32_t>(h->num_cx_registers), static_cast<uint32_t>(h->num_sh_registers),
+		             h->num_input_semantics, static_cast<uint32_t>(h->num_output_semantics),
+		             static_cast<uint32_t>(h->scratch_size_dw_per_thread));
+	}
 
 	EXIT_NOT_IMPLEMENTED((base & 0xFFFF0000000000FFull) != 0);
 
@@ -2954,11 +2990,24 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
 	const auto count_vaddr   = reinterpret_cast<uint64_t>(count_addr);
 
+	// The draw index goes where the shader's draw modifier asks, as for the non-indexed packet:
+	// the CP writes 0, 1, 2, ... there before each draw. Shaders pick their per-draw record with
+	// it (Wolverine's decals add it to the instance ID); without it every draw of the packet
+	// read the stale SGPR value and drew the same record.
+	const auto low                 = static_cast<uint32_t>(modifier);
+	uint32_t   draw_index_location = 0x280u;
+	if ((low & 0x8u) != 0) {
+		draw_index_location =
+		    indirect_modifier_sgpr_base(low) + extract_modifier_bits(low, 24u, 5u);
+	}
+	const auto draw_control = draw_index_location | ((low & 0x10u) << 23u) |
+	                          ((count_indirect & 0x1u) << 30u) | ((low & 0x8u) << 28u);
+
 	cmd[0] = KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u);
 	cmd[1] = data_offset_in_bytes;
 	cmd[2] = static_cast<uint32_t>(patch_offsets);
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
-	cmd[4] = (count_indirect & 1u) << 30u;
+	cmd[4] = draw_control;
 	cmd[5] = max_count_or_count;
 	cmd[6] = static_cast<uint32_t>(count_vaddr) & ~0x3u;
 	cmd[7] = static_cast<uint32_t>(count_vaddr >> 32u);

@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -112,6 +113,10 @@ uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass nume
 	return state.builder.Type(spv::OpTypeVector, ImageScalarType(state, numeric_class), components);
 }
 
+bool BindlessAs2D(const IR::ImageResource& image) {
+	return image.bindless && image.dimension == ImageDimension::Dim1D;
+}
+
 uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 	uint32_t sampled = 0;
 	uint32_t format  = spv::ImageFormatUnknown;
@@ -135,7 +140,7 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 	} else {
 		EXIT("invalid image resource class");
 	}
-	const auto& info = ImageDimensionInfoFor(image.dimension);
+	const auto& info = ImageDimensionInfoFor(BindlessAs2D(image) ? ImageDimension::Dim2D : image.dimension);
 	const auto scalar_type = image.atomic64 ? TypeScalarU64(state)
 	                                        : ImageScalarType(state, image.numeric_class);
 	return state.builder.Type(spv::OpTypeImage, scalar_type,
@@ -156,7 +161,8 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
                              uint32_t array_index) {
 	const auto& image_resource = ImageResourceAt(state, resource);
 	if (image_resource.bindless) {
-		EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+		EXIT_IF(image_resource.resource_class == IR::ImageResourceClass::Storage &&
+		        (image_resource.atomic || image_resource.dimension != ImageDimension::Dim2D));
 		const auto type     = ImageType(state, image_resource);
 		const auto variable = state.bindless_image_variables.find(type);
 		EXIT_IF(variable == state.bindless_image_variables.end() || state.bindless_slot == 0);
@@ -217,9 +223,19 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
 	}
-	// A bindless sampler is loaded NonUniform; the sampled image built from it is too.
-	const bool bindless_sampler = std::ranges::any_of(
-	    state.program.info.samplers, [](const IR::SamplerResource& sampler) { return sampler.bindless; });
+	// A bindless sampler is loaded NonUniform; the sampled image built from it is too. Only this
+	// instruction's sampler counts (state.bindless_sampler_slot is set for it by EmitImage, and
+	// LoadSamplerDescriptor requires it for a bindless one): a plain sampler in a shader that also
+	// has bindless ones samples uniformly. KYTY_SAMPLED_NONUNIFORM_ANY=1 restores the old rule
+	// (NonUniform whenever any sampler of the program is bindless).
+	static const bool any_rule = [] {
+		const char* value = std::getenv("KYTY_SAMPLED_NONUNIFORM_ANY");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool bindless_sampler =
+	    any_rule ? std::ranges::any_of(state.program.info.samplers,
+	                                   [](const IR::SamplerResource& sampler) { return sampler.bindless; })
+	             : state.bindless_sampler_slot != 0u;
 	if (array_index != 0u || image_resource.bindless || bindless_sampler) {
 		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
@@ -240,6 +256,76 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
 	return DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
 	                                "image descriptor array was not emitted");
+}
+
+uint32_t LoadDynamicClassUintDescriptor(EmitterState& state, uint32_t resource) {
+	auto image = ImageResourceAt(state, resource);
+	EXIT_IF(!image.dynamic_class);
+	image.numeric_class = Prospero::TextureNumericClass::Uint;
+	const auto kind     = IR::DescriptorBindingForImage(image);
+	EXIT_IF(!kind.has_value());
+	const auto type         = ImageType(state, image);
+	const auto pointer_type = state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type);
+	const auto variable     = state.image_variables[IR::ImageBindingIndex(*kind)];
+	const auto pointer      = DescriptorElementPointer(
+        state, pointer_type, variable, ConstantU32(state, ResourceForDescriptor(state, *kind, resource)),
+        *kind, resource, "dynamic-class uint image descriptor array was not emitted");
+	const auto loaded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, loaded, pointer);
+	return loaded;
+}
+
+uint32_t DynamicClassIsUint(EmitterState& state, uint32_t resource) {
+	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageClassDword());
+	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                ConstantU32(state, 1u));
+	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
+}
+
+uint32_t DynamicLayerIs2D(EmitterState& state, uint32_t resource) {
+	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageLayerDword());
+	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                ConstantU32(state, 1u));
+	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
+}
+
+uint32_t DynamicImage3DIs2D(EmitterState& state, uint32_t resource) {
+	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageDim3DDword());
+	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                ConstantU32(state, 1u));
+	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
+}
+
+uint32_t DynamicCubeIs(EmitterState& state, uint32_t resource) {
+	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageCubeDword());
+	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                ConstantU32(state, 1u));
+	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
+}
+
+uint32_t SelectVector(EmitterState& state, uint32_t type, uint32_t components, uint32_t condition,
+                      uint32_t if_true, uint32_t if_false) {
+	if (components <= 1u) {
+		return Select(state, type, condition, if_true, if_false);
+	}
+	const auto bools = state.builder.AllocateId();
+	std::vector<uint32_t> words {static_cast<uint32_t>(spv::OpCompositeConstruct), TypeBoolVector(state, components), bools};
+	for (uint32_t i = 0; i < components; i++) {
+		words.push_back(condition);
+	}
+	state.builder.AddFunction(words);
+	return Select(state, type, bools, if_true, if_false);
+}
+
+uint32_t SelectU32x4(EmitterState& state, uint32_t condition, uint32_t if_true, uint32_t if_false) {
+	const auto bool4 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4), bool4, condition,
+	                          condition, condition, condition);
+	return Select(state, TypeU32Vector(state, 4), bool4, if_true, if_false);
 }
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,

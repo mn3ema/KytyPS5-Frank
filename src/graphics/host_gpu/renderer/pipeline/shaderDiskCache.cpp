@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 4;
+constexpr uint32_t FormatVersion = 8; // 8: MemoryInfo::table_resource; 7: BufferResource::table_read; 6: IndirectDescriptor::storage; 5: BindingLayout::loop_guard
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -75,6 +75,7 @@ void Visit(Io& io, T& v) {
 	io(v.offen);
 	io(v.coherent);
 	io(v.planning_only);
+	io(v.table_resource);
 }
 
 template <typename Io, typename T>
@@ -100,6 +101,8 @@ void Visit(Io& io, T& v) {
 	io(v.gpu_records_add_flat);
 	io(v.gpu_records_add);
 	io(v.gpu_records_ssa);
+	io(v.table_read);
+	io(v.dynamic_format);
 	io(v.indirect_resources);
 }
 
@@ -126,6 +129,11 @@ void Visit(Io& io, T& v) {
 	io(v.indirect_mapping_offset);
 	io(v.indirect_search_iterations);
 	io(v.bindless);
+	io(v.unfiltered);
+	io(v.dynamic_class);
+	io(v.dynamic_layer);
+	io(v.dynamic_cube);
+	io(v.dynamic_3d);
 	io(v.indirect_resources);
 }
 
@@ -202,6 +210,11 @@ void Visit(Io& io, T& v) {
 	io(v.memory_offset_count);
 	io(v.write_tracking);
 	io(v.srt_verify);
+	io(v.loop_guard);
+	io(v.clip_space);
+	io(v.export_mapping);
+	io(v.image_flags);
+	io(v.buffer_stride_count);
 	io(v.user_data_registers);
 	io(v.descriptors);
 }
@@ -235,6 +248,7 @@ void Visit(Io& io, T& v) {
 	io(v.key_shift);
 	io(v.key_mask);
 	io(v.bindless);
+	io(v.storage);
 	io(v.key_count);
 	io(v.selector_first);
 	io(v.selector_mask);
@@ -378,7 +392,7 @@ void VisitPlanFields(Io& io, T& v) {
 // above as well (Visit lists every field; a field it leaves out is silently lost on a cache hit).
 // After updating the Visit, update the size. ResourcePlan's covers its scratch members too.
 #if defined(_MSC_VER) && defined(_M_X64)
-static_assert(sizeof(IR::MemoryInfo) == 72);
+static_assert(sizeof(IR::MemoryInfo) == 76); // 76: table_resource (v403)
 static_assert(sizeof(IR::BufferResource) == 88);
 static_assert(sizeof(IR::ImageResource) == 88);
 static_assert(sizeof(IR::SamplerResource) == 24);
@@ -700,7 +714,10 @@ std::vector<uint8_t> SessionKey(const SessionInfo& session) {
 	key.Put(ShaderRecompiler::Spirv::GetCoherentLoadAcquire());
 	key.Put(ShaderRecompiler::Spirv::GetDeviceClockShift());
 	key.Put(ShaderRecompiler::Spirv::GetHostImageFeatures().min_lod);
+	key.Put(ShaderRecompiler::Spirv::GetHostImageFeatures().pixel_interlock);
+	key.Put(ShaderRecompiler::Spirv::GetHostImageFeatures().max_sampler_lod_bias);
 	key.Put(ShaderRecompiler::Spirv::GetDenormFlushToZero32());
+	key.Put(ShaderRecompiler::Spirv::GetRobustBufferAccess());
 	// Every KYTY_* switch named in the recompiler's sources, with its value.
 	for (const auto name: ShaderDiskCacheVersion::RecompilerSwitches) {
 		if (name.empty()) {
@@ -789,6 +806,10 @@ void AppendInputKey(ByteWriter& key, const ShaderPixelInputInfo& info) {
 	                       info.dual_source_blending, info.ps_early_z, info.ps_execute_on_noop}) {
 		key.Put(flag);
 	}
+	// Only shaders that read FRONT_FACE carry the encoding, so other keys stay as they were.
+	if (info.ps_front_face) {
+		key.Put(info.ps_front_face_all_bits);
+	}
 	key.Put(static_cast<uint8_t>(info.alpha_blend_source));
 }
 
@@ -816,6 +837,13 @@ void AppendInputKey(ByteWriter& key, const ShaderComputeInputInfo& info) {
 void AppendSpecialization(ByteWriter& key, const IR::ResourceSpecialization& value) {
 	Writer writer {.out = key};
 	writer(value);
+}
+
+bool DecodeSpecialization(std::span<const uint8_t> bytes, IR::ResourceSpecialization& value) {
+	ByteReader reader(bytes);
+	Reader     visit {.in = reader};
+	visit(value);
+	return reader.AtEnd();
 }
 
 bool EncodeSourceRecord(bool unsupported, bool uses_clock, const IR::ResourcePlan* plan,
@@ -945,6 +973,11 @@ bool Store::Load(std::span<const uint8_t> key, std::vector<uint8_t>& payload) {
 	return true;
 }
 
+bool Store::Contains(std::span<const uint8_t> key) const {
+	std::error_code error;
+	return std::filesystem::is_regular_file(EntryPath(key), error);
+}
+
 void Store::Save(std::span<const uint8_t> key, std::span<const uint8_t> payload) {
 	ByteWriter file;
 	file.Put(FileMagic);
@@ -1003,9 +1036,10 @@ void Store::WriterLoop() {
 
 void Store::LogTotals(std::string_view when) {
 	CacheLog("Shader disk cache ({}): sources {} hits / {} misses, permutations {} hits / {} "
-	         "misses, {} rejected, {} not encodable, {} written ({} KB), {} KB read{}",
+	         "misses ({} null-buffer matches), {} rejected, {} not encodable, {} written ({} KB), {} KB read{}",
 	         when, counters.source_hits.load(), counters.source_misses.load(),
 	         counters.permutation_hits.load(), counters.permutation_misses.load(),
+	         counters.permutation_compatible.load(),
 	         counters.rejected.load(), counters.round_trip_failures.load(), counters.writes.load(),
 	         counters.bytes_written.load() / 1024u, counters.bytes_read.load() / 1024u,
 	         VerifyEnabled() ? fmt::format(", verified {} / {} mismatches", counters.verified.load(),

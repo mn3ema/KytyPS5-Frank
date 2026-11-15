@@ -16,6 +16,7 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <memory>
 #include <windows.h>
@@ -32,6 +33,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -404,6 +406,11 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			}
 		}
 		if (log_missing) {
+			static const bool log_io_fail = std::getenv("KYTY_LOG_IO_FAIL") != nullptr;
+			if (log_io_fail) {
+				std::fprintf(stderr, "[io-fail] apr-resolve %s -> %s\n", guest_path,
+				             info.host_path.c_str());
+			}
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
 		}
 	} else if (info.result == OK) {
@@ -960,6 +967,9 @@ struct CommandBufferState {
 		int32_t        type          = 0;
 		int32_t        prot          = 0;
 		uint8_t        gpu_mask_id   = 0;
+		// v400: run ahead of its ring for a guest access that needed it (AmmResolveQueuedMap);
+		// the ring skips it.
+		bool           applied_early = false;
 	};
 	enum class CounterCommandKind : uint32_t {
 		Write,
@@ -1614,6 +1624,108 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
+// Diagnostics on the game's own file reads (stderr, so they survive the chain's silenced LOGF):
+//   KYTY_LOG_APR_PATHS=1  -> "[apr-path] <host path>" once per file, on its first read
+//   KYTY_APR_GREP=<hex>[/<hex>...] -> "[apr-grep] p<i> <host path> off=<file offset>" when a read
+//                             buffer contains the byte pattern (up to 8 hits per pattern per file)
+namespace AprDiag {
+struct Pattern {
+	std::vector<uint8_t> bytes;
+};
+static std::mutex                          g_mutex;
+static std::set<std::string>               g_paths_seen;
+static std::map<std::string, uint32_t>     g_grep_hits;
+static std::vector<Pattern>                g_patterns;
+static bool                                g_log_paths = false;
+static bool                                g_init      = false;
+static uint32_t                            g_max_hits  = 8;   // KYTY_APR_GREP_MAX
+static uint64_t                            g_context   = 0;   // KYTY_APR_GREP_CONTEXT (bytes)
+
+static void Init() {
+	g_log_paths = std::getenv("KYTY_LOG_APR_PATHS") != nullptr;
+	if (const char* v = std::getenv("KYTY_APR_GREP_MAX"); v != nullptr) {
+		g_max_hits = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+	}
+	if (const char* v = std::getenv("KYTY_APR_GREP_CONTEXT"); v != nullptr) {
+		g_context = std::strtoull(v, nullptr, 10);
+	}
+	if (const char* spec = std::getenv("KYTY_APR_GREP"); spec != nullptr) {
+		std::string text(spec);
+		size_t      start = 0;
+		while (start <= text.size()) {
+			auto end = text.find('/', start);
+			if (end == std::string::npos) {
+				end = text.size();
+			}
+			const auto hex = text.substr(start, end - start);
+			Pattern    pattern;
+			for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+				pattern.bytes.push_back(
+				    static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+			}
+			if (!pattern.bytes.empty()) {
+				g_patterns.push_back(std::move(pattern));
+			}
+			start = end + 1;
+		}
+	}
+	g_init = true;
+}
+
+static void OnRead(const std::string& host_path, uint64_t file_offset, uint64_t destination,
+                   uint64_t bytes_read) {
+	std::scoped_lock lock(g_mutex);
+	if (!g_init) {
+		Init();
+	}
+	if (g_log_paths && g_paths_seen.insert(host_path).second) {
+		std::fprintf(stderr, "[apr-path] %s\n", host_path.c_str());
+	}
+	if (g_patterns.empty() || bytes_read == 0 || destination == 0) {
+		return;
+	}
+	const auto* data = reinterpret_cast<const uint8_t*>(destination);
+	for (size_t p = 0; p < g_patterns.size(); p++) {
+		const auto& bytes = g_patterns[p].bytes;
+		if (bytes.size() > bytes_read) {
+			continue;
+		}
+		const auto key = host_path + "#" + std::to_string(p);
+		for (uint64_t at = 0; at + bytes.size() <= bytes_read; at++) {
+			if (data[at] == bytes[0] && std::memcmp(data + at, bytes.data(), bytes.size()) == 0) {
+				auto& hits = g_grep_hits[key];
+				if (hits++ < g_max_hits) {
+					std::fprintf(stderr, "[apr-grep] p%zu %s off=0x%llx\n", p, host_path.c_str(),
+					             static_cast<unsigned long long>(file_offset + at));
+					if (g_context > 0) {
+						// hex + ascii of the bytes around the hit (clipped to the read buffer)
+						const uint64_t from = at > g_context ? at - g_context : 0;
+						const uint64_t to   = std::min<uint64_t>(bytes_read, at + bytes.size() + g_context);
+						for (uint64_t row = from & ~15ull; row < to; row += 16) {
+							char line[160];
+							int  n = std::snprintf(line, sizeof(line), "[apr-ctx] %08llx ",
+							                       static_cast<unsigned long long>(file_offset + row));
+							for (uint64_t c = row; c < row + 16; c++) {
+								n += std::snprintf(line + n, sizeof(line) - n, c >= from && c < to ? "%02x " : "   ",
+								                   c >= from && c < to ? data[c] : 0);
+							}
+							n += std::snprintf(line + n, sizeof(line) - n, " ");
+							for (uint64_t c = row; c < row + 16; c++) {
+								const auto ch = (c >= from && c < to) ? data[c] : ' ';
+								n += std::snprintf(line + n, sizeof(line) - n, "%c", (ch >= 0x20 && ch < 0x7f) ? ch : '.');
+							}
+							std::fprintf(stderr, "%s\n", line);
+						}
+					}
+				}
+				at += bytes.size() - 1;
+			}
+		}
+	}
+	std::fflush(stderr);
+}
+} // namespace AprDiag
+
 static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_engine,
                                      int32_t* execution_result, uint32_t* error_offset);
 
@@ -1773,6 +1885,51 @@ public:
 		std::thread([this] { Run(); }).detach();
 	}
 
+	// v400: a guest thread touched `vaddr`, which a map of a batch still queued on this ring
+	// covers: the batch's maps up to and including it run now, on the faulting thread, in their
+	// order, and are marked so the ring skips them. Unmaps are never run early, and a batch is
+	// not reached past one that waits, counts or reads files (the hardware ring would hold there
+	// too). True when a covering map ran.
+	bool ResolveQueuedMap(uint64_t vaddr) {
+		std::scoped_lock lock(m_mutex);
+		for (auto& submission: m_queue) {
+			auto& state = submission.state;
+			if (!state.wait_address_commands.empty() || !state.counter_commands.empty() ||
+			    !state.read_file_commands.empty()) {
+				return false;
+			}
+			size_t covering = state.amm_map_commands.size();
+			for (size_t i = 0; i < state.amm_map_commands.size(); i++) {
+				const auto& map = state.amm_map_commands[i];
+				if (map.kind != AmmCommandKind::Unmap && !map.applied_early && vaddr >= map.va &&
+				    vaddr - map.va < map.size) {
+					covering = i;
+					break;
+				}
+			}
+			if (covering == state.amm_map_commands.size()) {
+				continue;
+			}
+			for (size_t i = 0; i <= covering; i++) {
+				if (state.amm_map_commands[i].kind == AmmCommandKind::Unmap) {
+					return false; // an unmap before it in the batch: leave the order to the ring
+				}
+			}
+			for (size_t i = 0; i <= covering; i++) {
+				auto& map = state.amm_map_commands[i];
+				if (map.applied_early) {
+					continue;
+				}
+				if (ExecuteAmmMapCommand(map) != OK) {
+					return false;
+				}
+				map.applied_early = true;
+			}
+			return true;
+		}
+		return false;
+	}
+
 	void Enqueue(PendingSubmission&& submission) {
 		{
 			std::scoped_lock lock(m_mutex);
@@ -1918,11 +2075,12 @@ private:
 // later at another priority runs past it. One thread per ring keeps that property; folding
 // them into one queue deadlocked a wait-on-address against the higher-priority writer of
 // the value it waited for.
+std::mutex                                             g_engines_mutex;
+std::map<std::pair<bool, uint32_t>, SubmissionEngine*> g_engines;
+
 SubmissionEngine& Engine(bool amm_engine, uint32_t priority) {
-	static std::mutex                                            engines_mutex;
-	static std::map<std::pair<bool, uint32_t>, SubmissionEngine*> engines;
-	std::scoped_lock                                             lock(engines_mutex);
-	auto& engine = engines[{amm_engine, priority}];
+	std::scoped_lock lock(g_engines_mutex);
+	auto& engine = g_engines[{amm_engine, priority}];
 	if (engine == nullptr) {
 		static std::deque<std::string> names;
 		names.push_back((amm_engine ? "amm" : "apr") + std::string(" p") + std::to_string(priority));
@@ -1932,6 +2090,32 @@ SubmissionEngine& Engine(bool amm_engine, uint32_t priority) {
 }
 
 } // namespace
+
+// v400: Memory::SetQueuedMapResolver's resolver (SubmissionEngine::ResolveQueuedMap on every
+// AMM ring).
+static bool AmmResolveQueuedMap(uint64_t vaddr) {
+	std::vector<SubmissionEngine*> engines;
+	{
+		std::scoped_lock lock(g_engines_mutex);
+		for (const auto& [key, engine]: g_engines) {
+			if (key.first) {
+				engines.push_back(engine);
+			}
+		}
+	}
+	for (auto* engine: engines) {
+		if (engine->ResolveQueuedMap(vaddr)) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 64) {
+				std::fprintf(stderr, "[amm-early] a guest access to 0x%016" PRIx64
+				                     " ran a queued map ahead of its ring\n",
+				             vaddr);
+			}
+			return true;
+		}
+	}
+	return false;
+}
 
 static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32_t priority,
                                 uint32_t submission_id, uint64_t result_address) {
@@ -2094,7 +2278,13 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
+				if (result == OK) {
+					AprDiag::OnRead(host_path, command.file_offset, command.destination, bytes_read);
+				}
 				if (result != OK) {
+					std::fprintf(stderr, "[io-fail] apr-read %s off=0x%" PRIx64 " size=0x%" PRIx64 " -> %08x\n",
+					             host_path.c_str(), command.file_offset, command.size,
+					             static_cast<uint32_t>(result));
 					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
 					     ", path=%s dst=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64 "\n",
 					     command.file_id, static_cast<uint32_t>(result), host_path.c_str(),
@@ -2194,6 +2384,9 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 			case CommandKind::AmmMap: {
 				const auto& command = state.amm_map_commands[entry.index];
 				int         result  = OK;
+				if (command.applied_early) {
+					break; // v400: done already, for the access that needed it
+				}
 				if (command.kind == AmmCommandKind::Unmap) {
 					result = LibKernel::Memory::KernelMunmap(command.va, command.size);
 				} else {
@@ -3548,6 +3741,7 @@ static int KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) 
 
 LIB_DEFINE(InitAmpr_1) {
 	LibKernel::Memory::SetUnhandledFaultHook(&Ampr::AmmDiagDescribe);
+	LibKernel::Memory::SetQueuedMapResolver(&Ampr::AmmResolveQueuedMap); // v400
 	LIB_FUNC("8aI7R7WaOlc", Ampr::CommandBufferConstructor);
 	LIB_FUNC("a8uLzYY--tM", Ampr::AprCommandBufferConstructor);
 	LIB_FUNC("Qs1xtplKo0U", Ampr::AprCommandBufferDestructor);

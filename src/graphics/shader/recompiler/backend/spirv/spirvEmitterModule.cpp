@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
 
 #include <algorithm>
@@ -195,7 +196,8 @@ bool DispatchDimensionsIndirect(const EmitterState& state) {
 
 bool UsesPhysicalAddresses(const EmitterState& state) {
 	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
-	       state.program.bindings.write_tracking || state.program.bindings.srt_verify;
+	       state.program.bindings.write_tracking || state.program.bindings.srt_verify ||
+	       state.program.bindings.loop_guard;
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
@@ -233,7 +235,28 @@ uint32_t PushConstantBlockType(EmitterState& state) {
 	                                   PushConstantArrayType(state));
 }
 
+// The position output is Invariant (11-12): the guest GPU runs one shader binary per stage, so a
+// depth pre-pass and a later pass with an EQUAL/GEQUAL depth test over the same geometry compute
+// bit-identical positions. Host pipelines compile the same SPIR-V separately (different fragment
+// stages, varyings removed in a depth-only pass), and without Invariant the driver may contract or
+// schedule the position math differently per pipeline. KYTY_INVARIANT_POSITION=0 leaves it out.
+static bool InvariantPosition() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INVARIANT_POSITION");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint32_t PerVertexType(EmitterState& state) {
+	if (InvariantPosition()) {
+		return state.builder.DecoratedType(
+		    spv::OpTypeStruct,
+		    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+		     {spv::OpMemberDecorate, {0, spv::DecorationInvariant}},
+		     {spv::OpDecorate, {spv::DecorationBlock}}},
+		    TypeF32Vector(state, 4));
+	}
 	return state.builder.DecoratedType(
 	    spv::OpTypeStruct,
 	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
@@ -272,7 +295,9 @@ void DefineBindlessImages(EmitterState& state) {
 			continue;
 		}
 		uint32_t binding = IR::BindlessImages2D;
-		if (image.cube) {
+		if (image.resource_class == IR::ImageResourceClass::Storage) {
+			binding = IR::BindlessStorage2D;
+		} else if (image.cube) {
 			binding = IR::BindlessImagesCube;
 		} else if (image.dimension == ImageDimension::Dim3D) {
 			binding = IR::BindlessImages3D;
@@ -285,12 +310,18 @@ void DefineBindlessImages(EmitterState& state) {
 		    TypePointer(state, spv::StorageClassUniformConstant, array),
 		    spv::StorageClassUniformConstant);
 		state.builder.AddName(variable, "bindless_images");
+		if (image.resource_class == IR::ImageResourceClass::Storage &&
+		    UsesPixelInterlock(state.program)) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
+		}
 		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
 		                            IR::BindlessDescriptorSet);
 		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
 		state.bindless_image_variables[type] = variable;
 		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
-		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.RequireCapability(image.resource_class == IR::ImageResourceClass::Storage
+		                                    ? spv::CapabilityStorageImageArrayNonUniformIndexing
+		                                    : spv::CapabilitySampledImageArrayNonUniformIndexing);
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireVersion(0x00010500u);
 	}
@@ -351,10 +382,25 @@ void DefineDescriptors(EmitterState& state) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			state.builder.AddAnnotation(
+			    spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+			    IR::StageDescriptorSets() && state.program.stage == ShaderType::Pixel ? IR::PixelDescriptorSet : 0u);
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
 			                            IR::NativeBinding(state.program.stage, binding.kind));
 			return variable;
+		};
+		// The three host-owned buffers every shader only reads (all their accesses are loads; none
+		// is guest memory, so no guest device address reaches them, and the GPU fills the flattened
+		// SRT's slots in an earlier command): NonWritable. KYTY_HOST_BUFFERS_NONWRITABLE=0 leaves
+		// them undecorated as before.
+		const auto DecorateHostReadOnly = [&](uint32_t variable) {
+			static const bool enabled = [] {
+				const char* value = std::getenv("KYTY_HOST_BUFFERS_NONWRITABLE");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (enabled) {
+				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+			}
 		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
@@ -386,23 +432,39 @@ void DefineDescriptors(EmitterState& state) {
 					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					if (state.requirements.coherent_buffers) {
+					if (state.requirements.coherent_buffers || UsesPixelInterlock(state.program)) {
 						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
 					}
 				}
 				break;
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable = Define(StorageBufferType(state, 64), "bda_pagetable");
+				DecorateHostReadOnly(state.bda_pagetable_variable);
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
+				if (IR::ShaderDataUniform()) {
+					// uvec4 elements (std140 arrays are 16-byte strided), one dword per component.
+					const auto count = std::max(1u, (state.program.bindings.ShaderDataDwords() + 3u) / 4u);
+					const auto array = state.builder.DecoratedType(
+					    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 16u}}},
+					    TypeU32Vector(state, 4), ConstantU32(state, count));
+					const auto block = state.builder.DecoratedType(
+					    spv::OpTypeStruct,
+					    {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}}, {spv::OpDecorate, {spv::DecorationBlock}}},
+					    array);
+					state.shader_data_uniform_variable = Define(block, "shader_data", spv::StorageClassUniform);
+					break;
+				}
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state), "shader_data");
+				DecorateHostReadOnly(state.shader_data_storage_variable);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				DecorateHostReadOnly(state.flattened_srt_variable);
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),
@@ -425,11 +487,30 @@ void DefineDescriptors(EmitterState& state) {
 			default: {
 				EXIT_IF(IR::ImageBindingResourceClass(binding.kind) ==
 				        IR::ImageResourceClass::None);
-				const auto& image = state.program.info.images.at(binding.resources.front());
+				auto image = state.program.info.images.at(binding.resources.front());
+				// v429: a dynamic-class image's second binding is its uint group.
+				if (image.dynamic_class && IR::DescriptorBindingForImage(image) != binding.kind) {
+					image.numeric_class = Prospero::TextureNumericClass::Uint;
+				}
+				// v433: a dynamic-3D image's second binding is the 2D group of its class.
+				if (image.dynamic_3d && IR::DescriptorBindingForImage(image) != binding.kind) {
+					image.dimension = ImageDimension::Dim2D;
+				}
 				const auto  name  = "image_" + std::to_string(static_cast<uint32_t>(binding.kind));
 				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
 				    Define(ArrayType(ImageType(state, image)), name.c_str(),
 				           spv::StorageClassUniformConstant);
+				// POPS: a pixel shader reads and writes its targets as storage images inside the
+				// ordered interlock (decals blended into a packed G-buffer). Without Coherent
+				// the read may come from a cache line loaded before the previous overlapping
+				// fragment's write reached memory, and that write is lost: the console's
+				// ordering only holds when the critical section's accesses are coherent.
+				if (image.resource_class == IR::ImageResourceClass::Storage &&
+				    UsesPixelInterlock(state.program)) {
+					state.builder.AddAnnotation(spv::OpDecorate,
+					                            state.image_variables[IR::ImageBindingIndex(binding.kind)],
+					                            spv::DecorationCoherent);
+				}
 				if (image.dimension == ImageDimension::Dim1D ||
 				    image.dimension == ImageDimension::Dim1DArray) {
 					state.builder.RequireCapability(image.resource_class ==
@@ -663,6 +744,26 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
+	// Diagnostics (KYTY_PROBE_TESS_LEVELS=1, probed evaluation shader): the tessellation levels the
+	// tessellator used, appended per patch by the probe (spirvEmitterFlow.cpp).
+	if (state.program.stage == ShaderType::TessellationEvaluation && ProbeTessLevelsWanted() &&
+	    ProbeAppendWanted(state)) {
+		const auto array = [&](uint32_t count) {
+			return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
+		};
+		state.probe_tess_outer_variable =
+		    DefineInterfaceVariable(state, array(4), spv::StorageClassInput, "gl_TessLevelOuter");
+		state.builder.AddAnnotation(spv::OpDecorate, state.probe_tess_outer_variable,
+		                            spv::DecorationBuiltIn, spv::BuiltInTessLevelOuter);
+		state.builder.AddAnnotation(spv::OpDecorate, state.probe_tess_outer_variable,
+		                            spv::DecorationPatch);
+		state.probe_tess_inner_variable =
+		    DefineInterfaceVariable(state, array(2), spv::StorageClassInput, "gl_TessLevelInner");
+		state.builder.AddAnnotation(spv::OpDecorate, state.probe_tess_inner_variable,
+		                            spv::DecorationBuiltIn, spv::BuiltInTessLevelInner);
+		state.builder.AddAnnotation(spv::OpDecorate, state.probe_tess_inner_variable,
+		                            spv::DecorationPatch);
+	}
 	if (state.requirements.subgroup_local_invocation_id) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
@@ -697,7 +798,11 @@ void DefineOutputs(EmitterState& state) {
 		const char* value = std::getenv("KYTY_ZERO_POSITION_GUARD");
 		return value == nullptr || value[0] != '0';
 	}();
-	if (zero_position_guard && state.program.stage == ShaderType::Vertex &&
+	// The tessellation evaluation shader is the last stage before rasterization in tessellated
+	// draws (Wolverine's water DS kills vertices with a NaN position), so it gets the guard too.
+	if (zero_position_guard &&
+	    (state.program.stage == ShaderType::Vertex ||
+	     state.program.stage == ShaderType::TessellationEvaluation) &&
 	    clip_distance_count + cull_distance_count < 8u &&
 	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		    return output.kind == IR::StageOutputKind::Position;
@@ -959,6 +1064,12 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
+		if (UsesPixelInterlock(state.program)) {
+			state.builder.RequireExtension("SPV_EXT_fragment_shader_interlock");
+			state.builder.RequireCapability(spv::CapabilityFragmentShaderPixelInterlockEXT);
+			state.builder.AddExecutionMode(state.main_func,
+			                               spv::ExecutionModePixelInterlockOrderedEXT);
+		}
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}

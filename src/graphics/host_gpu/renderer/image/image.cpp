@@ -1,6 +1,12 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
 
 #include "common/assert.h"
+#include <cinttypes>
+#include <cstdio>
+#include <string>
+#include <unordered_map>
+#include <mutex>
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -803,6 +809,10 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
 	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
 	    info.samples);
+	ImageHistory::NoteCreate(static_cast<VkImage>(backing.image), info.data.address, info.data.size,
+	                         info.extent.width, info.extent.height, info.resources.layers,
+	                         info.resources.levels, static_cast<uint32_t>(create.format),
+	                         scheduler.CurrentTick());
 }
 
 uint64_t Image::HashGuestEdges() const {
@@ -824,14 +834,153 @@ uint64_t Image::HashGuestEdges() const {
 	return XXH3_64bits(bytes.data(), static_cast<size_t>(head_size + tail_size));
 }
 
+// KYTY_FAULT_MAP=1: the image views alive now, to catch a descriptor naming a destroyed one, and a
+// hook the renderer runs before an image's views are destroyed (bindless slots still holding one).
+bool StaleViewCheckEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAULT_MAP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+namespace {
+std::mutex& LiveViewsMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+std::unordered_map<VkImageView, std::string>& LiveViews() {
+	static auto* views = new std::unordered_map<VkImageView, std::string>;
+	return *views;
+}
+std::unordered_map<VkImageView, std::string>& DeadViews() {
+	static auto* views = new std::unordered_map<VkImageView, std::string>;
+	return *views;
+}
+} // namespace
+void (*g_image_views_destroying)(const Image& image) = nullptr;
+
+void NoteImageView(vk::ImageView view, const Image& image, bool live) {
+	if (!StaleViewCheckEnabled() || view == nullptr) {
+		return;
+	}
+	std::lock_guard lock(LiveViewsMutex());
+	const auto      key = static_cast<VkImageView>(view);
+	if (live) {
+		char text[160];
+		std::snprintf(text, sizeof(text), "%ux%ux%u fmt=%d guest=0x%llx img=%p",
+		              image.info.extent.width, image.info.extent.height, image.info.extent.depth,
+		              static_cast<int>(image.info.pixel_format),
+		              static_cast<unsigned long long>(image.info.data.address),
+		              static_cast<void*>(static_cast<VkImage>(image.backing.image)));
+		LiveViews()[key] = text;
+		DeadViews().erase(key);
+	} else {
+		const auto found = LiveViews().find(key);
+		if (found != LiveViews().end()) {
+			if (DeadViews().size() > 65536) DeadViews().clear();
+			DeadViews()[key] = found->second;
+			LiveViews().erase(found);
+		}
+	}
+}
+
+// streamBuffer.cpp (KYTY_FAULT_MAP=1): " va=0x...+0x..." of the image's memory, or " (freed)".
+std::string FaultMapImageRange(const void* image);
+
+std::string DescribeViewForFault(uint64_t view) {
+	std::string text;
+	{
+		std::lock_guard lock(LiveViewsMutex());
+		const auto      key = reinterpret_cast<VkImageView>(view);
+		if (const auto found = LiveViews().find(key); found != LiveViews().end()) {
+			text = "live " + found->second;
+		} else if (const auto found = DeadViews().find(key); found != DeadViews().end()) {
+			text = "DESTROYED " + found->second;
+		} else {
+			return "unknown (placeholder or not a texture-cache view)";
+		}
+	}
+	// v125: where the image's memory is, to compare with the fault address.
+	if (const auto pos = text.find("img="); pos != std::string::npos) {
+		const auto handle = std::strtoull(text.c_str() + pos + 4, nullptr, 16);
+		text += FaultMapImageRange(reinterpret_cast<const void*>(handle));
+	}
+	return text;
+}
+
+bool IsImageViewLive(VkImageView view) {
+	std::lock_guard lock(LiveViewsMutex());
+	return LiveViews().contains(view);
+}
+
+bool CheckLiveImageView(vk::ImageView view, const char* where) {
+	if (!StaleViewCheckEnabled() || view == nullptr) {
+		return true;
+	}
+	std::lock_guard lock(LiveViewsMutex());
+	const auto      key = static_cast<VkImageView>(view);
+	if (LiveViews().contains(key)) {
+		return true;
+	}
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1) < 32) {
+		const auto dead = DeadViews().find(key);
+		std::fprintf(stderr, "[stale-view] %s uses view %p, which is not alive (%s)\n", where,
+		             static_cast<void*>(key),
+		             dead != DeadViews().end() ? ("destroyed: " + dead->second).c_str()
+		                                       : "unknown, maybe a placeholder");
+		std::fflush(stderr);
+	}
+	return false;
+}
+
+namespace {
+// v370 (Crash B plan B5): an image destroyed while the last tick that used it (Transit stamps
+// tick_accessed_last on every use) is not complete on the GPU. The cache defers such releases
+// (TextureCache::ReleaseImage), so any line here names a destroy path that bypasses that check.
+// KYTY_DESTROY_AUDIT=0 turns it off.
+void AuditDestroy(const Image& image, CommandScheduler& scheduler) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DESTROY_AUDIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || image.tick_accessed_last == 0 ||
+	    scheduler.GetMasterSemaphore().KnownGpuTick() >= image.tick_accessed_last ||
+	    scheduler.IsFree(image.tick_accessed_last)) {
+		return;
+	}
+	static std::atomic<uint32_t> reported = 0;
+	const auto                   n        = reported.fetch_add(1) + 1;
+	if (n > 32 && (n & (n - 1)) != 0) {
+		return;
+	}
+	const auto stack = Common::HostBacktrace();
+	std::fprintf(stderr,
+	             "[destroy-early] #%u image %p %ux%u guest 0x%016" PRIx64 " recorded in tick %" PRIu64
+	             ", GPU at tick %" PRIu64 " (current %" PRIu64 ")\n%s\n",
+	             n, static_cast<void*>(static_cast<VkImage>(image.backing.image)), image.info.extent.width,
+	             image.info.extent.height, image.info.data.address, image.tick_accessed_last,
+	             scheduler.GetMasterSemaphore().KnownGpuTick(), scheduler.CurrentTick(), stack.c_str());
+	std::fflush(stderr);
+}
+} // namespace
+
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	if (g_image_views_destroying != nullptr && StaleViewCheckEnabled()) {
+		g_image_views_destroying(*this);
+	}
+	for (const auto& cached: views) {
+		NoteImageView(cached.view, *this, false);
+	}
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);
 		}
 	}
 	if (backing.image != nullptr) {
+		AuditDestroy(*this, m_scheduler);
+		ImageHistory::NoteDestroy(static_cast<VkImage>(backing.image), m_scheduler.CurrentTick());
 		m_graphics.DeleteImage(backing);
 	}
 }

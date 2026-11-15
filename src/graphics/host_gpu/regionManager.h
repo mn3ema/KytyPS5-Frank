@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <string_view>
 #include <mutex>
 #include <utility>
 
@@ -96,6 +97,21 @@ inline std::atomic<uint64_t> g_gpu_clean_epoch {1};
 // Bumped by the GPU thread when it starts a guest submission (its first slice).
 inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
+// Bumped by a command processor when a WAIT_REG_MEM passes (what the CPU wrote before the label
+// it waited on must be visible to the commands after it) and when a WRITE_DATA writes guest memory
+// on the CPU (the commands after it read those bytes): G6's RenderContext::PrepareBda walks again.
+inline std::atomic<uint64_t> g_bda_resync_seq {0};
+
+// KYTY_G6=compute (G6 stage 1): compute shaders read their read-only buffers through the GPU
+// address table (ResourceTracking.cpp); the host side of it.
+[[nodiscard]] inline bool G6Compute() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_G6");
+		return value != nullptr && std::string_view(value).starts_with("compute");
+	}();
+	return enabled;
+}
+
 // Hot pages (KYTY_HOT_PAGES=1). A page the CPU writes again and again (a ring of per-frame
 // constants, say) used to cost a write fault on the game thread and two protection changes per
 // write: in the jungle ~120,000 faults a second over the same ~40,000 pages. A page that faults
@@ -128,6 +144,9 @@ inline std::atomic<uint32_t> g_hot_epoch {1};
 struct HotPageStats {
 	std::atomic<uint64_t> promoted {0}, uploads {0}, repeats {0}, demoted_by_gpu {0},
 	    faults {0};
+	// Label reads that started a generation, and the polls that did not because the label still
+	// held the value the previous read saw (KYTY_HOT_LABEL_DEDUPE).
+	std::atomic<uint64_t> label_bumps {0}, label_skips {0};
 };
 inline HotPageStats g_hot_stats;
 // GPU thread: the game may have written guest memory since the last bump.
@@ -253,6 +272,7 @@ public:
 					m_cpu_touched_word->fetch_or(m_cpu_summary_bit, std::memory_order_acq_rel);
 				}
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+				m_version.fetch_add(1, std::memory_order_release);
 			}
 		} else {
 			bits.UnsetRange(start, end);
@@ -261,6 +281,7 @@ public:
 			}
 			if constexpr (source == DirtySource::Gpu) {
 				g_gpu_clean_epoch.fetch_add(1, std::memory_order_release);
+				m_version.fetch_add(1, std::memory_order_release);
 			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
@@ -337,6 +358,12 @@ public:
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
 	}
+
+	[[nodiscard]] uint64_t Version() const noexcept {
+		return m_version.load(std::memory_order_acquire);
+	}
+	// A region with hot pages re-uploads them by generation, which no version tracks.
+	[[nodiscard]] bool HasHotPages() const noexcept { return m_hot != nullptr; }
 
 	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
 	// Set before the region is published.
@@ -451,6 +478,9 @@ private:
 	RegionBits   m_gpu_dirty;
 	// The constructor fills m_cpu_dirty, so the CPU summary starts true.
 	std::atomic<bool> m_cpu_maybe_dirty {true};
+	// Bumped with g_cpu_dirty_epoch / g_gpu_clean_epoch for this region's pages only
+	// (BufferCache::SynchronizeBuffer's per-region memo, KYTY_SYNC_SKIP_REGION).
+	std::atomic<uint64_t> m_version {1};
 	std::atomic<bool> m_gpu_maybe_dirty {false};
 	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;
 	std::atomic<uint64_t>* m_cpu_touched_word = nullptr;

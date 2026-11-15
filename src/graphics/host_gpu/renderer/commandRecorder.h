@@ -5,12 +5,17 @@
 #include "graphics/host_gpu/renderer/barrierSink.h"
 #include "graphics/host_gpu/renderer/barrierStats.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
 #include <cstdint>
 
 namespace Libs::Graphics {
+
+// image.cpp: false (and a [stale-view] report) when the view is not alive.
+bool CheckLiveImageView(vk::ImageView view, const char* where);
+
 
 // The Vulkan commands of the hot recording paths, with vk::CommandBuffer's names and arguments
 // (ported from IDXTRI's wolverine-perf branch, d9958e28 + ad1e1396).
@@ -35,6 +40,7 @@ public:
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
+		GpuTiming::Note(GpuTiming::GapDraw);
 		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
 			SetCommandDrawSafe(safe);
@@ -43,6 +49,7 @@ public:
 	}
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index, int32_t offset,
 	                 uint32_t first_instance) const {
+		GpuTiming::Note(GpuTiming::GapDraw);
 		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
 			SetCommandDrawSafe(safe);
@@ -51,6 +58,7 @@ public:
 	}
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
+		GpuTiming::Note(GpuTiming::GapDraw);
 		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
 			SetCommandDrawSafe(safe);
@@ -59,6 +67,7 @@ public:
 	}
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
+		GpuTiming::Note(GpuTiming::GapDraw);
 		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
 			SetCommandDrawSafe(safe);
@@ -66,6 +75,7 @@ public:
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
+		GpuTiming::Note(GpuTiming::GapDraw);
 		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
 			SetCommandDrawSafe(safe);
@@ -74,6 +84,7 @@ public:
 	}
 	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                              uint32_t stride) const {
+		GpuTiming::Note(GpuTiming::GapDraw);
 		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
 			SetCommandDrawSafe(safe);
@@ -81,9 +92,11 @@ public:
 		});
 	}
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
+		GpuTiming::Note(GpuTiming::GapDispatch);
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
 	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
+		GpuTiming::Note(GpuTiming::GapDispatch);
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
@@ -138,23 +151,38 @@ public:
 		}
 		const auto* copy = StashWrites(writes, count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
+			CheckPushedViews(copy, count);
 			command.pushDescriptorSetKHR(bind_point, layout, set, count, copy);
 		});
+	}
+	// v125 (KYTY_FAULT_MAP=1): the views a push descriptor names, checked on the recording thread
+	// at the moment the driver copies their headers (MakeImageInfo checked them earlier, on the
+	// GPU thread; an image destroyed in between would hand the GPU a header of freed memory).
+	static void CheckPushedViews(const vk::WriteDescriptorSet* writes, uint32_t count) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (writes[i].pImageInfo == nullptr) {
+				continue;
+			}
+			for (uint32_t j = 0; j < writes[i].descriptorCount; j++) {
+				(void)CheckLiveImageView(writes[i].pImageInfo[j].imageView, "a push descriptor at record time");
+			}
+		}
 	}
 	// vkUpdateDescriptorSets of a set allocated for this command buffer, then its bind: both move
 	// to the recording thread (the update is driver work too). The set must not be in use yet.
 	void updateAndBindDescriptorSet(vk::Device device, vk::PipelineBindPoint bind_point,
 	                                vk::PipelineLayout layout, vk::DescriptorSet set,
-	                                uint32_t count, const vk::WriteDescriptorSet* writes) const {
+	                                uint32_t count, const vk::WriteDescriptorSet* writes,
+	                                uint32_t first_set = 0) const {
 		if (!Threaded()) {
 			device.updateDescriptorSets(count, writes, 0, nullptr);
-			m_direct.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+			m_direct.bindDescriptorSets(bind_point, layout, first_set, 1, &set, 0, nullptr);
 			return;
 		}
 		const auto* copy = StashWrites(writes, count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
 			device.updateDescriptorSets(count, copy, 0, nullptr);
-			command.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+			command.bindDescriptorSets(bind_point, layout, first_set, 1, &set, 0, nullptr);
 		});
 	}
 	void pipelineBarrier(vk::PipelineStageFlags source, vk::PipelineStageFlags destination,
@@ -163,6 +191,7 @@ public:
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images,
 	                     std::source_location site = std::source_location::current()) const {
+		GpuTiming::Note(GpuTiming::GapBarrier);
 		if (!Threaded()) {
 			SetBarrierSite(&site);
 			m_direct.pipelineBarrier(source, destination, flags, memory_count, memory, buffer_count,
@@ -185,6 +214,7 @@ public:
 	}
 	void pipelineBarrier2(const vk::DependencyInfo& dependency,
 	                      std::source_location site = std::source_location::current()) const {
+		GpuTiming::Note(GpuTiming::GapBarrier);
 		if (!Threaded()) {
 			SetBarrierSite(&site);
 			m_direct.pipelineBarrier2(dependency);
@@ -212,6 +242,7 @@ public:
 	// requested inside rendering and stay pending (barrierSink.h).
 	void guestPipelineBarrier2(const vk::DependencyInfo& dependency,
 	                           std::source_location site = std::source_location::current()) const {
+		GpuTiming::Note(GpuTiming::GapGuestBarrier);
 		EXIT_IF(dependency.pNext != nullptr || dependency.memoryBarrierCount != 1 ||
 		        dependency.bufferMemoryBarrierCount != 0 || dependency.imageMemoryBarrierCount != 0);
 		const vk::MemoryBarrier2 barrier = dependency.pMemoryBarriers[0];
@@ -228,6 +259,7 @@ public:
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
 	                const vk::BufferCopy* regions) const {
+		GpuTiming::Note(GpuTiming::GapCopyBuffer);
 		if (!Threaded()) {
 			m_direct.copyBuffer(source, destination, count, regions);
 			return;
@@ -237,10 +269,12 @@ public:
 		    [=](vk::CommandBuffer command) { command.copyBuffer(source, destination, count, r); });
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, const vk::BufferCopy& region) const {
+		GpuTiming::Note(GpuTiming::GapCopyBuffer);
 		copyBuffer(source, destination, 1, &region);
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const {
+		GpuTiming::Note(GpuTiming::GapFill);
 		if (!Threaded()) {
 			m_direct.updateBuffer(buffer, offset, size, data);
 			return;
@@ -250,15 +284,26 @@ public:
 			command.updateBuffer(buffer, offset, size, copy);
 		});
 	}
+	void resetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) const {
+		Run([=](vk::CommandBuffer command) { command.resetQueryPool(pool, first, count); });
+	}
+	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
+		Run([=](vk::CommandBuffer command) { command.beginQuery(pool, query, flags); });
+	}
+	void endQuery(vk::QueryPool pool, uint32_t query) const {
+		Run([=](vk::CommandBuffer command) { command.endQuery(pool, query); });
+	}
 	void writeTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, uint32_t query) const {
 		Run([=](vk::CommandBuffer command) { command.writeTimestamp(stage, pool, query); });
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
+		GpuTiming::Note(GpuTiming::GapFill);
 		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		GpuTiming::Note(GpuTiming::GapCopyImage);
 		if (!Threaded()) {
 			m_direct.copyBufferToImage(source, destination, layout, count, regions);
 			return;
@@ -270,10 +315,12 @@ public:
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
 	                       const vk::BufferImageCopy& region) const {
+		GpuTiming::Note(GpuTiming::GapCopyImage);
 		copyBufferToImage(source, destination, layout, 1, &region);
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
 	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		GpuTiming::Note(GpuTiming::GapCopyImage);
 		if (!Threaded()) {
 			m_direct.copyImageToBuffer(source, layout, destination, count, regions);
 			return;
@@ -285,11 +332,13 @@ public:
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
 	                       const vk::BufferImageCopy& region) const {
+		GpuTiming::Note(GpuTiming::GapCopyImage);
 		copyImageToBuffer(source, layout, destination, 1, &region);
 	}
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, uint32_t count,
 	               const vk::ImageCopy* regions) const {
+		GpuTiming::Note(GpuTiming::GapCopyImage);
 		if (!Threaded()) {
 			m_direct.copyImage(source, source_layout, destination, destination_layout, count,
 			                   regions);
@@ -302,10 +351,12 @@ public:
 	}
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, const vk::ImageCopy& region) const {
+		GpuTiming::Note(GpuTiming::GapCopyImage);
 		copyImage(source, source_layout, destination, destination_layout, 1, &region);
 	}
 	void resolveImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region) const {
+		GpuTiming::Note(GpuTiming::GapCopyImage);
 		Run([=](vk::CommandBuffer command) {
 			command.resolveImage(source, source_layout, destination, destination_layout, 1,
 			                     &region);
@@ -313,6 +364,7 @@ public:
 	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
 	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+		GpuTiming::Note(GpuTiming::GapClear);
 		if (!Threaded()) {
 			m_direct.clearColorImage(image, layout, color, count, ranges);
 			return;
@@ -326,6 +378,7 @@ public:
 	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
 	                            const vk::ClearDepthStencilValue* value, uint32_t count,
 	                            const vk::ImageSubresourceRange* ranges) const {
+		GpuTiming::Note(GpuTiming::GapClear);
 		if (!Threaded()) {
 			m_direct.clearDepthStencilImage(image, layout, value, count, ranges);
 			return;
@@ -344,6 +397,7 @@ public:
 	}
 	void beginRendering(const vk::RenderingInfo* info) const { beginRendering(*info); }
 	void beginRendering(const vk::RenderingInfo& info) const {
+		GpuTiming::Note(GpuTiming::GapRendering);
 		if (!Threaded()) {
 			m_direct.beginRendering(info);
 			return;
@@ -359,9 +413,20 @@ public:
 		    m_scheduler->Stash(info.pDepthAttachment, info.pDepthAttachment != nullptr ? 1u : 0u);
 		copy.pStencilAttachment = m_scheduler->Stash(info.pStencilAttachment,
 		                                             info.pStencilAttachment != nullptr ? 1u : 0u);
-		m_scheduler->Record([copy](vk::CommandBuffer command) { command.beginRendering(copy); });
+		m_scheduler->Record([copy](vk::CommandBuffer command) {
+			// v126 (KYTY_FAULT_MAP=1): the attachments' views at the moment the driver reads them.
+			for (uint32_t i = 0; i < copy.colorAttachmentCount; i++) {
+				(void)CheckLiveImageView(copy.pColorAttachments[i].imageView,
+				                         "a colour attachment at record time");
+			}
+			if (copy.pDepthAttachment != nullptr) {
+				(void)CheckLiveImageView(copy.pDepthAttachment->imageView, "a depth attachment at record time");
+			}
+			command.beginRendering(copy);
+		});
 	}
 	void endRendering(std::source_location site = std::source_location::current()) const {
+		GpuTiming::Note(GpuTiming::GapRendering);
 		Run([site](vk::CommandBuffer command) {
 			SetBarrierSite(&site);
 			command.endRendering();
@@ -395,6 +460,15 @@ public:
 	void setBlendConstants(const float constants[4]) const {
 		const std::array<float, 4> values {constants[0], constants[1], constants[2], constants[3]};
 		Run([=](vk::CommandBuffer command) { command.setBlendConstants(values.data()); });
+	}
+	void setDepthClipEnableEXT(vk::Bool32 enable) const {
+		Run([=](vk::CommandBuffer command) { command.setDepthClipEnableEXT(enable); });
+	}
+	void setDepthClipNegativeOneToOneEXT(vk::Bool32 enable) const {
+		Run([=](vk::CommandBuffer command) { command.setDepthClipNegativeOneToOneEXT(enable); });
+	}
+	void setPolygonModeEXT(vk::PolygonMode mode) const {
+		Run([=](vk::CommandBuffer command) { command.setPolygonModeEXT(mode); });
 	}
 	void setCullMode(vk::CullModeFlags mode) const {
 		Run([=](vk::CommandBuffer command) { command.setCullMode(mode); });

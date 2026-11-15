@@ -201,6 +201,8 @@ void                  EmitBarrier(EmitterState& state);
 void                  EmitWaveLdsBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
 void                  EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
+void                  EmitShaderTrapValues(EmitterState& state, uint32_t pc, uint32_t code,
+                                           uint32_t v0, uint32_t v1, uint32_t v2);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);

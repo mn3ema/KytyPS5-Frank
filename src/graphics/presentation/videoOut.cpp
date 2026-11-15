@@ -1,4 +1,7 @@
 #include "graphics/presentation/videoOut.h"
+#include "graphics/host_gpu/renderer/syncToggle.h"
+#include "common/fpsLog.h"
+#include "common/sampler.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -30,9 +33,13 @@
 #include <string>
 #include <atomic>
 #include <fmt/format.h>
+#include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/sync.h"
 #include <list>
 #include <thread>
 #include <vector>
+#include <unordered_set>
+#include <mutex>
 
 namespace Libs::Graphics {
 struct GraphicContext;
@@ -220,6 +227,7 @@ public:
 	bool Flip(uint32_t micros, bool off_vblank = false);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
+	[[nodiscard]] std::string DebugState();
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -373,6 +381,7 @@ static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
 
 static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind kind,
                                   void* trigger_data) {
+	Graphics::DrainProtectionHelper(Graphics::ProtectDrainReason::GuestSignal);
 	VideoOutEventQueues queues;
 	{
 		Common::LockGuard lock(video_out.events->mutex);
@@ -505,7 +514,7 @@ constexpr const char* kVoApiNames[VoApiCount] = {"GetVblankStatus", "WaitVblank"
                                                  "LatencyControlWaitBeforeInput"};
 std::array<std::atomic<uint32_t>, VoApiCount> g_vo_api_calls {};
 bool VoApiLogEnabled() {
-	static const bool enabled = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool enabled = Common::FpsLogDiagnostics();
 	return enabled;
 }
 void NoteVoApi(VoApi api) {
@@ -895,6 +904,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	Common::Sampler::RegisterCurrentThread("present");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
@@ -909,7 +919,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0 && flip_immediate && !m_presenter.IsGuestPaused()) {
+		if (total_wait > 0 && (flip_immediate || Graphics::SyncToggle::FlipNowWindow()) &&
+		    !m_presenter.IsGuestPaused()) {
 			// Wait for the vblank in steps of up to 1 ms, presenting ready flips as they come.
 			const auto deadline = sleep_begin + static_cast<uint64_t>(total_wait);
 			for (;;) {
@@ -1248,6 +1259,24 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
+std::string FlipQueue::DebugState() {
+	static const char* states[] = {"reserved", "recording", "ready", "presenting"};
+	Common::LockGuard lock(m_mutex);
+	std::string       out = fmt::format("processing={} gpu:", m_processing ? 1 : 0);
+	for (const auto& r: m_requests) {
+		out += fmt::format(" [id={} {} idx={} grp={} age={}us]", r.id, states[static_cast<int>(r.state)],
+		                   r.index, r.group,
+		                   (LibKernel::KernelGetProcessTimeCounter() - r.submit_ptc) * 1000000u /
+		                       std::max<uint64_t>(LibKernel::KernelGetProcessTimeCounterFrequency(), 1));
+	}
+	out += " cpu:";
+	for (const auto& r: m_cpu_requests) {
+		out += fmt::format(" [id={} {} idx={}]", r.id, states[static_cast<int>(r.state)], r.index);
+	}
+	out += fmt::format(" cancelled={}", m_cancelled_requests.size());
+	return out;
+}
+
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
@@ -1407,6 +1436,16 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
 	     "\t dcc_cb_register_clear_color = %016" PRIx64 "\n",
 	     pixel_format, tiling_mode, width, height, option, dcc_control,
 	     dcc_cb_register_clear_color);
+
+	{
+		// The size the game picked for its display buffers (it follows the reported output).
+		static std::atomic<uint64_t> last {0};
+		const uint64_t size = (static_cast<uint64_t>(width) << 32u) | height;
+		if (last.exchange(size) != size) {
+			std::fprintf(stderr, "[video-out] game display buffers %" PRIu32 "x%" PRIu32 "\n", width,
+			             height);
+		}
+	}
 
 	memset(attribute, 0, sizeof(VideoOutBufferAttribute2));
 
@@ -1650,9 +1689,61 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 	return OK;
 }
 
+namespace {
+// KYTY_SCAN_DWORD=<hex dword>[:<first flip>[:<every flips>]]: at those guest flips, scan every
+// committed guest mapping for the dword and print each hit with the 8 dwords before and after
+// ([scan] flip= addr= |...). Finds a table entry by its name hash, then shows how its value moves.
+// Runs on the guest thread that submits the flip (reading guest pages from the GPU thread
+// stalls on the backing store).
+void ScanDwordAtFlip() {
+	static const std::array<uint64_t, 3> setting = [] {
+		std::array<uint64_t, 3> result {0, 0, 0};
+		if (const char* value = std::getenv("KYTY_SCAN_DWORD"); value != nullptr) {
+			char* end = nullptr;
+			result[0] = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') result[1] = std::strtoull(end + 1, &end, 10);
+			if (end != nullptr && *end == ':') result[2] = std::strtoull(end + 1, &end, 10);
+		}
+		return result;
+	}();
+	if (setting[0] == 0) return;
+	static uint64_t next_flip = setting[1];
+	const uint64_t  flip      = Graphics::Sync::GuestFlipCount();
+	if (flip < next_flip) return;
+	next_flip = setting[2] != 0 ? flip + setting[2] : UINT64_MAX;
+	const uint32_t needle = static_cast<uint32_t>(setting[0]);
+	uint32_t       hits   = 0;
+	for (const auto& [start, size]: Libs::LibKernel::Memory::CommittedRanges()) {
+		if (start >= Libs::LibKernel::Memory::kExtendedMemoryBase) continue;
+		const uint64_t readable = Libs::LibKernel::Memory::TryClampRangeSize(start, size);
+		const auto*    words    = reinterpret_cast<const uint32_t*>(start);
+		for (uint64_t i = 0; i + 4 <= readable; i += 4) {
+			uint32_t w = 0;
+			std::memcpy(&w, reinterpret_cast<const void*>(start + i), 4);
+			if (w != needle) continue;
+			std::string text;
+			for (int64_t k = -8; k <= 8; k++) {
+				const uint64_t at = start + i + static_cast<uint64_t>(k * 4);
+				uint32_t       v  = 0xdeadbeefu;
+				if (k == 0 || (at >= start && at + 4 <= start + readable)) std::memcpy(&v, reinterpret_cast<const void*>(at), 4);
+				text += fmt::format("{}{:08x}", k == 0 ? " [" : " ", v);
+				if (k == 0) text += "]";
+			}
+			std::fprintf(stderr, "[scan] flip=%llu addr=%llx |%s\n", static_cast<unsigned long long>(flip),
+			             static_cast<unsigned long long>(start + i), text.c_str());
+			if (++hits >= 64) break;
+		}
+		(void)words;
+		if (hits >= 64) break;
+	}
+	std::fprintf(stderr, "[scan] flip=%llu dword=%08x hits=%u\n", static_cast<unsigned long long>(flip), needle, hits);
+}
+} // namespace
+
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
 	NoteVoApi(VoSubmitFlip);
+	ScanDwordAtFlip();
 
 	uint64_t  request_id = 0;
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
@@ -1700,6 +1791,10 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
+std::string VideoOutDriver::DebugFlipState() {
+	return m_impl->GetFlipQueue().DebugState();
+}
+
 void VideoOutDriver::WaitFlipDone(int handle, int index) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
@@ -1709,6 +1804,7 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
+	ScanDwordAtFlip();
 	PRINT_NAME();
 	NoteVoApi(VoGetFlipStatus);
 
@@ -1739,6 +1835,7 @@ KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) 
 }
 
 KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
+	ScanDwordAtFlip();
 	PRINT_NAME();
 	NoteVoApi(VoIsFlipPending);
 
@@ -1758,6 +1855,7 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 }
 
 KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status) {
+	ScanDwordAtFlip();
 	PRINT_NAME();
 	NoteVoApi(VoGetVblankStatus);
 
@@ -1856,6 +1954,20 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	return OK;
 }
 
+// --output-resolution 1080|2160 (main.cpp sets KYTY_OUTPUT_RESOLUTION): the TV resolution
+// VideoOutGetOutputStatus reports, whatever the window or param.json say. 0: not forced.
+static uint32_t ForcedOutputResolution() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_OUTPUT_RESOLUTION");
+		if (text == nullptr) return 0u;
+		const std::string v(text);
+		if (v == "1080" || v == "1080p") return 1u;
+		if (v == "2160" || v == "2160p" || v == "4k" || v == "4K") return 2u;
+		return 0u;
+	}();
+	return value;
+}
+
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) {
 	PRINT_NAME();
 
@@ -1872,8 +1984,17 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	status->resolution =
+	// --output-resolution / KYTY_OUTPUT_RESOLUTION overrides it.
+	const uint32_t detected =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	const uint32_t forced = ForcedOutputResolution();
+	status->resolution    = forced != 0 ? forced : detected;
+	static std::atomic<uint32_t> reported {0};
+	if (reported.exchange(status->resolution + 1u) != status->resolution + 1u) {
+		std::fprintf(stderr, "[video-out] output status tells the game %s (%s; ATTRIBUTE3=0x%x)\n",
+		             status->resolution == 1u ? "1080p" : "2160p",
+		             forced != 0 ? "--output-resolution" : "default", attribute3);
+	}
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
@@ -1968,6 +2089,16 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 	if (result != OK) {
 		return result;
 	}
+	{
+		// Which output modes the game probes (they encode resolution, rate and range).
+		static std::mutex                   seen_mutex;
+		static std::unordered_set<uint64_t> seen;
+		std::lock_guard                     lock(seen_mutex);
+		if (seen.size() < 64 && seen.insert(mode).second) {
+			std::fprintf(stderr, "[video-out] game asks whether output mode 0x%016" PRIx64 " is supported\n",
+			             mode);
+		}
+	}
 
 	if (mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
 		return (Config::GetVblankFrequency() >= 119 ? VIDEO_OUT_TRUE : VIDEO_OUT_FALSE);
@@ -1996,6 +2127,11 @@ KYTY_SYSV_ABI int VideoOutConfigureOutput(int handle, uint64_t mode,
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
+	// Logged when the mode changes: this title configures the same mode every frame (~30 calls/s,
+	// 1.8% of its render thread in fprintf, 11-15).
+	if (mode != ctx->output_mode) {
+		std::fprintf(stderr, "[video-out] game configures output mode 0x%016" PRIx64 "\n", mode);
+	}
 	ctx->mutex.Lock();
 	ctx->output_mode = mode;
 	TriggerVideoOutEvents(*ctx, VideoOutEventKind::OutputMode,

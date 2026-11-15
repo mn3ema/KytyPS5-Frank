@@ -201,6 +201,8 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
 	bool                                           ps_front_face                = false;
+	// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS: the FRONT_FACE VGPR is 1/0 (set) or +1.0f/-1.0f (clear).
+	bool                                           ps_front_face_all_bits       = false;
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	bool                                           ps_pixel_kill_enable         = false;
@@ -342,6 +344,9 @@ void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 // The guest hash the shader binary declares (a content hash when it declares none).
 uint64_t ShaderDeclaredHash(uint64_t shader_addr);
+// KYTY_SHADER_CREATE_LOG=1 (defined in libs/agc.cpp).
+bool   ShaderCreateLogEnabled();
+double ShaderCreateLogSeconds();
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

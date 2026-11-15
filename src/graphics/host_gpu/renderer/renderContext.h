@@ -43,6 +43,61 @@ public:
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
+	// The renderer mutex with a per-thread depth, for the command-processor threads
+	// (KYTY_ASYNC_THREAD): an off-lock window releases every level its thread holds.
+	void                LockRenderer();
+	void                UnlockRenderer();
+	// Graphics right of way (KYTY_ASYNC_POLITE, on by default with the async thread): the graphics
+	// command-processor thread is waiting for the renderer mutex. The async thread steps aside
+	// at its next packet and does not take the mutex while this holds.
+	[[nodiscard]] static bool GraphicsWaiting() noexcept;
+	[[nodiscard]] static bool PoliteAsync() noexcept;
+	// Releases all of this thread's tracked levels and marks it off-lock (guest-memory reads go
+	// through the concurrent queries, SetGpuReadDelegate); returns the depth to restore.
+	uint32_t            ReleaseRenderer();
+	void                ReacquireRenderer(uint32_t depth);
+	// This thread is inside an off-lock window (ReleaseRenderer).
+	[[nodiscard]] static bool RendererReleased() noexcept;
+	// This thread holds the renderer through LockRenderer (ReacquireScope among them).
+	[[nodiscard]] static bool HoldsRenderer() noexcept;
+	// A thread holding no level marks itself off-lock (true) or not (false) as ReleaseRenderer
+	// does, for work it does without the mutex (the async thread's queued dispatches, G4).
+	static void MarkOffLock(bool off);
+	// This thread's renderer-mutex statistics since the last call: time waiting for it, how
+	// often it was held by another thread, and time spent in off-lock windows.
+	struct LockStats {
+		uint64_t wait_ns     = 0;
+		uint64_t contended   = 0;
+		uint64_t acquires    = 0;
+		uint64_t released_ns = 0;
+	};
+	static LockStats TakeLockStats() noexcept;
+	// Releases this thread's tracked renderer levels for a blocking wait whose end needs another
+	// thread that takes the renderer mutex (the presenter, for flips), and restores them after,
+	// with the thread's registers bound again.
+	class UnlockedScope {
+	public:
+		explicit UnlockedScope(RenderContext& context);
+		~UnlockedScope();
+		KYTY_CLASS_NO_COPY(UnlockedScope);
+
+	private:
+		RenderContext& m_context;
+		uint32_t       m_depth = 0;
+	};
+	// Inside an off-lock window, holds the renderer mutex (and leaves the delegate mode) for the
+	// scope: the exact guest-memory paths (downloads, the GPU-thread caches) need it.
+	class ReacquireScope {
+	public:
+		explicit ReacquireScope(RenderContext& context);
+		// The renderer instance (there is one).
+		ReacquireScope();
+		~ReacquireScope();
+		KYTY_CLASS_NO_COPY(ReacquireScope);
+
+	private:
+		RenderContext* m_context = nullptr;
+	};
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
@@ -53,6 +108,10 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// PageManager::ResolveStale, before the fault is emulated or handled.
+	[[nodiscard]] bool ResolveStaleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+		return m_page_manager.ResolveStale(fault_vaddr, access);
+	}
 	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
@@ -64,10 +123,15 @@ public:
 	// UnmapMemory for several ranges with one GPU-thread round trip and one drain (an AMM batch
 	// remaps dozens of ranges; one round trip each made the batch take tens of milliseconds).
 	void               UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+	// GPU thread, inside an unmap: drains the GPU only when the ranges hold a shared buffer (F4.1).
+	void               DrainForUnmap(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	// The host protection of the range was replaced behind the page tracker
 	// (PageManager::ResyncHostProtection): the watched pages get the tracker's protection back.
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 		m_page_manager.ResyncHostProtection(vaddr, size);
+	}
+	void ForgetProtectionFaults(uint64_t vaddr, uint64_t size) noexcept {
+		m_page_manager.ForgetProtectionFaults(vaddr, size);
 	}
 	void               PrepareBda();
 	void               RunGarbageCollector();
@@ -101,6 +165,7 @@ private:
 	bool                      m_bda_logged = false;
 	uint64_t                  m_bda_synced_epoch      = 0;
 	uint64_t                  m_bda_synced_submission = 0;
+	uint64_t                  m_bda_synced_waits      = 0; // g_bda_resync_seq at the last walk (G6)
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -1,10 +1,20 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
+#include "kernel/memory.h"
+#include "gpu_tiler_shaders/bindless_sweep_spv.h"
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+#include <atomic>
+
 #include <cstdio>
 #include <cinttypes>
 #include <mutex>
 #include <set>
 #include <string>
+#include <chrono>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -27,6 +37,75 @@
 #include <cstring>
 
 namespace Libs::Graphics {
+
+bool        FaultMapImageVa(const void* image, uint64_t& va, uint64_t& size); // streamBuffer.cpp
+std::string FaultMapImageRange(const void* image);                            // streamBuffer.cpp
+
+namespace {
+// C4b parts, opt-in since 10-24 (B0: no effect on the freed-memory crash in 12 romp runs).
+bool PublishAtSubmit() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_PUBLISH_AT_SUBMIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// v384: KYTY_BINDLESS_PUBLISH_SAFE=1. Crash B (C22): draws already submitted read translation
+// entries live, so an entry written while they ran sent them to a slot whose descriptor was written
+// after their submission; the driver then resolved it to a recycled texture header of a destroyed
+// render target, and the read faulted once that memory was freed. Vulkan allows an update after
+// bind to reach only submissions made after it: the entry now waits until every submission made
+// before the descriptor write has completed. Pending entries (a slot going away) apply at once.
+bool PublishSafeEnabled() {
+	// v386: on by default (C23, Mac's 26 + 22 min sessions: no Crash B); =0 restores live writes.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_PUBLISH_SAFE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+// v383: KYTY_CANARY_DETECT (the recompiler's switch) also keeps a write log per slot.
+bool CanaryDetectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CANARY_DETECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool DeferredRetire() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_DEFERRED_RETIRE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// KYTY_BINDLESS_BLIND=1 (v374, Crash B bisection, diagnostics only): keys resolve, textures load
+// and slots are written exactly as usual, but every translation entry the GPU sees names the grey
+// placeholder (slot 0) instead of the key's slot, so no draw ever reads a texture through a
+// bindless slot. With v373's KYTY_BINDLESS_NONE (no textures at all) this separates "the GPU reads
+// through the table" from "the texture load changes memory and timing".
+uint32_t VisibleSlot(uint32_t slot) {
+	static const bool blind = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_BLIND");
+		return value != nullptr && value[0] == '1';
+	}();
+	return blind && slot != ShaderRecompiler::IR::BindlessPending ? 0u : slot;
+}
+inline void StoreFence() noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+	_mm_sfence();
+#else
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
+} // namespace
+
+
+// image.cpp (KYTY_FAULT_MAP=1): false, and a report, for a view of a destroyed image.
+bool CheckLiveImageView(vk::ImageView view, const char* where);
+bool IsImageViewLive(VkImageView view);       // image.cpp
+std::string DescribeViewForFault(uint64_t view); // image.cpp
 
 bool BindlessEngineEnabled() {
 	static const bool enabled = [] {
@@ -152,54 +231,95 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 		return;
 	}
 	m_images_per_array =
-	    std::min(MaxImagesPerArray, graphics.bindless_max_sampled_images / ImageArrays);
+	    std::min(MaxImagesPerArray, graphics.bindless_max_sampled_images / SampledImageArrays);
+	// KYTY_BINDLESS_IMAGES=n: at most n images per array (bisect, v436w).
+	if (const char* cap = std::getenv("KYTY_BINDLESS_IMAGES"); cap != nullptr) {
+		m_images_per_array = std::min(m_images_per_array, static_cast<uint32_t>(std::strtoul(cap, nullptr, 0)));
+	}
+	m_storage_per_array = graphics.bindless_storage_enabled
+	                          ? std::max(PlaceholderColors,
+	                                     std::min({m_images_per_array, 4096u,
+	                                               graphics.bindless_max_storage_images}))
+	                          : PlaceholderColors;
 	if (m_images_per_array == 0) {
 		LOGF("Bindless table: the device allows no update-after-bind sampled images\n");
 		return;
 	}
 
-	constexpr auto image_flags = vk::DescriptorBindingFlagBits::ePartiallyBound |
-	                             vk::DescriptorBindingFlagBits::eUpdateAfterBind |
-	                             vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+	// Bisect knob (v436v): KYTY_BINDLESS_NO_UAB=1 drops update-after-bind (updates while
+	// pending become invalid: a fault test only).
+	static const bool no_uab = [] {
+		const char* v = std::getenv("KYTY_BINDLESS_NO_UAB");
+		return v != nullptr && v[0] == '1';
+	}();
+	// The table names the stages that read it, not eAll: with eAll in an independent-sets
+	// pipeline layout (graphics pipeline libraries) every bindless draw could fault the GPU on
+	// NVIDIA 621.14 (ReadInvalid at 0x5800000; v436v: eAll faults, these stages are clean, same
+	// run otherwise). Default with KYTY_GPL (the layouts of other runs stay as they were, and
+	// with them the driver cache); KYTY_BINDLESS_STAGES=1/0 forces it either way.
+	const bool few_stages = [&] {
+		const char* v = std::getenv("KYTY_BINDLESS_STAGES");
+		return v != nullptr ? v[0] == '1' : graphics.graphics_pipeline_library_enabled;
+	}();
+	const vk::ShaderStageFlags stages =
+	    few_stages ? (vk::ShaderStageFlagBits::eAllGraphics | vk::ShaderStageFlagBits::eCompute |
+	                  (graphics.mesh_shader_enabled ? vk::ShaderStageFlagBits::eMeshEXT
+	                                                : vk::ShaderStageFlags {}))
+	               : vk::ShaderStageFlagBits::eAll;
+	const auto image_flags = no_uab ? vk::DescriptorBindingFlags {vk::DescriptorBindingFlagBits::ePartiallyBound}
+	                                : vk::DescriptorBindingFlagBits::ePartiallyBound |
+	                                      vk::DescriptorBindingFlagBits::eUpdateAfterBind |
+	                                      vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
 	// The buffers are written once, here, so they need no update-after-bind.
-	constexpr auto buffer_flags = vk::DescriptorBindingFlags {};
+	const auto buffer_flags = vk::DescriptorBindingFlags {};
 	// A device without update-after-bind samplers still gets a one-entry array, holding the
 	// default sampler, so every bindless pipeline sees the same layout.
 	m_samplers_per_array = std::min(MaxSamplers, graphics.bindless_max_samplers);
-	const std::array<vk::DescriptorSetLayoutBinding, 7> bindings {{
-	    {Images2D, vk::DescriptorType::eSampledImage, m_images_per_array, vk::ShaderStageFlagBits::eAll,
+	const std::array<vk::DescriptorSetLayoutBinding, 8> bindings {{
+	    {Images2D, vk::DescriptorType::eSampledImage, m_images_per_array, stages,
 	     nullptr},
 	    {Images2DArray, vk::DescriptorType::eSampledImage, m_images_per_array,
-	     vk::ShaderStageFlagBits::eAll, nullptr},
+	     stages, nullptr},
 	    {ImagesCube, vk::DescriptorType::eSampledImage, m_images_per_array,
-	     vk::ShaderStageFlagBits::eAll, nullptr},
-	    {Images3D, vk::DescriptorType::eSampledImage, m_images_per_array, vk::ShaderStageFlagBits::eAll,
+	     stages, nullptr},
+	    {Images3D, vk::DescriptorType::eSampledImage, m_images_per_array, stages,
 	     nullptr},
-	    {Translation, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll, nullptr},
-	    {Feedback, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll, nullptr},
+	    {Storage2D, vk::DescriptorType::eStorageImage, m_storage_per_array, stages,
+	     nullptr},
+	    {Translation, vk::DescriptorType::eStorageBuffer, 1, stages, nullptr},
+	    {Feedback, vk::DescriptorType::eStorageBuffer, 1, stages, nullptr},
 	    {Samplers, vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u),
-	     vk::ShaderStageFlagBits::eAll, nullptr},
+	     stages, nullptr},
 	}};
-	const std::array<vk::DescriptorBindingFlags, 7> binding_flags {
-	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags, image_flags};
+	// Without update-after-bind storage images the storage array holds its placeholders only,
+	// written here, before any draw binds the set.
+	const auto storage_flags = graphics.bindless_storage_enabled
+	                               ? image_flags
+	                               : vk::DescriptorBindingFlags {vk::DescriptorBindingFlagBits::ePartiallyBound};
+	const std::array<vk::DescriptorBindingFlags, 8> binding_flags {
+	    image_flags, image_flags, image_flags, image_flags, storage_flags, buffer_flags, buffer_flags,
+	    image_flags};
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
 	flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
 	flags_info.pBindingFlags = binding_flags.data();
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.pNext        = &flags_info;
-	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
+	layout_info.flags        = no_uab ? vk::DescriptorSetLayoutCreateFlags {}
+	                                  : vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
 	layout_info.bindingCount = static_cast<uint32_t>(bindings.size());
 	layout_info.pBindings    = bindings.data();
 	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout),
 	                     "create bindless descriptor layout");
 
-	const std::array<vk::DescriptorPoolSize, 3> sizes {{
-	    {vk::DescriptorType::eSampledImage, m_images_per_array * ImageArrays},
+	const std::array<vk::DescriptorPoolSize, 4> sizes {{
+	    {vk::DescriptorType::eSampledImage, m_images_per_array * SampledImageArrays},
+	    {vk::DescriptorType::eStorageImage, m_storage_per_array},
 	    {vk::DescriptorType::eStorageBuffer, 2},
 	    {vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u)},
 	}};
 	vk::DescriptorPoolCreateInfo pool_info {};
-	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
+	pool_info.flags         = no_uab ? vk::DescriptorPoolCreateFlags {}
+	                                 : vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
 	pool_info.maxSets       = 1;
 	pool_info.poolSizeCount = static_cast<uint32_t>(sizes.size());
 	pool_info.pPoolSizes    = sizes.data();
@@ -248,8 +368,13 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	CreatePlaceholders(scheduler);
 	graphics.bindless_layout = m_layout;
 	graphics.bindless_set    = m_set;
-	LOGF("Bindless table: %u images per array, %u translation entries, %u samplers\n",
-	     m_images_per_array, TranslationEntries, m_samplers_per_array);
+	LOGF("Bindless table: %u images per array, %u storage images, %u translation entries, %u samplers\n",
+	     m_images_per_array, m_storage_per_array, TranslationEntries, m_samplers_per_array);
+	ShaderRecompiler::IR::g_bindless_storage_supported.store(m_storage_per_array > PlaceholderColors,
+	                                                        std::memory_order_relaxed);
+	if (PublishAtSubmit()) {
+		m_scheduler.SetAfterSubmit([this] { PublishTranslations(); });
+	}
 }
 
 BindlessTable::SamplerHeap* BindlessTable::FindOrCreateSamplerHeap(uint64_t base,
@@ -446,7 +571,12 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 	    {vk::ImageType::e2D, vk::ImageViewType::e2DArray, 1, {}},
 	    {vk::ImageType::e2D, vk::ImageViewType::eCube, 6, vk::ImageCreateFlagBits::eCubeCompatible},
 	    {vk::ImageType::e3D, vk::ImageViewType::e3D, 1, {}},
+	    {vk::ImageType::e2D, vk::ImageViewType::e2D, 1, {}}, // Storage2D
 	}};
+	const auto layout_of = [](uint32_t i) {
+		return i % ImageArrays == Storage2D ? vk::ImageLayout::eGeneral
+		                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
+	};
 	for (uint32_t i = 0; i < Placeholders; i++) {
 		vk::ImageCreateInfo info {};
 		info.flags         = kinds[i % ImageArrays].flags;
@@ -458,6 +588,9 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 		info.samples       = vk::SampleCountFlagBits::e1;
 		info.tiling        = vk::ImageTiling::eOptimal;
 		info.usage         = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+		if (i % ImageArrays == Storage2D) {
+			info.usage |= vk::ImageUsageFlagBits::eStorage;
+		}
 		info.initialLayout = vk::ImageLayout::eUndefined;
 		EXIT_IF(!m_graphics.CreateImage(info, m_placeholders[i]));
 		vk::ImageViewCreateInfo view {};
@@ -504,9 +637,9 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 		to_transfer[i].subresourceRange    = range;
 		to_read[i]                         = to_transfer[i];
 		to_read[i].srcAccessMask           = vk::AccessFlagBits::eTransferWrite;
-		to_read[i].dstAccessMask           = vk::AccessFlagBits::eShaderRead;
+		to_read[i].dstAccessMask           = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 		to_read[i].oldLayout               = vk::ImageLayout::eTransferDstOptimal;
-		to_read[i].newLayout               = vk::ImageLayout::eShaderReadOnlyOptimal;
+		to_read[i].newLayout               = layout_of(i);
 	}
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 0, nullptr,
@@ -568,19 +701,62 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 	std::array<vk::DescriptorImageInfo, Placeholders> infos {};
 	std::array<vk::WriteDescriptorSet, Placeholders> writes {};
 	for (uint32_t i = 0; i < Placeholders; i++) {
-		infos[i]                  = {nullptr, m_placeholder_views[i],
-		                             vk::ImageLayout::eShaderReadOnlyOptimal};
+		infos[i]                  = {nullptr, m_placeholder_views[i], layout_of(i)};
 		writes[i].dstSet          = m_set;
 		writes[i].dstBinding      = Images2D + i % ImageArrays;
 		writes[i].dstArrayElement = i / ImageArrays;
 		writes[i].descriptorCount = 1;
-		writes[i].descriptorType  = vk::DescriptorType::eSampledImage;
+		writes[i].descriptorType  = DescriptorTypeFor(i % ImageArrays);
 		writes[i].pImageInfo      = &infos[i];
 	}
 	m_graphics.device.updateDescriptorSets(Placeholders, writes.data(), 0, nullptr);
+
+	// C4 (KYTY_BINDLESS_PREFILL=0 disables): every other slot of every image array holds its
+	// binding's placeholder from the start. A draw already executing when a slot is first written
+	// (UPDATE_AFTER_BIND: the write is only guaranteed visible to later submissions) may fetch the
+	// slot's descriptor from a GPU cache line loaded earlier for a neighbouring slot, or before the
+	// write reached memory. With never-written slots (KYTY_BINDLESS_SLOT_REUSE=0) that was
+	// uninitialized pool memory: a garbage texture header, read through a garbage address. Now it
+	// is a placeholder, which is what a pending key samples anyway.
+	static const bool prefill = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_PREFILL");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (prefill && m_images_per_array > PlaceholderColors) {
+		std::vector<vk::DescriptorImageInfo> fill;
+		for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+			if (SlotsPerArray(binding) <= PlaceholderColors) {
+				continue;
+			}
+			const uint32_t count = SlotsPerArray(binding) - PlaceholderColors;
+			fill.assign(count, vk::DescriptorImageInfo {nullptr, m_placeholder_views[binding],
+			                                            layout_of(binding)});
+			vk::WriteDescriptorSet write {};
+			write.dstSet          = m_set;
+			write.dstBinding      = Images2D + binding;
+			write.dstArrayElement = PlaceholderColors;
+			write.descriptorCount = count;
+			write.descriptorType  = DescriptorTypeFor(binding);
+			write.pImageInfo      = fill.data();
+			m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+		}
+		LOGF("Bindless table: %u slots per array pre-filled with placeholders\n",
+		     m_images_per_array - PlaceholderColors);
+	}
 }
 
 BindlessTable::~BindlessTable() {
+	m_scheduler.SetAfterSubmit({});
+	m_sweep_sink.reset();
+	if (m_sweep_pipeline != nullptr) {
+		m_graphics.device.destroyPipeline(m_sweep_pipeline, nullptr);
+	}
+	if (m_sweep_pipeline_layout != nullptr) {
+		m_graphics.device.destroyPipelineLayout(m_sweep_pipeline_layout, nullptr);
+	}
+	if (m_sweep_set_layout != nullptr) {
+		m_graphics.device.destroyDescriptorSetLayout(m_sweep_set_layout, nullptr);
+	}
 	for (uint32_t i = 0; i < Placeholders; i++) {
 		if (m_placeholder_views[i] != nullptr) {
 			m_graphics.device.destroyImageView(m_placeholder_views[i], nullptr);
@@ -624,7 +800,7 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 		if (key < old_entries && heap.settled[key] != 0) {
 			value = heap.slots[key];
 		}
-		translation[heap.region + key] = value;
+		translation[heap.region + key] = VisibleSlot(value);
 		feedback[heap.region + key]    = 0;
 	}
 	if (!m_translation->IsCoherent()) {
@@ -676,7 +852,7 @@ uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
 		free.pop_front();
 		return slot;
 	}
-	if (m_next_slot[binding] >= m_images_per_array) {
+	if (m_next_slot[binding] >= SlotsPerArray(binding)) {
 		return 0;
 	}
 	return m_next_slot[binding]++;
@@ -693,14 +869,21 @@ void BindlessTable::ReleaseSlot(uint32_t binding, uint32_t slot) {
 }
 
 void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view,
-                              vk::ImageLayout layout) {
-	const vk::DescriptorImageInfo info {nullptr, view, layout};
+                              vk::ImageLayout layout, VkImage image, uint64_t heap_base,
+                              uint32_t key, uint32_t width, uint32_t height, uint32_t layers) {
+	if (std::ranges::find(m_placeholder_views, view) == m_placeholder_views.end()) {
+		(void)CheckLiveImageView(view, "a bindless slot");
+	}
+	// A storage image is written in the general layout, whatever the caller passed for a
+	// placeholder.
+	const vk::DescriptorImageInfo info {nullptr, view,
+	                                    binding == Storage2D ? vk::ImageLayout::eGeneral : layout};
 	vk::WriteDescriptorSet        write {};
 	write.dstSet          = m_set;
 	write.dstBinding      = binding;
 	write.dstArrayElement = slot;
 	write.descriptorCount = 1;
-	write.descriptorType  = vk::DescriptorType::eSampledImage;
+	write.descriptorType  = DescriptorTypeFor(binding);
 	write.pImageInfo      = &info;
 	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
 	if (binding >= ImageArrays) {
@@ -709,6 +892,38 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 	auto& views = m_slot_views[binding];
 	if (views.size() <= slot) {
 		views.resize(slot + 1u);
+	}
+	if (ImageHistory::Enabled()) {
+		auto& images = m_slot_images[binding];
+		if (images.size() <= slot) {
+			images.resize(slot + 1u, VK_NULL_HANDLE);
+		}
+		ImageHistory::NoteSlotWrite(binding, slot, image, images[slot], m_scheduler.CurrentTick(),
+		                            heap_base, key);
+		images[slot] = image;
+	}
+	{
+		auto& expect = m_slot_expect[binding];
+		if (expect.size() <= slot) {
+			expect.resize(slot + 1u);
+		}
+		expect[slot] = {width, height, layers, key, m_scheduler.CurrentTick(), heap_base};
+	}
+	if (CanaryDetectEnabled()) {
+		auto& logs = m_slot_log[binding];
+		if (logs.size() <= slot) {
+			logs.resize(slot + 1u);
+		}
+		auto& log = logs[slot];
+		const double now_ms = std::chrono::duration<double, std::milli>(
+		                          std::chrono::steady_clock::now().time_since_epoch()).count();
+		const bool placeholder_write =
+		    std::ranges::find(m_placeholder_views, view) != m_placeholder_views.end();
+		log.writes[log.next % log.writes.size()] = {m_scheduler.CurrentTick(), now_ms,
+		                                            static_cast<VkImageView>(view),
+		                                            placeholder_write ? VK_NULL_HANDLE : image,
+		                                            width, height, layers, key, heap_base};
+		log.next++;
 	}
 	if (const auto old = views[slot]; old != nullptr) {
 		if (const auto found = m_view_slots.find(static_cast<VkImageView>(old));
@@ -724,6 +939,19 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 	views[slot] = placeholder ? vk::ImageView {} : view;
 	if (!placeholder && view != nullptr) {
 		m_view_slots[static_cast<VkImageView>(view)].emplace_back(binding, slot);
+	}
+}
+
+void BindlessTable::ReportHeldViews(std::span<const vk::ImageView> views, const char* what) {
+	for (const auto view: views) {
+		const auto found = m_view_slots.find(static_cast<VkImageView>(view));
+		if (found == m_view_slots.end()) {
+			continue;
+		}
+		for (const auto& [binding, slot]: found->second) {
+			std::fprintf(stderr, "[stale-view] bindless binding %u slot %u still holds a view of %s\n",
+			             binding, slot, what);
+		}
 	}
 }
 
@@ -753,15 +981,15 @@ bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 						std::erase(heap.resolved, id);
 						heap.checked_generation = 0;
 					}
-					ReleaseSlot(binding, slot);
 					heap.slots[key]   = 0;
 					heap.settled[key] = 0;
 					heap.images[key]  = {};
 					SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
 				}
 			}
-			WriteSlot(binding, slot, PlaceholderView(binding),
-			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			// C4b: placeholder and free list once the GPU is past the current tick; the caller
+			// keeps the image alive until then (held).
+			RetireSlot(binding, slot);
 			static std::atomic<uint32_t> reported = 0;
 			if (reported.fetch_add(1) < 16) {
 				LOGF("Bindless: binding %u slot %u still held an image being destroyed; "
@@ -774,17 +1002,140 @@ bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 }
 
 void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot) {
+	if (PublishSafeEnabled()) {
+		const uint32_t entry = heap.region + key;
+		std::lock_guard lock(m_publish_mutex);
+		// A later value for the entry supersedes the queued ones (v385: by generation, O(1)).
+		if (slot != ShaderRecompiler::IR::BindlessPending) {
+			const auto generation          = ++m_publish_safe_generation;
+			m_publish_safe_latest[entry]   = generation;
+			m_publish_safe.push_back({entry, VisibleSlot(slot), m_scheduler.CurrentTick(), generation});
+			m_publish_safe_max = std::max<uint64_t>(m_publish_safe_max, m_publish_safe.size());
+			return;
+		}
+		m_publish_safe_latest.erase(entry);
+		auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+		StoreFence();
+		translation[entry] = VisibleSlot(slot);
+		if (!m_translation->IsCoherent()) {
+			m_translation->Flush(entry * sizeof(uint32_t), sizeof(uint32_t));
+		}
+		return;
+	}
+	if (PublishAtSubmit()) {
+		// C4b: visible to the GPU after the next vkQueueSubmit, so no draw already executing
+		// can find a slot through an entry written while it ran (PublishTranslations).
+		std::lock_guard lock(m_publish_mutex);
+		m_publish.emplace_back(heap.region + key, VisibleSlot(slot));
+		return;
+	}
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
-	translation[heap.region + key] = slot;
+	// C4: the descriptor write that made the slot valid (vkUpdateDescriptorSets, a store into
+	// write-combined descriptor memory) must reach memory before a draw can find the slot through
+	// this entry; x86 does not order write-combined stores against later ones without a fence.
+	StoreFence();
+	translation[heap.region + key] = VisibleSlot(slot);
 	if (!m_translation->IsCoherent()) {
 		m_translation->Flush((heap.region + key) * sizeof(uint32_t), sizeof(uint32_t));
 	}
 }
 
+void BindlessTable::PublishSafe() {
+	if (!PublishSafeEnabled()) {
+		return;
+	}
+	std::lock_guard lock(m_publish_mutex);
+	// v385: the GPU progress the scheduler already knows (no driver call per bindless draw; the
+	// scheduler refreshes it often enough).
+	const auto& master = m_scheduler.GetMasterSemaphore();
+	static auto last_report = std::chrono::steady_clock::now();
+	if (const auto now = std::chrono::steady_clock::now(); now - last_report > std::chrono::seconds(10)) {
+		last_report = now;
+		std::fprintf(stderr,
+		             "[publish-safe] queued %zu (max %" PRIu64 "), published %" PRIu64 ", superseded %" PRIu64
+		             ", oldest waits for tick %" PRIu64 " (GPU at %" PRIu64 ", recording %" PRIu64 ")\n",
+		             m_publish_safe.size(), m_publish_safe_max, m_publish_safe_published, m_publish_safe_superseded,
+		             m_publish_safe.empty() ? 0 : m_publish_safe.front().tick - 1u, master.KnownGpuTick(),
+		             m_scheduler.CurrentTick());
+		m_publish_safe_max = m_publish_safe.size();
+	}
+	if (m_publish_safe.empty() || !master.IsFree(m_publish_safe.front().tick - 1u)) {
+		return;
+	}
+	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	// The descriptor writes these entries name were made before they were queued.
+	StoreFence();
+	uint32_t low = UINT32_MAX, high = 0;
+	while (!m_publish_safe.empty() && master.IsFree(m_publish_safe.front().tick - 1u)) {
+		const auto e = m_publish_safe.front();
+		m_publish_safe.pop_front();
+		const auto latest = m_publish_safe_latest.find(e.entry);
+		if (latest == m_publish_safe_latest.end() || latest->second != e.generation) {
+			m_publish_safe_superseded++;
+			continue;
+		}
+		m_publish_safe_latest.erase(latest);
+		translation[e.entry] = e.value;
+		low                  = std::min(low, e.entry);
+		high                 = std::max(high, e.entry);
+		m_publish_safe_published++;
+	}
+	StoreFence();
+	if (!m_translation->IsCoherent() && low <= high) {
+		m_translation->Flush(low * sizeof(uint32_t), (high - low + 1u) * sizeof(uint32_t));
+	}
+}
+
+void BindlessTable::PublishTranslations() {
+	std::vector<std::pair<uint32_t, uint32_t>> entries;
+	{
+		std::lock_guard lock(m_publish_mutex);
+		if (m_publish.empty()) {
+			return;
+		}
+		entries.swap(m_publish);
+	}
+	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	// The descriptor writes these entries name were made before they were queued.
+	StoreFence();
+	uint32_t low = UINT32_MAX, high = 0;
+	for (const auto& [entry, value]: entries) {
+		translation[entry] = value;
+		low                = std::min(low, entry);
+		high               = std::max(high, entry);
+	}
+	StoreFence();
+	if (!m_translation->IsCoherent()) {
+		m_translation->Flush(low * sizeof(uint32_t), (high - low + 1u) * sizeof(uint32_t));
+	}
+}
+
+void BindlessTable::RetireSlot(uint32_t binding, uint32_t slot) {
+	if (!DeferredRetire()) {
+		WriteSlot(binding, slot, PlaceholderView(binding), vk::ImageLayout::eShaderReadOnlyOptimal);
+		ReleaseSlot(binding, slot);
+		return;
+	}
+	const uint64_t id = (uint64_t {binding} << 32u) | slot;
+	if (!m_retiring.emplace(id, true).second) {
+		return; // already waiting
+	}
+	// The keys' pending entries were queued before this; the placeholder goes into the slot (and
+	// the slot back to the free list) only after the GPU has finished every draw recorded so far,
+	// which is also after those entries were published (the submit of this tick publishes them).
+	m_scheduler.DeferRelease([this, binding, slot, id] {
+		WriteSlot(binding, slot, PlaceholderView(binding), vk::ImageLayout::eShaderReadOnlyOptimal);
+		ReleaseSlot(binding, slot);
+		m_retiring.erase(id);
+	});
+}
+
 void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	// Regions are allocated contiguously after word 0, so one copy covers every heap.
-	static const bool capture =
-	    std::getenv("KYTY_KEY_CAPTURE") != nullptr || std::getenv("KYTY_PROBE_RECT") != nullptr;
+	static const bool capture = std::getenv("KYTY_KEY_CAPTURE") != nullptr ||
+	                            std::getenv("KYTY_PROBE_RECT") != nullptr ||
+	                            std::getenv("KYTY_BINDLESS_OOB_INFO") != nullptr ||
+	                            std::getenv("KYTY_NAN_MAGENTA") != nullptr;
 	const vk::DeviceSize size = vk::DeviceSize {capture ? TranslationEntries : m_next_region} *
 	                            sizeof(uint32_t);
 	scheduler.EndRendering();
@@ -796,12 +1147,16 @@ void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	flags_written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	flags_written.buffer              = m_feedback->Handle();
 	flags_written.offset              = 0;
-	flags_written.size                = size;
+	flags_written.size                = VK_WHOLE_SIZE;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
 	                        &flags_written, 0, nullptr);
-	const vk::BufferCopy copy {0, 0, size};
-	command.copyBuffer(m_feedback->Handle(), m_feedback_snapshot->Handle(), 1, &copy);
+	// v127: plus the out-of-range slot word (above every region).
+	constexpr vk::DeviceSize oob = vk::DeviceSize {ShaderRecompiler::IR::BindlessOutOfRangeSlotWord} *
+	                               sizeof(uint32_t);
+	const std::array<vk::BufferCopy, 2> copies {{{0, 0, size}, {oob, oob, sizeof(uint32_t)}}};
+	command.copyBuffer(m_feedback->Handle(), m_feedback_snapshot->Handle(),
+	                   size > oob ? 1u : 2u, copies.data());
 	auto snapshot_written          = flags_written;
 	snapshot_written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	snapshot_written.dstAccessMask = vk::AccessFlagBits::eHostRead;
@@ -812,11 +1167,205 @@ void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	m_snapshot_tick = scheduler.CurrentTick();
 }
 
+static bool SlotSweepEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_SWEEP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void BindlessTable::RecordSlotSweep(CommandScheduler& scheduler, uint64_t frame) {
+	if (!SlotSweepEnabled() || m_set == nullptr || frame == m_sweep_frame) {
+		return;
+	}
+	if (m_sweep_pipeline == nullptr) {
+		const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1,
+		                                              vk::ShaderStageFlagBits::eCompute, nullptr};
+		vk::DescriptorSetLayoutCreateInfo    layout_info {};
+		layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		layout_info.bindingCount = 1;
+		layout_info.pBindings    = &binding;
+		RequireVulkanSuccess(
+		    m_graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_sweep_set_layout),
+		    "create bindless sweep descriptor layout");
+		const std::array<vk::DescriptorSetLayout, 2> sets {m_sweep_set_layout, m_layout};
+		const vk::PushConstantRange                  range {vk::ShaderStageFlagBits::eCompute, 0, 12};
+		vk::PipelineLayoutCreateInfo                 pipeline_layout_info {};
+		pipeline_layout_info.setLayoutCount         = static_cast<uint32_t>(sets.size());
+		pipeline_layout_info.pSetLayouts            = sets.data();
+		pipeline_layout_info.pushConstantRangeCount = 1;
+		pipeline_layout_info.pPushConstantRanges    = &range;
+		RequireVulkanSuccess(m_graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+		                                                            &m_sweep_pipeline_layout),
+		                     "create bindless sweep pipeline layout");
+		const auto                        module = CompileSPV(BINDLESS_SWEEP_SPV, m_graphics.device);
+		vk::PipelineShaderStageCreateInfo stage {};
+		stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		stage.module = module;
+		stage.pName  = "main";
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage  = stage;
+		pipeline_info.layout = m_sweep_pipeline_layout;
+		const auto result    = m_graphics.device.createComputePipelines(nullptr, 1, &pipeline_info,
+		                                                                nullptr, &m_sweep_pipeline);
+		m_graphics.device.destroyShaderModule(module, nullptr);
+		RequireVulkanSuccess(result, "create bindless sweep pipeline");
+		SetVulkanObjectNameF(m_graphics.device, m_sweep_pipeline, "Kyty.BindlessSweep");
+		// Download usage: host-cached, so the report can read what the GPU wrote (Invalidate).
+		m_sweep_sink = std::make_unique<Buffer>(m_graphics, scheduler, MemoryUsage::Download, 0,
+		                                        AllFlags,
+		                                        vk::DeviceSize {ImageArrays} * 65536u * 2u * sizeof(uint32_t));
+		LOGF("Bindless sweep: on (one texel from every allocated slot, once a frame)\n");
+	}
+	// The previous sweep's answers, once the GPU has run it.
+	if (m_sweep_tick != 0 && scheduler.IsFree(m_sweep_tick)) {
+		VerifySweep();
+	}
+	m_sweep_frame = frame;
+	m_sweep_tick  = scheduler.CurrentTick();
+	scheduler.EndRendering();
+	auto command = scheduler.Current().Recorder();
+	// Everything drawn so far is visible to the sweep's reads.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &before, 0, nullptr,
+	                        0, nullptr);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_sweep_pipeline);
+	const vk::DescriptorBufferInfo sink {m_sweep_sink->Handle(), 0, VK_WHOLE_SIZE};
+	vk::WriteDescriptorSet         write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+	write.pBufferInfo     = &sink;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_sweep_pipeline_layout, 0, 1, &write);
+	command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, m_sweep_pipeline_layout, 1, 1, &m_set,
+	                           0, nullptr);
+	for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+		// The cube fetch samples through sampler slot 0, written with the first bindless sampler.
+		const uint32_t count =
+		    (binding == ImagesCube && !m_default_sampler_written) || binding == Storage2D
+		        ? 0u
+		        : std::min(m_next_slot[binding], 65536u);
+		m_sweep_counts[binding] = count;
+		if (count == 0) {
+			continue;
+		}
+		const std::array<uint32_t, 3> constants {binding, count, static_cast<uint32_t>(frame)};
+		command.pushConstants(m_sweep_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                      sizeof(constants), constants.data());
+		command.dispatch((count + 255u) / 256u, 1, 1);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eMemoryRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                        {}, 1, &after, 0, nullptr, 0, nullptr);
+}
+
+// v124: what the GPU's descriptors say each slot's image is, against what the host wrote. A slot
+// the host repointed to the placeholder that still reports the old texture's size is a descriptor
+// write that did not take effect on the GPU side ([bindless-verify] STALE); the sweep's texel
+// fetches of such a slot fault once that memory is unmapped.
+void BindlessTable::VerifySweep() {
+	m_sweep_sink->Invalidate(0, m_sweep_sink->Size());
+	const auto*    sink  = reinterpret_cast<const uint32_t*>(m_sweep_sink->Mapped().data());
+	const uint32_t frame = static_cast<uint32_t>(m_sweep_frame) & 0xffffu;
+	uint32_t       printed = 0;
+	m_verify_frames++;
+	for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+		const auto& expect = m_slot_expect[binding];
+		for (uint32_t slot = PlaceholderColors; slot < m_sweep_counts[binding] && slot < expect.size();
+		     slot++) {
+			const auto& e = expect[slot];
+			if (e.tick >= m_sweep_tick) {
+				continue; // written after the sweep was recorded; the next sweep sees it
+			}
+			const uint32_t w0 = sink[(binding * 65536u + slot) * 2u];
+			const uint32_t w1 = sink[(binding * 65536u + slot) * 2u + 1u];
+			if ((w1 >> 16u) != frame) {
+				continue; // the sweep did not reach it
+			}
+			const uint32_t width  = w0 & 0xffffu;
+			const uint32_t height = w0 >> 16u;
+			const uint32_t layers = w1 & 0xffffu;
+			m_verify_checked++;
+			const bool layers_known = binding != ImagesCube;
+			if (width == (e.width & 0xffffu) && height == (e.height & 0xffffu) &&
+			    (!layers_known || layers == (e.layers & 0xffffu))) {
+				continue;
+			}
+			m_verify_mismatches++;
+			static uint32_t total_printed = 0;
+			if (printed < 8 && total_printed < 400) {
+				printed++;
+				total_printed++;
+				const VkImage image = binding < m_slot_images.size() && slot < m_slot_images[binding].size()
+				                          ? m_slot_images[binding][slot]
+				                          : VK_NULL_HANDLE;
+				std::fprintf(stderr,
+				             "[bindless-verify] frame %llu binding %u slot %u: GPU %ux%ux%u, host %ux%ux%u%s "
+				             "(image %p, written tick %llu, heap 0x%llx key %u, sweep tick %llu)\n",
+				             static_cast<unsigned long long>(m_sweep_frame), binding, slot, width, height,
+				             layers, e.width, e.height, e.layers,
+				             e.width == 1 && e.height == 1 ? " STALE (host: placeholder)" : "",
+				             static_cast<void*>(image), static_cast<unsigned long long>(e.tick),
+				             static_cast<unsigned long long>(e.heap), e.key,
+				             static_cast<unsigned long long>(m_sweep_tick));
+				if (image != VK_NULL_HANDLE) {
+					ImageHistory::Describe(image, stderr);
+				}
+			}
+		}
+	}
+	if (m_verify_frames % 300 == 0) {
+		std::fprintf(stderr, "[bindless-verify] %llu frames: %llu slots checked, %llu mismatches\n",
+		             static_cast<unsigned long long>(m_verify_frames),
+		             static_cast<unsigned long long>(m_verify_checked),
+		             static_cast<unsigned long long>(m_verify_mismatches));
+	}
+}
+
+void BindlessTable::ReportSweep(uint64_t /*frame*/) const {
+	if (!SlotSweepEnabled() || m_sweep_sink == nullptr || m_sweep_sink->Mapped().empty()) {
+		return;
+	}
+	m_sweep_sink->Invalidate(0, m_sweep_sink->Size());
+	const auto*    sink  = reinterpret_cast<const uint32_t*>(m_sweep_sink->Mapped().data());
+	const uint32_t frame = static_cast<uint32_t>(m_sweep_frame);
+	std::fprintf(stderr, "[bindless-sweep] last sweep recorded for frame %u (tick %llu); %llu frames verified, %llu slots checked, %llu mismatches\n",
+	             frame, static_cast<unsigned long long>(m_sweep_tick),
+	             static_cast<unsigned long long>(m_verify_frames),
+	             static_cast<unsigned long long>(m_verify_checked),
+	             static_cast<unsigned long long>(m_verify_mismatches));
+	for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+		uint32_t unfinished = 0, first = UINT32_MAX, last = 0, previous_frame = 0;
+		for (uint32_t slot = 0; slot < m_sweep_counts[binding]; slot++) {
+			const auto value = sink[(binding * 65536u + slot) * 2u + 1u] >> 16u;
+			if (value != (frame & 0xffffu)) {
+				unfinished++;
+				first = std::min(first, slot);
+				last  = std::max(last, slot);
+				previous_frame = value;
+			}
+		}
+		std::fprintf(stderr,
+		             "[bindless-sweep] binding %u: %u slots swept, %u not finished with this frame's "
+		             "sweep (slots %u..%u; they hold the value %u)\n",
+		             binding, m_sweep_counts[binding], unfinished, first == UINT32_MAX ? 0 : first,
+		             last, previous_frame);
+	}
+}
+
 bool BindlessTable::SnapshotReady(CommandScheduler& scheduler) {
 	return m_snapshot_tick != 0 && scheduler.IsFree(m_snapshot_tick);
 }
 
 void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) {
+	ReportCanaryHits(false);
 	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
 	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
 	m_feedback_snapshot->Invalidate(heap.region * sizeof(uint32_t),
@@ -873,20 +1422,61 @@ uint32_t BindlessTable::TakeWordZero() {
 	return value;
 }
 
-void BindlessTable::ArmUsageProbe() {
-	auto* feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+std::atomic<uint32_t> g_bindless_oob_seen {0}; // descriptors.cpp counts [bindless-oob]
+
+uint32_t BindlessTable::TakeFeedbackWord(uint32_t word) {
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	m_feedback_snapshot->Invalidate(word * sizeof(uint32_t), sizeof(uint32_t));
+	const auto value = snapshot[word];
+	if (value != 0) {
+		feedback[word] = 0;
+		m_feedback->Flush(word * sizeof(uint32_t), sizeof(uint32_t));
+	}
+	return value;
+}
+
+uint32_t BindlessTable::TakeOutOfRangeSlot() {
+	constexpr uint32_t word     = ShaderRecompiler::IR::BindlessOutOfRangeSlotWord;
+	const auto*        snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	auto*              feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	m_feedback_snapshot->Invalidate(word * sizeof(uint32_t), sizeof(uint32_t));
+	const auto value = snapshot[word];
+	if (value != 0) {
+		feedback[word] = 0;
+		m_feedback->Flush(word * sizeof(uint32_t), sizeof(uint32_t));
+	}
+	return value;
+}
+
+void BindlessTable::SetProbeActive(bool active) {
+	constexpr uint32_t word = ShaderRecompiler::IR::BindlessProbeActiveWord;
+	if (m_feedback == nullptr || m_feedback->Mapped().size() < (word + 1u) * sizeof(uint32_t)) {
+		return;
+	}
+	StoreFence();
+	reinterpret_cast<uint32_t*>(m_feedback->Mapped().data())[word] = active ? 1u : 0u;
+	StoreFence();
+	m_feedback->Flush(word * sizeof(uint32_t), sizeof(uint32_t));
+}
+
+uint32_t BindlessTable::ArmUsageProbe() {
+	auto*    feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	uint32_t total    = 0;
 	for (const auto& heap: m_heaps) {
 		bool marked = false;
 		for (uint32_t key = 0; key < heap.entries && key < heap.images.size(); key++) {
 			if (heap.images[key]) {
 				feedback[heap.region + key] = ProbeMark;
 				marked                      = true;
+				total++;
 			}
 		}
 		if (marked) {
 			m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
 		}
 	}
+	return total;
 }
 
 void BindlessTable::MarkUnsampled(const Heap& heap, uint32_t key) {
@@ -961,13 +1551,18 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 			}
 		}
 	}
-	if (heap.slots[key] != 0) {
-		ReleaseSlot(SlotBinding(heap, heap.slots[key]), SlotIndex(heap.slots[key]));
-	}
+	const auto entry  = heap.slots[key];
 	heap.slots[key]   = 0;
 	heap.settled[key] = 0;
 	heap.images[key]  = {};
 	SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+	if (entry != 0) {
+		// v122: the placeholder goes into the slot before it is freed (RetireSlot). Freeing it with
+		// the old view still in it let ReleaseViews find the slot again when that image was
+		// destroyed and free it a second time: with slot reuse on, two keys then shared one slot
+		// (the second key's texture showed on the first key's objects).
+		RetireSlot(SlotBinding(heap, entry), SlotIndex(entry));
+	}
 	return no_refs;
 }
 
@@ -977,24 +1572,403 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		return;
 	}
 	for (const auto& [heap, key]: found->second) {
-		if (heap->slots[key] != 0) {
-			// Placeholder 0 of the slot's own view type. Placeholder i is of binding
-			// i % ImageArrays and colour i / ImageArrays, so colour 0 of binding b is entry b
-			// (b * PlaceholderColors named another binding's view type for b = 1..3).
-			const auto binding = SlotBinding(*heap, heap->slots[key]);
-			const auto slot    = SlotIndex(heap->slots[key]);
-			WriteSlot(binding, slot, PlaceholderView(binding),
-			          vk::ImageLayout::eShaderReadOnlyOptimal);
-			ReleaseSlot(binding, slot);
-		}
+		const auto entry = heap->slots[key];
 		heap->slots[key]   = 0;
 		heap->settled[key] = 0;
 		heap->images[key]  = {};
+		// C4b: the key turns pending first; the slot keeps the old view until the GPU is past
+		// every draw that may have read the old entry (RetireSlot), then gets placeholder 0 of
+		// its own view type (colour 0 of binding b is placeholder entry b).
 		SetTranslation(*heap, key, ShaderRecompiler::IR::BindlessPending);
+		if (entry != 0) {
+			RetireSlot(SlotBinding(*heap, entry), SlotIndex(entry));
+		}
 		std::erase(heap->resolved, id);
 		m_unregistered_keys++;
 	}
 	m_image_refs.erase(found);
+}
+
+
+void BindlessTable::DescribeKeysForGuestRange(uint64_t lo, uint64_t hi, FILE* out) const {
+	const auto TsharpBase = [](const uint32_t* d) {
+		return ((static_cast<uint64_t>(d[0]) | (static_cast<uint64_t>(d[1]) << 32u)) & 0xFFFFFFFFFFull) << 8u;
+	};
+	const auto* translation = m_translation != nullptr && !m_translation->Mapped().empty()
+	                              ? reinterpret_cast<const uint32_t*>(m_translation->Mapped().data())
+	                              : nullptr;
+	uint32_t printed = 0, now_matches = 0, settled_matches = 0, heaps = 0;
+	std::vector<uint32_t> words;
+	for (const auto& heap: m_heaps) {
+		heaps++;
+		const uint32_t count = std::max(heap.entries, heap.guest_entries);
+		words.assign(static_cast<size_t>(count) * 8u, 0u);
+		const bool readable = count != 0 &&
+		                      Libs::LibKernel::Memory::TryReadBacking(heap.base + heap.table_offset, words.data(),
+		                                                              static_cast<uint64_t>(count) * 32u);
+		for (uint32_t key = 0; key < count; key++) {
+			const uint64_t now     = readable ? TsharpBase(&words[static_cast<size_t>(key) * 8u]) : 0;
+			const uint64_t settled = key < heap.descriptors.size() ? TsharpBase(heap.descriptors[key].data()) : 0;
+			const bool     now_in  = now >= lo && now < hi;
+			const bool     set_in  = settled >= lo && settled < hi;
+			if (!now_in && !set_in) {
+				continue;
+			}
+			now_matches += now_in ? 1u : 0u;
+			settled_matches += set_in ? 1u : 0u;
+			if (printed++ >= 48) {
+				continue;
+			}
+			const uint32_t slot  = key < heap.slots.size() ? heap.slots[key] : 0u;
+			const uint32_t entry = translation != nullptr && heap.region + key < TranslationEntries
+			                           ? translation[heap.region + key]
+			                           : 0u;
+			const auto     image = key < heap.images.size() ? heap.images[key] : ImageId {};
+			std::fprintf(out,
+			             "[bindless-guest] heap 0x%012" PRIx64 "+0x%x binding %u region %u key %u: T# now 0x%" PRIx64
+			             "%s, settled from 0x%" PRIx64 "%s; settled=%u stale=%u slot=0x%x translation=0x%x image=%u.%u\n",
+			             heap.base, heap.table_offset, heap.binding, heap.region, key, now, now_in ? " (in range)" : "",
+			             settled, set_in ? " (in range)" : "",
+			             key < heap.settled.size() ? heap.settled[key] : 0u, key < heap.stale.size() ? heap.stale[key] : 0u,
+			             slot, entry, static_cast<uint32_t>(image.index), static_cast<uint32_t>(image.generation));
+		}
+	}
+	std::fprintf(out,
+	             "[bindless-guest] guest 0x%" PRIx64 "-0x%" PRIx64 ": %u keys' T# point into it now, %u keys were "
+	             "settled from such a T# (%u heaps)\n",
+	             lo, hi, now_matches, settled_matches, heaps);
+	std::fflush(out);
+}
+
+void BindlessTable::CompareSlotCapture(FILE* out) const {
+	if (m_translation == nullptr || m_translation->Mapped().empty() || m_feedback == nullptr ||
+	    m_feedback->Mapped().size() < (ShaderRecompiler::IR::BindlessSlotCaptureBase +
+	                                   ShaderRecompiler::IR::BindlessSlotCaptureEntries) * sizeof(uint32_t)) {
+		std::fprintf(out, "[slot-capture] no capture area\n");
+		return;
+	}
+	m_feedback->Invalidate(ShaderRecompiler::IR::BindlessSlotCaptureBase * sizeof(uint32_t),
+	                       ShaderRecompiler::IR::BindlessSlotCaptureEntries * sizeof(uint32_t));
+	const auto* feedback    = reinterpret_cast<const uint32_t*>(m_feedback->Mapped().data());
+	const auto* translation = reinterpret_cast<const uint32_t*>(m_translation->Mapped().data());
+	const auto  now_tick    = m_scheduler.CurrentTick();
+	uint64_t    sampled = 0, same = 0, pending_both = 0, differ = 0, printed = 0;
+	for (const auto& heap: m_heaps) {
+		for (uint32_t key = 0; key < heap.entries; key++) {
+			const uint32_t index = heap.region + key;
+			if (index >= ShaderRecompiler::IR::BindlessSlotCaptureEntries) {
+				continue;
+			}
+			const uint32_t word = feedback[ShaderRecompiler::IR::BindlessSlotCaptureBase + index];
+			if (word == 0) {
+				continue;
+			}
+			sampled++;
+			const bool     gpu_pending = word == 0xfffffffeu;
+			const uint32_t gpu_raw     = gpu_pending ? ShaderRecompiler::IR::BindlessPending : (word & 0x7fffffffu);
+			const uint32_t host_raw    = translation[index];
+			if (gpu_raw == host_raw) {
+				(gpu_pending ? pending_both : same)++;
+				continue;
+			}
+			differ++;
+			if (printed++ >= 64) {
+				continue;
+			}
+			// What the slot the GPU read serves now, per the host.
+			char gpu_slot[160] = "pending (placeholder 2)";
+			if (!gpu_pending) {
+				const uint32_t binding = SlotBinding(heap, gpu_raw);
+				const uint32_t slot    = SlotIndex(gpu_raw);
+				if (binding < ImageArrays && slot < m_slot_expect[binding].size()) {
+					const auto& e = m_slot_expect[binding][slot];
+					std::snprintf(gpu_slot, sizeof(gpu_slot),
+					              "binding %u slot %u, now %ux%ux%u for heap 0x%" PRIx64 " key %u written %" PRIu64
+					              " ticks ago",
+					              binding, slot, e.width, e.height, e.layers, e.heap, e.key, now_tick - e.tick);
+				} else {
+					std::snprintf(gpu_slot, sizeof(gpu_slot), "binding %u slot %u (never written by the host)",
+					              binding, slot);
+				}
+			}
+			std::fprintf(out,
+			             "[slot-capture] heap 0x%012" PRIx64 " binding %u region %u key %u: GPU read 0x%x (%s), host "
+			             "now 0x%x, host slot 0x%x settled=%u\n",
+			             heap.base, heap.binding, heap.region, key, gpu_raw, gpu_slot, host_raw,
+			             key < heap.slots.size() ? heap.slots[key] : 0u, key < heap.settled.size() ? heap.settled[key] : 0u);
+		}
+	}
+	std::fprintf(out,
+	             "[slot-capture] %" PRIu64 " keys sampled since start: %" PRIu64 " read what the host has now, %" PRIu64
+	             " pending on both sides, %" PRIu64 " differ\n",
+	             sampled, same, pending_both, differ);
+	std::fflush(out);
+}
+
+void BindlessTable::ReportCanaryHits(bool force) const {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CANARY_DETECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	namespace IR = ShaderRecompiler::IR;
+	if (!enabled || m_feedback == nullptr ||
+	    m_feedback->Mapped().size() < (IR::BindlessCanarySize + IR::BindlessCanarySlotMask + 1u) * sizeof(uint32_t)) {
+		return;
+	}
+	static auto     last_check = std::chrono::steady_clock::now();
+	static uint32_t last_count = 0;
+	static std::vector<uint32_t> reported(IR::BindlessCanarySlotMask + 1u, 0u);
+	const auto      now        = std::chrono::steady_clock::now();
+	if (!force && now - last_check < std::chrono::milliseconds(100)) {
+		return;
+	}
+	last_check = now;
+	m_feedback->Invalidate(IR::BindlessCanaryWord * sizeof(uint32_t), 8u * sizeof(uint32_t));
+	const auto* feedback = reinterpret_cast<const uint32_t*>(m_feedback->Mapped().data());
+	const uint32_t count = feedback[IR::BindlessCanaryWord];
+	if (count == last_count) {
+		if (force) {
+			std::fprintf(stderr, "[canary-hit] total %u (none new)\n", count);
+		}
+		return;
+	}
+	std::fprintf(stderr,
+	             "[canary-hit] total %u (+%u; 4ch %u, 2ch %u, 1ch %u) at tick %" PRIu64
+	             "; last: shader %08x%08x translation 0x%08x\n",
+	             count, count - last_count, feedback[IR::BindlessCanaryWord + 4u], feedback[IR::BindlessCanaryWord + 5u],
+	             feedback[IR::BindlessCanaryWord + 6u], m_scheduler.CurrentTick(), feedback[IR::BindlessCanaryWord + 2u],
+	             feedback[IR::BindlessCanaryWord + 1u], feedback[IR::BindlessCanaryWord + 3u]);
+	last_count = count;
+	m_feedback->Invalidate(IR::BindlessCanarySlots * sizeof(uint32_t),
+	                       3u * (IR::BindlessCanarySlotMask + 1u) * sizeof(uint32_t));
+	uint32_t printed = 0;
+	for (uint32_t slot = 0; slot <= IR::BindlessCanarySlotMask && printed < 32; slot++) {
+		const uint32_t hash = feedback[IR::BindlessCanarySlots + slot];
+		const uint32_t raw  = feedback[IR::BindlessCanaryRaw + slot];
+		const uint32_t size = feedback[IR::BindlessCanarySize + slot];
+		if (hash == 0 || reported[slot] == (hash ^ raw ^ 0x5a5a5a5au)) {
+			continue;
+		}
+		reported[slot] = hash ^ raw ^ 0x5a5a5a5au;
+		printed++;
+		std::string views;
+		for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+			const auto& list = m_slot_views[binding];
+			if (slot >= list.size() || !list[slot]) {
+				continue;
+			}
+			const auto view = static_cast<VkImageView>(list[slot]);
+			views += " b" + std::to_string(binding) + (IsImageViewLive(view) ? " live " : " DESTROYED ") +
+			         DescribeViewForFault(reinterpret_cast<uint64_t>(view)) + ";";
+		}
+		std::fprintf(stderr, "[canary-hit]   slot %u: shader ..%08x translation 0x%08x signature %u, descriptor %ux%u, slot now:%s\n",
+		             slot, hash, raw & ~0x03000000u, (raw >> 24u) & 3u, size & 0xffffu, size >> 16u,
+		             views.empty() ? " (no view)" : views.c_str());
+		// v383: the slot's recent writes (any binding), oldest first, with each view's state now
+		// and, for a hit whose descriptor size matches none of them, the images' histories.
+		const double now_ms = std::chrono::duration<double, std::milli>(
+		                          std::chrono::steady_clock::now().time_since_epoch()).count();
+		bool any_size_match = false;
+		std::vector<VkImage> images;
+		for (uint32_t binding = 0; binding < ImageArrays; binding++) {
+			const auto& logs = m_slot_log[binding];
+			if (slot >= logs.size() || logs[slot].next == 0) {
+				continue;
+			}
+			const auto& log   = logs[slot];
+			const auto  count = std::min<uint32_t>(log.next, static_cast<uint32_t>(log.writes.size()));
+			for (uint32_t i = 0; i < count; i++) {
+				const auto& w = log.writes[(log.next - count + i) % log.writes.size()];
+				if (w.image != VK_NULL_HANDLE && (w.width | (w.height << 16u)) == size) {
+					any_size_match = true;
+				}
+				if (w.image != VK_NULL_HANDLE && std::ranges::find(images, w.image) == images.end()) {
+					images.push_back(w.image);
+				}
+				std::fprintf(stderr,
+				             "[canary-hit]     b%u write tick %" PRIu64 " (%.0f ms ago): %s view %p image %p %ux%ux%u key %u heap 0x%" PRIx64
+				             ", view %s now\n",
+				             binding, w.tick, now_ms - w.ms, w.image == VK_NULL_HANDLE ? "placeholder" : "texture",
+				             static_cast<void*>(w.view), static_cast<void*>(w.image), w.width, w.height, w.layers, w.key,
+				             w.heap, IsImageViewLive(w.view) ? "live" : "DESTROYED");
+			}
+		}
+		if (!any_size_match && size != 0xffffffffu && ImageHistory::Enabled()) {
+			std::fprintf(stderr, "[canary-hit]     descriptor size %ux%u matches no write of this slot\n", size & 0xffffu,
+			             size >> 16u);
+			for (const auto image: images) {
+				ImageHistory::Describe(image, stderr);
+			}
+		}
+	}
+	std::fflush(stderr);
+}
+
+void BindlessTable::AuditForFault() const {
+	if (m_translation == nullptr || m_translation->Mapped().empty()) {
+		std::fprintf(stderr, "[bindless-audit] no translation buffer\n");
+		return;
+	}
+	ReportCanaryHits(true);
+	if (static const bool slot_capture = [] {
+		    const char* value = std::getenv("KYTY_SLOT_CAPTURE");
+		    return value != nullptr && value[0] == '1';
+	    }();
+	    slot_capture) {
+		CompareSlotCapture(stderr);
+	}
+	// v127: a translation value that named no slot since the last snapshot (shader clamp report),
+	// read live from the feedback buffer, so a value from the faulting frame shows.
+	if (m_feedback != nullptr && !m_feedback->Mapped().empty()) {
+		constexpr uint32_t word = ShaderRecompiler::IR::BindlessOutOfRangeSlotWord;
+		m_feedback->Invalidate(word * sizeof(uint32_t), sizeof(uint32_t));
+		const auto value = reinterpret_cast<const uint32_t*>(m_feedback->Mapped().data())[word];
+		std::fprintf(stderr, "[bindless-oob] at device loss: %s (0x%08x); seen during the run: %u\n",
+		             value != 0 ? "a translation value named no slot" : "none pending", value,
+		             g_bindless_oob_seen.load());
+	}
+	// Entries still queued for publication (KYTY_BINDLESS_PUBLISH_AT_SUBMIT) count as written.
+	std::vector<uint32_t> translation_copy(
+	    reinterpret_cast<const uint32_t*>(m_translation->Mapped().data()),
+	    reinterpret_cast<const uint32_t*>(m_translation->Mapped().data()) + TranslationEntries);
+	{
+		std::lock_guard lock(m_publish_mutex);
+		for (const auto& [entry, value]: m_publish) {
+			if (entry < translation_copy.size()) {
+				translation_copy[entry] = value;
+			}
+		}
+	}
+	const uint32_t* translation = translation_copy.data();
+	// Which translation entries belong to a live heap region (and that heap's binding).
+	std::vector<int32_t> owner(m_next_region, -1);
+	for (size_t h = 0; h < m_heaps.size(); h++) {
+		const auto& heap = m_heaps[h];
+		for (uint32_t k = 0; k < heap.entries && heap.region + k < m_next_region; k++) {
+			owner[heap.region + k] = static_cast<int32_t>(h);
+		}
+	}
+	uint64_t live_entries = 0, stale_entries = 0, pending = 0, placeholder = 0, dead = 0,
+	         free_slot = 0, past_end = 0, live_view = 0, mismatched = 0;
+	uint32_t printed = 0;
+	const auto is_free = [&](uint32_t binding, uint32_t slot) {
+		for (const auto& [free, tick]: m_free_slots[binding]) {
+			if (free == slot) return true;
+		}
+		return false;
+	};
+	for (uint32_t i = 1; i < m_next_region; i++) {
+		const auto value = translation[i];
+		if (value == ShaderRecompiler::IR::BindlessPending) {
+			pending++;
+			continue;
+		}
+		const bool stale = owner[i] < 0;
+		(stale ? stale_entries : live_entries)++;
+		uint32_t binding = 0;
+		if ((value & ShaderRecompiler::IR::BindlessSlotFlagMask) == ShaderRecompiler::IR::BindlessSlotArrayFlag) {
+			binding = ShaderRecompiler::IR::BindlessImages2DArray;
+		} else if (!stale) {
+			binding = m_heaps[static_cast<size_t>(owner[i])].binding;
+		} else {
+			binding = ImageArrays; // unknown: a moved-away region keeps no binding
+		}
+		const auto slot = SlotIndex(value);
+		const char* problem = nullptr;
+		std::string detail;
+		if (binding < ImageArrays) {
+			if (slot >= m_next_slot[binding]) {
+				past_end++;
+				problem = "slot past the allocated range";
+			} else if (slot < PlaceholderColors) {
+				placeholder++;
+			} else if (is_free(binding, slot)) {
+				free_slot++;
+				problem = "slot is on the free list";
+			} else {
+				const auto& views = m_slot_views[binding];
+				const auto  view  = slot < views.size() ? views[slot] : vk::ImageView {};
+				if (!view) {
+					placeholder++;
+				} else if (!IsImageViewLive(static_cast<VkImageView>(view))) {
+					dead++;
+					problem = "slot holds a destroyed view";
+					detail  = DescribeViewForFault(reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
+				} else {
+					live_view++;
+					if (!stale) {
+						const auto& heap = m_heaps[static_cast<size_t>(owner[i])];
+						const auto  key  = i - heap.region;
+						if (key < heap.slots.size() && heap.slots[key] != value) {
+							mismatched++;
+							problem = "GPU translation differs from the heap's CPU slot";
+						}
+					}
+				}
+			}
+		}
+		if (problem != nullptr && printed < 32) {
+			printed++;
+			std::fprintf(stderr, "[bindless-audit]   entry %u (%s region%s) -> binding %u slot %u: %s %s\n", i,
+			             stale ? "moved-away" : "live",
+			             stale ? "" : (" of heap " + std::to_string(owner[i])).c_str(), binding, slot, problem,
+			             detail.c_str());
+		}
+	}
+	std::fprintf(stderr,
+	             "[bindless-audit] translation entries 1..%u: pending %" PRIu64 ", in live regions %" PRIu64
+	             ", in moved-away regions %" PRIu64 "; slots: placeholder %" PRIu64 ", live view %" PRIu64
+	             ", DESTROYED view %" PRIu64 ", free %" PRIu64 ", past end %" PRIu64
+	             ", translation!=heap %" PRIu64 "; heaps %zu, next slots %u/%u/%u/%u\n",
+	             m_next_region - 1, pending, live_entries, stale_entries, placeholder, live_view, dead,
+	             free_slot, past_end, mismatched, m_heaps.size(), m_next_slot[0], m_next_slot[1],
+	             m_next_slot[2], m_next_slot[3]);
+	// The views held by slots no translation entry names any more can still be sampled by a draw
+	// that cached an old translation: count destroyed views anywhere in the arrays too.
+	uint64_t dead_anywhere = 0;
+	for (uint32_t b = 0; b < ImageArrays; b++) {
+		for (const auto view: m_slot_views[b]) {
+			if (view && !IsImageViewLive(static_cast<VkImageView>(view))) dead_anywhere++;
+		}
+	}
+	std::fprintf(stderr, "[bindless-audit] destroyed views held by any slot: %" PRIu64 "\n", dead_anywhere);
+	// v295: a view handle the driver reused passes the liveness check above. The image a slot was
+	// written with (m_slot_images) tells: its view now belongs to another image, or the image itself
+	// is gone (its memory freed), while the descriptor still holds the old view's header.
+	uint64_t replaced = 0, image_gone = 0, printed_slots = 0;
+	for (uint32_t b = 0; b < ImageArrays; b++) {
+		const auto& views  = m_slot_views[b];
+		const auto& images = m_slot_images[b];
+		for (uint32_t s = PlaceholderColors; s < views.size() && s < images.size(); s++) {
+			const auto view  = static_cast<VkImageView>(views[s]);
+			const auto image = images[s];
+			if (view == VK_NULL_HANDLE || image == VK_NULL_HANDLE ||
+			    std::ranges::find(m_placeholder_views, views[s]) != m_placeholder_views.end()) {
+				continue;
+			}
+			const auto owner = ImageHistory::ImageOfView(view);
+			uint64_t   va = 0, size = 0;
+			const bool live_image = FaultMapImageVa(image, va, size);
+			const bool view_moved = owner != VK_NULL_HANDLE && owner != image;
+			if (!view_moved && live_image) {
+				continue;
+			}
+			replaced += view_moved ? 1 : 0;
+			image_gone += live_image ? 0 : 1;
+			if (printed_slots++ < 24) {
+				std::fprintf(stderr,
+				             "[bindless-audit]   binding %u slot %u: view %p written with image %p%s%s;%s\n", b, s,
+				             static_cast<void*>(view), static_cast<void*>(image),
+				             view_moved ? " (the view handle now belongs to another image)" : "",
+				             live_image ? "" : " (that image is no longer live)",
+				             FaultMapImageRange(image).c_str());
+			}
+		}
+	}
+	std::fprintf(stderr,
+	             "[bindless-audit] slots whose view handle was reused: %" PRIu64
+	             ", slots whose image is gone: %" PRIu64 "\n",
+	             replaced, image_gone);
 }
 
 } // namespace Libs::Graphics

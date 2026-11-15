@@ -54,9 +54,9 @@ inline bool DispatchRunsEnabled() {
 	return enabled;
 }
 
-// GPU thread only.
+// Per command-processor thread (KYTY_ASYNC_THREAD runs the compute queues on their own).
 inline DispatchRunState& DispatchRun() {
-	static DispatchRunState state;
+	thread_local DispatchRunState state;
 	return state;
 }
 
@@ -81,13 +81,32 @@ struct MeshArgsRunState {
 	std::vector<MeshArgsRunEntry> upcoming;         // collected when packet has no conversion
 	std::vector<MeshArgsRunEntry> converted;        // the current batch, in command order
 	size_t                        next = 0;         // first batch entry not used yet
+	uint64_t                      generation = 0;   // changes whenever a new batch replaces it
+	const uint32_t*               last_used_packet = nullptr;
+	uint64_t                      last_used_generation = 0;
 	uint64_t batches = 0, batched = 0, hits = 0, single = 0; // stats
+
+	void Invalidate() {
+		packet = nullptr;
+		upcoming.clear();
+		converted.clear();
+		next = 0;
+		generation++;
+		last_used_packet = nullptr;
+		last_used_generation = 0;
+	}
 
 	[[nodiscard]] bool Contains(const uint32_t* p) const {
 		for (size_t i = next; i < converted.size(); i++) {
 			if (converted[i].packet == p) return true;
 		}
 		return false;
+	}
+	[[nodiscard]] const MeshArgsRunEntry* Peek(const uint32_t* p) const {
+		for (size_t i = next; i < converted.size(); i++) {
+			if (converted[i].packet == p) return &converted[i];
+		}
+		return nullptr;
 	}
 	// The batch entry of `p`; entries before it are skipped (their draws were not mesh draws).
 	const MeshArgsRunEntry* Take(const uint32_t* p) {

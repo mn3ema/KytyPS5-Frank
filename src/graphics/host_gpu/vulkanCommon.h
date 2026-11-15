@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include <vulkan/vulkan.hpp>
+#include "graphics/host_gpu/aftermath.h"
 #include <vulkan/vulkan_hash.hpp>
 
 namespace Libs::Graphics {
@@ -31,7 +32,8 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	// Also with KYTY_AFTERMATH_DLL: the crash dump's resource tracking names what was at the fault.
+	if (!(Config::GraphicsDebugDumpEnabled() || Aftermath::Enabled()) || device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

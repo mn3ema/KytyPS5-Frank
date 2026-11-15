@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "common/sampler.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -3221,6 +3222,14 @@ static void* RunThread(void* arg) {
 #endif
 	thread->host_thread_id = os_thread_id;
 	KYTY_PROFILER_THREAD(thread->name.c_str());
+	// KYTY_SAMPLE with KYTY_SAMPLE_GUEST=1: the guest's threads are sampled too ([sample-threads]).
+	if (static const bool sample_guest = std::getenv("KYTY_SAMPLE_GUEST") != nullptr; sample_guest) {
+		const auto stack_low = reinterpret_cast<uintptr_t>(thread->attr->stack_addr);
+		Common::Sampler::RegisterGuestThread(("g:" + thread->name).c_str(), stack_low,
+		                                     stack_low + thread->attr->stack_size);
+	} else {
+		Common::Sampler::NameCurrentThread(("g:" + thread->name).c_str());
+	}
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",

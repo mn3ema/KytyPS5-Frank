@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -41,22 +42,77 @@ bool SrtRawReadsOnGpu() {
 
 // KYTY_GPU_RESOURCES=<hash>[,<hash>...] (hex) or "all": the listed shaders read their buffers
 // through the descriptor words in the shader (BDA), as GPU-selected buffers do, instead of a
-// binding the host refreshes for every draw.
+// binding the host refreshes for every draw. "all,-<hash>,-<hash>": all but those.
 bool GpuResources(uint64_t shader_hash) {
+	struct List {
+		bool                         all = false;
+		std::unordered_set<uint64_t> included, excluded;
+	};
 	static const auto list = [] {
-		std::pair<bool, std::unordered_set<uint64_t>> result {false, {}};
+		List        result;
 		const char* value = std::getenv("KYTY_GPU_RESOURCES");
 		if (value == nullptr) return result;
 		const std::string_view text(value);
-		result.first = text == "all";
-		for (size_t begin = 0; !result.first && begin < text.size();) {
-			const auto end = std::min(text.find(',', begin), text.size());
-			if (end > begin) result.second.insert(std::strtoull(std::string(text.substr(begin, end - begin)).c_str(), nullptr, 16));
+		for (size_t begin = 0; begin < text.size();) {
+			const auto end  = std::min(text.find(',', begin), text.size());
+			const auto item = text.substr(begin, end - begin);
+			if (item == "all") {
+				result.all = true;
+			} else if (!item.empty() && item[0] == '-') {
+				result.excluded.insert(std::strtoull(std::string(item.substr(1)).c_str(), nullptr, 16));
+			} else if (!item.empty()) {
+				result.included.insert(std::strtoull(std::string(item).c_str(), nullptr, 16));
+			}
 			begin = end + 1;
 		}
 		return result;
 	}();
-	return list.first || list.second.contains(shader_hash);
+	if (list.excluded.contains(shader_hash)) return false;
+	return list.all || list.included.contains(shader_hash);
+}
+
+// KYTY_GPU_RESOURCES_STAGES=graphics|compute (default both): which stages KYTY_GPU_RESOURCES
+// applies to. Compute shaders that loop on their data hung the GPU in this mode (11-08).
+bool GpuResourcesStage(ShaderType stage) {
+	static const int stages = [] {
+		const char* value = std::getenv("KYTY_GPU_RESOURCES_STAGES");
+		if (value == nullptr) return 3;
+		const std::string_view text(value);
+		return text == "graphics" ? 1 : text == "compute" ? 2 : 3;
+	}();
+	return (stages & (stage == ShaderType::Compute ? 2 : 1)) != 0;
+}
+
+// KYTY_G6=compute (G6 stage 1, 2026-11-09): compute shaders read their read-only buffers through
+// the GPU address table (as KYTY_GPU_RESOURCES does), but only buffers whose descriptor the host
+// evaluates too: the host keeps each such buffer present and resident before the dispatch is
+// recorded (BufferCache::PrepareTableRead), so a page is never missing from the table, and binds no
+// descriptor and syncs nothing per binding (the CPU's writes reach the table's buffers through
+// RenderContext::PrepareBda). Formatted loads and loads that feed a resource handle stay host
+// bindings. KYTY_G6=compute-noscalar: scalar (constant-buffer) loads stay host bindings too
+// (narrowing the 11-09 GPU hang). Unset: off.
+bool G6Stage(ShaderType stage) {
+	static const bool compute = [] {
+		const char* value = std::getenv("KYTY_G6");
+		return value != nullptr && std::string_view(value).starts_with("compute");
+	}();
+	return compute && stage == ShaderType::Compute;
+}
+bool G6NoScalar() {
+	static const bool no_scalar = [] {
+		const char* value = std::getenv("KYTY_G6");
+		return value != nullptr && std::string_view(value) == "compute-noscalar";
+	}();
+	return no_scalar;
+}
+
+// KYTY_GPU_RESOURCES_FORMATTED=1: KYTY_GPU_RESOURCES also takes buffers read by formatted loads.
+bool GpuResourcesFormatted() {
+	static const bool formatted = [] {
+		const char* value = std::getenv("KYTY_GPU_RESOURCES_FORMATTED");
+		return value != nullptr && value[0] == '1';
+	}();
+	return formatted;
 }
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -1055,7 +1111,7 @@ private:
 				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    a.key_shift != b.key_shift || a.key_mask != b.key_mask ||
-				    a.bindless != b.bindless ||
+				    a.bindless != b.bindless || a.storage != b.storage ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -2249,6 +2305,43 @@ private:
 		return true;
 	}
 
+	// Whether the handle only loads (or queries the size of) a 2D image whose descriptor, the same
+	// eight values, another handle of this program stores to.
+	bool IsStoredDescriptorRead(const Inst& handle) const {
+		const auto image_use = [&](const Inst& user, bool write) {
+			const auto op = user.GetOpcode();
+			if (write ? op != ValueOpcode::ImageWrite
+			          : op != ValueOpcode::ImageRead && op != ValueOpcode::ImageQueryDimensions) {
+				return false;
+			}
+			const auto index = user.Flags<MemoryFlags>().index;
+			return index < m_program.memory_info.size() &&
+			       m_program.memory_info[index].image_dimension == Decoder::ImageDimension::Dim2D &&
+			       !m_program.memory_info[index].image_r128;
+		};
+		if (handle.NumArgs() != 8u || handle.Uses().empty() ||
+		    !std::ranges::all_of(handle.Uses(), [&](const Use& use) { return image_use(*use.user, false); })) {
+			return false;
+		}
+		for (const auto* block: m_program.blocks) {
+			for (const auto& other: *block) {
+				if (&other == &handle || other.GetOpcode() != ValueOpcode::GetImageResource ||
+				    other.NumArgs() != 8u || other.Uses().empty() ||
+				    !std::ranges::all_of(other.Uses(), [&](const Use& use) { return image_use(*use.user, true); })) {
+					continue;
+				}
+				bool same = true;
+				for (uint32_t i = 0; i < 8u && same; i++) {
+					same = handle.Arg(i).Resolve() == other.Arg(i).Resolve();
+				}
+				if (same) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, const DescriptorSource& descriptor,
 	                          IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) return false;
@@ -2270,7 +2363,28 @@ private:
 			return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
 			       ImageResourceClass::Sampled;
 		});
-		const bool bindless = m_program.bindless_images && sampled_only &&
+		// A handle only 2D stores use (no atomics) can be bindless too, through the storage
+		// array (BindlessStorage2D): a store-only image picked per material from a table too
+		// large to enumerate otherwise loses its stores.
+		const bool storage_only =
+		    !sampled_only && ShaderRecompiler::IR::BindlessStorageImagesEnabled() &&
+		    std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			    if (use.user->GetOpcode() != ValueOpcode::ImageWrite) return false;
+			    const auto index = use.user->Flags<MemoryFlags>().index;
+			    return index < m_program.memory_info.size() &&
+			           m_program.memory_info[index].image_dimension == Decoder::ImageDimension::Dim2D &&
+			           !m_program.memory_info[index].image_r128;
+		    });
+		// Loads (and size queries) of a descriptor this pixel shader also stores to, in a
+		// pixel-ordered section: a read-modify-write (the scent trail adds its density to the
+		// accumulation image under POPS). Through the sampled array the loads would go through
+		// the texture cache, which does not see the stores of overlapping pixels before them, so
+		// they read through the storage array too (coherent under the interlock).
+		const bool storage_reads = sampled_only && storage_only == false &&
+		                           ShaderRecompiler::IR::BindlessStorageImagesEnabled() &&
+		                           m_program.uses_pops && m_program.stage == ShaderType::Pixel &&
+		                           IsStoredDescriptorRead(handle);
+		const bool bindless = m_program.bindless_images && (sampled_only || storage_only) &&
 		                      table_source.dword_count == 4u;
 		if (!bindless && table_source.dword_count == 4u) {
 			std::string uses;
@@ -2393,6 +2507,16 @@ private:
 			indirect.table_offset = table_offset;
 			indirect.table_stride = table_stride;
 			indirect.bindless     = true;
+			indirect.storage      = storage_only || storage_reads;
+			if (indirect.storage) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 256) {
+					std::fprintf(stderr, "[bindless-storage-shader] %s %016llx %s pops=%d\n",
+					             std::string(StageName(m_program.stage)).c_str(),
+					             static_cast<unsigned long long>(m_program.shader_hash),
+					             storage_only ? "stores" : "loads", m_program.uses_pops ? 1 : 0);
+				}
+			}
 			material_source       = {};
 		}
 		indirect.table_source = InternSource(table_source);
@@ -2982,6 +3106,64 @@ private:
 		}
 	}
 
+	// G6 table-read exclusions (11-12). A table read uses the descriptor the GPU computes, so:
+	// 1. its words must not come from S_GETPC: GetShaderBase is 0 in SPIR-V (pcs stay
+	//    shader-relative for the dispatcher), so a V# over the shader's embedded constants
+	//    (3c7a24e9: s_getpc + offset, read with S_BUFFER_LOAD) would point at guest page 0. The
+	//    host evaluates such descriptors with the real shader base; keep them host bindings.
+	// 2. no written handle in the shader may use the same descriptor words: one memory, one path,
+	//    as on the hardware (18cee445's look-back polls flags its own workgroups store through a
+	//    handle built from the same registers; dispatch recovery saves only written bindings).
+	bool HandleUsesShaderBase(const Inst& handle) {
+		std::vector<const Inst*>          pending {&handle};
+		std::unordered_set<const Inst*>   seen {&handle};
+		while (!pending.empty()) {
+			const auto* current = pending.back();
+			pending.pop_back();
+			if (current->GetOpcode() == ValueOpcode::GetShaderBase) {
+				return true;
+			}
+			if (seen.size() > 4096u) {
+				return true; // too deep to tell: stay a host binding
+			}
+			for (size_t arg = 0; arg < current->NumArgs(); arg++) {
+				const auto* next = current->Arg(arg).Resolve().TryInstruction();
+				if (next != nullptr && seen.insert(next).second) {
+					pending.push_back(next);
+				}
+			}
+		}
+		return false;
+	}
+	bool HandleAliasesWrittenHandle(const Inst& handle) {
+		for (auto* block: m_program.blocks) {
+			for (const auto& other: *block) {
+				if (&other == &handle || other.GetOpcode() != ValueOpcode::GetBufferResource ||
+				    other.NumArgs() != handle.NumArgs()) {
+					continue;
+				}
+				bool same = true;
+				for (size_t arg = 0; arg < handle.NumArgs() && same; arg++) {
+					const auto a = handle.Arg(arg).Resolve();
+					const auto b = other.Arg(arg).Resolve();
+					if (a.IsImmediate() && b.IsImmediate()) {
+						same = a.GetType() == b.GetType() && (a.GetType() != Type::U32 || a.U32() == b.U32());
+					} else {
+						same = !a.IsImmediate() && !b.IsImmediate() &&
+						       a.TryInstruction() == b.TryInstruction();
+					}
+				}
+				if (!same) continue;
+				for (const auto& use: other.Uses()) {
+					if (BufferAccessOf(use.user->GetOpcode()) != BufferAccess::Read) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
 	// True when a value the load returns reaches a resource handle (a descriptor kept in that
 	// buffer): the host evaluates such descriptors from the loaded bytes, so the load must stay
 	// a host-visible binding (KYTY_GPU_RESOURCES). The instructions that feed any handle are
@@ -3101,10 +3283,14 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	// table: the use reads through the GPU address table (KYTY_G6); the resource is table_read
+	// only while every use of it does.
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                   bool table = false) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
 				Merge(m_info.buffers[i], memory, op, pc);
+				m_info.buffers[i].table_read = m_info.buffers[i].table_read && table;
 				return i;
 			}
 		}
@@ -3114,6 +3300,7 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
+		resource.table_read   = table;
 		Merge(resource, memory, op, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
@@ -3135,7 +3322,15 @@ private:
 	}
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
-		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
+		auto resource_class = ImageOpcodeInfoOf(op).resource_class;
+		// Loads of a descriptor the shader stores to under POPS read the storage view
+		// (IndirectDescriptor::storage).
+		if (const auto* descriptor = Source(source);
+		    descriptor != nullptr && descriptor->indirect_descriptor.has_value() &&
+		    descriptor->indirect_descriptor->storage &&
+		    (op == ValueOpcode::ImageRead || op == ValueOpcode::ImageQueryDimensions)) {
+			resource_class = ImageResourceClass::Storage;
+		}
 		const bool atomic64 = ImageOpcodeInfoOf(op).access == ImageAccess::Atomic &&
 		                      memory.data_bits == 64u;
 		const bool dynamic_mip =
@@ -3179,6 +3374,8 @@ private:
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.unfiltered   = image.unfiltered || op == ValueOpcode::ImageRead ||
+		                   op == ValueOpcode::ImageQueryDimensions;
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {
@@ -3274,18 +3471,64 @@ private:
 		if (buffer != BufferAccess::None) {
 			handle = inst.Arg(0).Resolve().TryInstruction();
 			const auto* indirect = handle == nullptr ? nullptr : FindIndirectDescriptor(*handle);
+			// KYTY_G6=compute: a read-only buffer whose descriptor the host evaluates is read through
+			// the table; it stays a resource (the host needs its range) with no binding patch.
+			if (indirect == nullptr && buffer == BufferAccess::Read && G6Stage(m_program.stage) &&
+			    !(G6NoScalar() && op == ValueOpcode::ReadConstBuffer) &&
+			    memory.kind == (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+			                                                       : ResourceKind::Buffer) &&
+			    memory.SupportsIndirectBufferLoad(op) && !memory.formatted && handle != nullptr &&
+			    handle->GetOpcode() == ValueOpcode::GetBufferResource && handle->NumArgs() == 4 &&
+			    std::ranges::all_of(handle->Uses(), [&](const Use& use) {
+				    const auto use_op = use.user->GetOpcode();
+				    const auto index  = use.user->Flags<MemoryFlags>().index;
+				    return BufferAccessOf(use_op) == BufferAccess::Read &&
+				           !(G6NoScalar() && use_op == ValueOpcode::ReadConstBuffer) &&
+				           index < m_program.memory_info.size() &&
+				           m_program.memory_info[index].SupportsIndirectBufferLoad(use_op) &&
+				           !m_program.memory_info[index].formatted &&
+				           // 3. no GLC/DLC load (a poll of memory another workgroup, queue or the
+				           //    CPU publishes: 383103dc hung polling through the table in v404).
+				           !m_program.memory_info[index].coherent && !FeedsResourceHandle(*use.user);
+			    }) &&
+			    !HandleUsesShaderBase(*handle) && !HandleAliasesWrittenHandle(*handle)) {
+				Inst*    table_handle = nullptr;
+				uint32_t table_source = 0;
+				if (GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
+				              memory.resource * 4u, table_handle, table_source)) {
+					const auto table_resource = AddBuffer(table_source, memory, op, flags.pc, true);
+					if (table_resource == UINT32_MAX) {
+						Fail(flags.pc, "buffer resource limit exceeded");
+					}
+					m_program.memory_info[flags.index].table_resource = table_resource;
+					if (memory.coherent) {
+						// A GLC/DLC load through the table (a polling read): the backend makes it
+						// volatile. Named once per compile to tie a G6 hang to its shader.
+						std::fprintf(stderr, "[g6-coherent] shader %016llx pc 0x%x\n",
+						             static_cast<unsigned long long>(m_program.shader_hash), flags.pc);
+					}
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					m_info.uses_dma                         = true;
+					return;
+				}
+			}
 			if (indirect == nullptr && buffer == BufferAccess::Read &&
 			    memory.kind == (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 			                                                       : ResourceKind::Buffer) &&
 			    memory.SupportsIndirectBufferLoad(op) && handle != nullptr &&
 			    handle->GetOpcode() == ValueOpcode::GetBufferResource && handle->NumArgs() == 4 &&
-			    GpuResources(m_program.shader_hash) &&
+			    GpuResources(m_program.shader_hash) && GpuResourcesStage(m_program.stage) &&
 			    std::ranges::all_of(handle->Uses(), [&](const Use& use) {
 				    const auto use_op = use.user->GetOpcode();
 				    const auto index  = use.user->Flags<MemoryFlags>().index;
+				    // Formatted loads stay host bindings unless KYTY_GPU_RESOURCES_FORMATTED=1: in
+				    // the shader they decode the format behind a switch of ~80 cases per component,
+				    // which took the driver minutes to compile (compute dec083415ec94cc6) and costs
+				    // the GPU more than the binding saves the host.
 				    return BufferAccessOf(use_op) == BufferAccess::Read &&
 				           index < m_program.memory_info.size() &&
 				           m_program.memory_info[index].SupportsIndirectBufferLoad(use_op) &&
+				           (!m_program.memory_info[index].formatted || GpuResourcesFormatted()) &&
 				           !FeedsResourceHandle(*use.user);
 			    })) {
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;

@@ -15,6 +15,8 @@ namespace {
 constexpr uint32_t   DescriptorHeapCount = 4096;
 constexpr std::array DescriptorPoolSizes = {
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 65536},
+    // The shader-data buffer as a uniform buffer (KYTY_SHADER_DATA_UBO): one per stage.
+    vk::DescriptorPoolSize {vk::DescriptorType::eUniformBuffer, 16384},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 8192},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 8192},

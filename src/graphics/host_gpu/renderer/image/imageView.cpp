@@ -3,8 +3,12 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageHistory.h"
 
 namespace Libs::Graphics {
+
+// image.cpp (KYTY_FAULT_MAP=1): the registry of live image views.
+void NoteImageView(vk::ImageView view, const Image& image, bool live);
 
 namespace {
 
@@ -389,6 +393,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     view_info.level_count, view_info.base_layer, view_info.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
 	}
+	ImageHistory::NoteView(static_cast<VkImageView>(view), static_cast<VkImage>(image.image));
 	SetVulkanObjectNameF(
 	    m_graphics.device, view,
 	    "Kyty.ImageView[guest=0x{:016x} format={} aspect=0x{:x} mip={}+{} layer={}+{}]",
@@ -396,6 +401,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	    static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 	    normalized.level_count, normalized.base_layer, normalized.layer_count);
 	views.push_back({normalized, view});
+	NoteImageView(view, *this, true);
 	return view;
 }
 

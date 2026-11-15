@@ -16,6 +16,18 @@ void PreferPerformanceCores(const char* name);
 // idxtri/wolverine-perf 861aa3d1: ~40 guest threads compete with them at normal priority.
 void RaiseGpuThreadPriority();
 
+// Below-normal scheduling priority for the calling thread (background work such as the startup
+// shader precompile; Windows only).
+void LowerBackgroundThreadPriority();
+
+// Windows 11 power throttling (EcoQoS) lowers the clocks of, and on hybrid CPUs moves to efficiency
+// cores, threads the system judges to be background work, and stops honouring timer-resolution
+// requests of processes whose window is not visible; on Arrow Lake (Core Ultra 200) under 24H2 this
+// was reported to halve throughput. The emulator opts its whole process out at start (execution
+// speed and timer resolution), so no guest or host thread is throttled. KYTY_POWER_THROTTLING=1
+// leaves the system's default (for an A/B). Windows only; logs one line.
+void OptOutOfPowerThrottling();
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_

@@ -363,7 +363,10 @@ void PlayGo::Open(const std::filesystem::path& file_name) {
 
 	m_f.Read(&magic1, 4);
 
-	if (magic1 != 0x6f676c70) {
+	// "plgo" (PS4) or "plgx" (PS5 packages, e.g. Wolverine): the chunk count is at offset 10 in
+	// both. Rejecting "plgx" left PlayGo unsupported, and Wolverine stops at the end of its initial
+	// chunks ("Reached end of initial game content installed", Mac 10-26).
+	if (magic1 != 0x6f676c70 && magic1 != 0x78676c70) {
 		LOGF("invalid file: magic1 = %08" PRIx32 "\n", magic1);
 		return;
 	}

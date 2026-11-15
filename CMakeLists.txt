@@ -368,6 +368,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${local_memory_warmup_shader_header}")
 
+set(bindless_sweep_shader_source "${gpu_tiler_shader_dir}/bindless_sweep.comp")
+set(bindless_sweep_shader_spv "${gpu_tiler_generated_dir}/bindless_sweep.spv")
+set(bindless_sweep_shader_header "${gpu_tiler_generated_dir}/bindless_sweep_spv.h")
+add_custom_command(
+	OUTPUT "${bindless_sweep_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${bindless_sweep_shader_spv}" "${bindless_sweep_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${bindless_sweep_shader_spv}
+	        -DOUTPUT=${bindless_sweep_shader_header}
+	        -DSYMBOL=BINDLESS_SWEEP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${bindless_sweep_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${bindless_sweep_shader_header}")
+
 set(dispatch_indirect_groups_shader_source "${gpu_tiler_shader_dir}/dispatch_indirect_groups.comp")
 set(dispatch_indirect_groups_shader_spv "${gpu_tiler_generated_dir}/dispatch_indirect_groups.spv")
 set(dispatch_indirect_groups_shader_header

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -130,6 +131,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Recorder().beginRendering(rendering);
+	if (RenderStats::Enabled()) {
+		RenderStats::NoteBegin(this, state);
+	}
 	m_render_state = state;
 	m_rendering    = true;
 }
@@ -139,6 +143,9 @@ void CommandBuffer::EndRendering(std::source_location site) const {
 		return;
 	}
 	Recorder().endRendering(site);
+	if (RenderStats::Enabled()) {
+		RenderStats::NoteEnd(this, m_render_state, site);
+	}
 	m_rendering    = false;
 	m_render_state = {};
 }

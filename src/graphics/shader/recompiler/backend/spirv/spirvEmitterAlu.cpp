@@ -364,8 +364,10 @@ uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1)
 	return Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
 }
 
+// The RDNA 2 clamp output modifier takes NaN to 0 (DX10 clamp); FClamp is undefined for a NaN
+// operand, NClamp (NMax then NMin) returns 0 for it.
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+	return EmitExt(state, TypeF32(state), GLSLstd450NClamp,
 	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
 }
 

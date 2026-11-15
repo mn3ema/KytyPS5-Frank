@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <array>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -86,6 +87,14 @@ void Translator::ForceDestination(const Decoder::Instruction& inst,
 	}
 }
 
+void Translator::ScaleDestination(const Decoder::Instruction& inst, uint32_t factor_bits) {
+	const auto operand = OffsetOperand(inst.dst, 0);
+	const auto value   = IR::F32(ReadOperand(operand, IR::Type::F32));
+	float      factor  = 1.0f;
+	std::memcpy(&factor, &factor_bits, sizeof(factor));
+	WriteOperand(operand, ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(factor)}));
+}
+
 void Translator::ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values) {
 	Decoder::Operand reg;
 	reg.kind = Decoder::OperandKind::Vgpr;
@@ -115,7 +124,8 @@ const ProbePc& ProbePcSetting() {
 			       result.count < 3u) {
 				result.kinds[result.count]   = end[0];
 				result.vgprs[result.count++] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
-				if (end != nullptr && *end == ',') {
+				// '+' too: the test chains split their settings on commas.
+				if (end != nullptr && (*end == ',' || *end == '+')) {
 					end++;
 				}
 			}
@@ -123,6 +133,67 @@ const ProbePc& ProbePcSetting() {
 		return result;
 	}();
 	return setting;
+}
+
+const ExportPatchUv& ExportPatchUvSetting() {
+	static const ExportPatchUv setting = [] {
+		ExportPatchUv result;
+		const char*   value = std::getenv("KYTY_EXPORT_PATCH_UV");
+		if (value == nullptr) {
+			return result;
+		}
+		char* end   = nullptr;
+		result.hash = std::strtoull(value, &end, 16);
+		if (end == nullptr || *end != '@') {
+			return result;
+		}
+		result.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		if (end == nullptr || *end != ':') {
+			return result;
+		}
+		end++;
+		for (uint32_t i = 0; i < 4u; i++) {
+			if (end == nullptr || (*end != 'v' && *end != 'u')) {
+				return result;
+			}
+			result.as_uint[i] = *end == 'u';
+			result.regs[i]    = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+			if (end != nullptr && (*end == ',' || *end == '+')) {
+				end++;
+			}
+		}
+		if (end == nullptr || *end != ':') {
+			return result;
+		}
+		result.target = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		result.valid  = true;
+		return result;
+	}();
+	return setting;
+}
+
+void Translator::PatchUvCopy(const ExportPatchUv& setting) {
+	for (uint32_t i = 0; i < 2u; i++) {
+		Decoder::Operand base;
+		base.kind = Decoder::OperandKind::Vgpr;
+		base.reg  = setting.regs[i];
+		Decoder::Operand coord;
+		coord.kind = Decoder::OperandKind::Vgpr;
+		coord.reg  = setting.regs[i + 2u];
+		const auto read = [&](const Decoder::Operand& operand, bool as_uint) {
+			if (as_uint) {
+				return IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32U32, {ReadRawU32(operand)}));
+			}
+			return IR::F32(ReadOperand(operand, IR::Type::F32));
+		};
+		const auto b = read(base, setting.as_uint[i]);
+		const auto c = read(coord, setting.as_uint[i + 2u]);
+		const auto half = ir.Emit(IR::ValueOpcode::FPMul32, {c, IR::Value::F32(0.5f)});
+		Decoder::Operand target;
+		target.kind = Decoder::OperandKind::Vgpr;
+		target.reg  = PatchUvVgpr + i;
+		WriteOperand(target, ir.Emit(IR::ValueOpcode::FPAdd32, {b, half}));
+	}
 }
 
 void Translator::ProbeCopy(const ProbePc& probe) {
@@ -208,6 +279,16 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 	if (forced.hash != 0 && forced.hash == program.shader_hash &&
 	    forced.target == inst.exp.target && forced.component < 4u) {
 		components[forced.component] = IR::Value(forced.value);
+	}
+	const auto& patch_uv = ExportPatchUvSetting();
+	if (patch_uv.valid && patch_uv.hash == program.shader_hash &&
+	    patch_uv.target == inst.exp.target) {
+		for (uint32_t i = 0; i < 2u; i++) {
+			Decoder::Operand source;
+			source.kind           = Decoder::OperandKind::Vgpr;
+			source.reg            = PatchUvVgpr + i;
+			components[i * 2u]    = ReadRawU32(source);
+		}
 	}
 	const auto& probe = ProbePcSetting();
 	// Pixel shaders export the probed registers as MRT0; other stages as parameter 0 (the host

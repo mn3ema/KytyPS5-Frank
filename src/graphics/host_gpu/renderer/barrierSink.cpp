@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/barrierSink.h"
+#include "common/fpsLog.h"
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -169,7 +170,7 @@ void MergePending(CommandState& s, const VkMemoryBarrier2& b) {
 }
 
 void Report() {
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::FpsLogDiagnostics();
 	if (!log) return;
 	static std::atomic<int64_t> last {0};
 	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(

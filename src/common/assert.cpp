@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <mutex>
+#include <cstring>
 #include <string>
 
 #ifdef _WIN32
@@ -65,6 +66,20 @@ static std::string NameAddress(DWORD64 address) {
 	if (SymGetLineFromAddr64(process, address, &line_displacement, &line) != FALSE) {
 		out += fmt::format(" [{}:{}]", line.FileName, line.LineNumber);
 	}
+	// The module, for frames outside this executable (a driver or layer DLL names itself only by
+	// its nearest export otherwise).
+	HMODULE module = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCSTR>(address), &module) != FALSE &&
+	    module != nullptr && module != GetModuleHandleA(nullptr)) {
+		char path[MAX_PATH] {};
+		if (GetModuleFileNameA(module, path, sizeof(path)) != 0) {
+			const char* name = std::strrchr(path, '\\');
+			out += fmt::format(" ({}+0x{:x})", name != nullptr ? name + 1 : path,
+			                   address - reinterpret_cast<DWORD64>(module));
+		}
+	}
 	return out;
 }
 #endif
@@ -107,6 +122,35 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 	                   line, HostBacktrace());
 }
 
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#define KYTY_RECOVERABLE_EXITS 1
+#else
+#define KYTY_RECOVERABLE_EXITS 0
+#endif
+
+static thread_local int g_recoverable_depth = 0;
+
+RecoverableExitScope::RecoverableExitScope() {
+	g_recoverable_depth++;
+}
+
+RecoverableExitScope::~RecoverableExitScope() {
+	g_recoverable_depth--;
+}
+
+bool RecoverableExitsSupported() {
+	return KYTY_RECOVERABLE_EXITS != 0;
+}
+
+static void ThrowIfRecoverable([[maybe_unused]] std::string_view text, [[maybe_unused]] const char* file,
+                               [[maybe_unused]] int line) {
+#if KYTY_RECOVERABLE_EXITS
+	if (g_recoverable_depth > 0) {
+		throw RecoverableExit {fmt::format("{} ({}:{})", text, file, line)};
+	}
+#endif
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
 	Subsystems::EmergencyShutdownActive();
@@ -114,20 +158,24 @@ static int DbgReport(const char* title, std::string_view text, const char* file,
 }
 
 int DbgExitIfHandler(const char* expr, const char* file, int line) {
+	ThrowIfRecoverable(expr, file, line);
 	return DbgReport("--- Fatal Error ---", fmt::format("Error: condition ({}) is true", expr),
 	                 file, line);
 }
 
 int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
+	ThrowIfRecoverable(expr, file, line);
 	return DbgReport("--- Fatal Error ---", fmt::format("Not implemented ({})", expr), file, line);
 }
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
+	ThrowIfRecoverable(text, file, line);
 	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
 	return 1;
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
+	ThrowIfRecoverable(text, file, line);
 	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
 	return 1;
 }

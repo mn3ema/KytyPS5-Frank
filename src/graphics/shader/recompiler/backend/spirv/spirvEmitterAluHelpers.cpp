@@ -253,14 +253,16 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitFlushF32DenormAlways(EmitterState& state, uint32_t value) {
-	// Experiment (2026-10-17): KYTY_DENORM_FLUSH=0 leaves FP32 denormals to the host instead of
-	// flushing them in software around every MAD, conversion and flushing compare (about half
-	// the instructions of the heaviest shaders).
+	// The software FP32 denormal flush (the guest flushes denormals in MAD/MAC, conversions,
+	// transcendentals and the flushing compares) is opt-in: KYTY_DENORM_FLUSH=1 or
+	// --exact-denormals. It only changes results below 1.2e-38, and devices without
+	// DenormFlushToZero (NVIDIA) paid ~9 ms of GPU time a frame for it in the jungle
+	// (RTX 5090 Laptop, slot 6: GPU 37.5 -> 28.7 ms; 283e883115bc9cd7 7.3 -> 4.5 ms).
 	static const bool software_flush = [] {
 		const char* v = std::getenv("KYTY_DENORM_FLUSH");
-		return v == nullptr || v[0] != '0';
+		return v != nullptr && v[0] == '1';
 	}();
-	if (!software_flush) {
+	if (!software_flush || state.f32_flushed.contains(value)) {
 		return value;
 	}
 	const auto bits      = state.builder.AllocateId();
@@ -278,6 +280,8 @@ uint32_t EmitFlushF32DenormAlways(EmitterState& state, uint32_t value) {
 	                          ConstantU32(state, 0x00800000u));
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, subnormal, sign_bits, bits);
 	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), ret, selected);
+	state.f32_flushed.insert(selected);
+	state.f32_flushed.insert(ret);
 	return ret;
 }
 

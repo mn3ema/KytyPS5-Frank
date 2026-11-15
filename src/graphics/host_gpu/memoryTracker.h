@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <source_location>
+#include <span>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -36,6 +38,10 @@ inline const bool g_tracker_bitmap =
 inline const bool g_tracker_dirty_walk = std::getenv("KYTY_TRACKER_DIRTY_WALK") == nullptr ||
                                          std::getenv("KYTY_TRACKER_DIRTY_WALK")[0] == '1';
 
+// Which path the last ForEachUploadRange on this thread took (KYTY_SYNC_STATS): 0 clean hint,
+// 1 dirty-region walk, 2 full read-only walk, 3 written.
+inline thread_local int g_upload_path = 0;
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -48,11 +54,63 @@ public:
 	// buffer spanning hundreds of clean regions is answered from a few words. False is
 	// conservative.
 	[[nodiscard]] bool IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept;
+	// The sum of the range's region versions (RegionManager::Version), for ranges of at most
+	// `max_regions` regions that all exist; false otherwise. The versions only grow, so an equal
+	// sum means no page of the range became CPU-dirty or stopped being GPU-dirty.
+	[[nodiscard]] bool RangeVersion(uint64_t vaddr, uint64_t size, uint64_t max_regions,
+	                                uint64_t& version) const noexcept {
+		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+			return false;
+		}
+		const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		if (last - first >= max_regions) {
+			return false;
+		}
+		uint64_t sum = 0;
+		for (uint64_t index = first; index <= last; index++) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr || manager->HasHotPages()) {
+				return false;
+			}
+			sum += manager->Version();
+		}
+		version = sum;
+		return true;
+	}
+
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
-	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// The caller's line goes to the [page-protect] stats (KYTY_FPS_LOG).
+	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size,
+	                                             std::source_location site = std::source_location::current());
+	// Check byte ownership under the region lock before lifting GPU protection. Readback's fast
+	// path uses this with the dirty-range lock, matching ForEachDownloadRange's lock order.
+	template <typename Check>
+	[[nodiscard]] bool UnmarkRegionAsGpuModifiedIf(uint64_t vaddr, uint64_t size, Check&& check) {
+		if (size == 0) {
+			return false;
+		}
+		CheckNotInUploadCallback();
+		ValidateRange(vaddr, size);
+		if (vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE) {
+			return false;
+		}
+		const auto index   = vaddr / TRACKER_REGION_SIZE;
+		auto*      manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return false;
+		}
+		std::scoped_lock lock(manager->lock);
+		if (!check()) {
+			return false;
+		}
+		const auto offset = vaddr % TRACKER_REGION_SIZE;
+		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, size);
+		return true;
+	}
 	// KYTY_READ_SNAPSHOT (RegionManager::SetReadLift).
 	void               LiftReads(uint64_t vaddr, uint64_t size);
 	void               RestoreReads(uint64_t vaddr, uint64_t size);
@@ -194,6 +252,7 @@ public:
 		CheckNotInUploadCallback();
 		if (!is_written && g_tracker_skip_clean && g_tracker_bitmap &&
 		    IsRangeCpuCleanHint(vaddr, size)) {
+			g_upload_path = 0;
 			// What the walk below finds for a read-only range whose regions all exist and are
 			// clean: nothing to copy.
 			const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
@@ -203,6 +262,7 @@ public:
 		}
 		if (!is_written && g_tracker_skip_clean && g_tracker_bitmap && g_tracker_dirty_walk &&
 		    AllRegionsPresent(vaddr, size)) {
+			g_upload_path = 1;
 			// The loop below for a read-only range, with the clean regions skipped by their bitmap
 			// bits rather than by loading each region (the bits mirror the regions' summaries).
 			const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
@@ -217,6 +277,7 @@ public:
 			s_upload_owner = previous_upload_owner;
 			return;
 		}
+		g_upload_path = is_written ? 3 : 2;
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -249,6 +310,53 @@ public:
 			               });
 		}
 		s_upload_owner = previous_upload_owner;
+	}
+
+	// Batch counterpart for sorted [address, size] spans. Region locks are acquired once in
+	// ascending region order, while copy discovery and GPU transitions retain input order.
+	template <typename RangeFunc, typename UploadFunc>
+	void ForEachUploadRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges,
+	                         RangeFunc&& range_func, UploadFunc&& upload_func) {
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		CheckNotInUploadCallback();
+		struct Piece { uint64_t region, offset, bytes; RegionManager* manager; };
+		std::vector<Piece> pieces;
+		std::vector<std::pair<uint64_t, RegionManager*>> managers;
+		for (const auto [vaddr, size]: ranges) {
+			ValidateRange(vaddr, size);
+			uint64_t remaining = size, index = vaddr / TRACKER_REGION_SIZE;
+			uint64_t offset = vaddr % TRACKER_REGION_SIZE;
+			while (remaining != 0) {
+				const auto bytes = std::min(TRACKER_REGION_SIZE - offset, remaining);
+				auto* manager = m_regions[index].load(std::memory_order_acquire);
+				if (manager == nullptr) {
+					manager = GetOrCreateRegion(index);
+				}
+				pieces.push_back({index, offset, bytes, manager});
+				managers.emplace_back(index, manager);
+				remaining -= bytes; ++index; offset = 0;
+			}
+		}
+		std::sort(managers.begin(), managers.end(), [](const auto& a, const auto& b) {
+			return a.first < b.first;
+		});
+		managers.erase(std::unique(managers.begin(), managers.end(),
+		                           [](const auto& a, const auto& b) { return a.first == b.first; }),
+		               managers.end());
+		for (const auto& [region, manager]: managers) { (void)region; manager->lock.lock(); }
+		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		for (const auto& piece: pieces) {
+			piece.manager->template ForEachModifiedRange<DirtySource::Cpu, true>(
+			    piece.manager->GetCpuAddr() + piece.offset, piece.bytes, range_func);
+		}
+		upload_func();
+		for (const auto& piece: pieces) {
+			piece.manager->template ChangeState<DirtySource::Gpu, true>(
+			    piece.manager->GetCpuAddr() + piece.offset, piece.bytes);
+		}
+		s_upload_owner = previous_upload_owner;
+		for (auto it = managers.rbegin(); it != managers.rend(); ++it) it->second->lock.unlock();
 	}
 
 private:

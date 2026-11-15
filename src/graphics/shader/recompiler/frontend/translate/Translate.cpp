@@ -137,8 +137,11 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
 		case Decoder::OperandKind::SharedBase:
-		case Decoder::OperandKind::PrivateBase:
-		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
+		case Decoder::OperandKind::PrivateBase: return IR::U32(IR::Value(0u));
+		case Decoder::OperandKind::PopsExitingWaveId:
+			// Ordering comes from the fragment interlock around the whole shader instead.
+			program.uses_pops = true;
+			return IR::U32(IR::Value(0u));
 		case Decoder::OperandKind::SharedLimit:
 		case Decoder::OperandKind::PrivateLimit: return IR::U32(IR::Value(UINT32_MAX));
 		case Decoder::OperandKind::Sgpr:
@@ -704,8 +707,10 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		return IR::U1(IR::Value(zero || ones));
 	}
 	switch (operand.kind) {
-		case Decoder::OperandKind::Null:
-		case Decoder::OperandKind::PopsExitingWaveId: return IR::U1(IR::Value(true));
+		case Decoder::OperandKind::Null: return IR::U1(IR::Value(true));
+		case Decoder::OperandKind::PopsExitingWaveId:
+			program.uses_pops = true;
+			return IR::U1(IR::Value(true));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarMaskTag(static_cast<IR::ScalarReg>(operand.reg));
 		case Decoder::OperandKind::ExecLo:
@@ -1413,7 +1418,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
-	// Diagnostics: KYTY_FORCE_PC=<shader hash>@<pc>=<dword>[,<dword>...][;<pc>=...] (all hex)
+	// Diagnostics: KYTY_FORCE_PC=<shader hash>@<pc>=<dword>[,<dword>...][;<pc>=...] (all hex;
+	// '+' between dwords and '/' between entries too, for test chains that split on ',' and ';')
 	// overwrites the destinations of instructions with constants, to bisect which path feeds a
 	// wrong result. <pc>:v<n>=... writes VGPRs from v<n> on instead, after that instruction.
 	struct ForcedResult {
@@ -1425,6 +1431,27 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		uint64_t                  hash = 0;
 		std::vector<ForcedResult> results;
 	};
+	// KYTY_SCALE_PC=<shader hash>@<pc>=<f32 bits>[/<pc>=<f32 bits>...] (hex): multiplies the F32
+	// destination of the instruction at <pc> by the factor after it is translated. Same parser
+	// as KYTY_FORCE_PC; a title-specific stopgap when a game-side multiplier is not applied.
+	static const ForcedResults scaled = [] {
+		ForcedResults result;
+		const char*   value = std::getenv("KYTY_SCALE_PC");
+		if (value == nullptr) {
+			return result;
+		}
+		char* end   = nullptr;
+		result.hash = std::strtoull(value, &end, 16);
+		while (end != nullptr && (*end == '@' || *end == ';' || *end == '/')) {
+			ForcedResult entry;
+			entry.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			if (end != nullptr && *end == '=') {
+				entry.values.push_back(static_cast<uint32_t>(std::strtoul(end + 1, &end, 16)));
+			}
+			result.results.push_back(std::move(entry));
+		}
+		return result;
+	}();
 	static const ForcedResults forced = [] {
 		ForcedResults result;
 		const char*   value = std::getenv("KYTY_FORCE_PC");
@@ -1433,13 +1460,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		char* end   = nullptr;
 		result.hash = std::strtoull(value, &end, 16);
-		while (end != nullptr && (*end == '@' || *end == ';')) {
+		while (end != nullptr && (*end == '@' || *end == ';' || *end == '/')) {
 			ForcedResult forced_result;
 			forced_result.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
 			if (end != nullptr && end[0] == ':' && end[1] == 'v') {
 				forced_result.vgpr = static_cast<uint32_t>(std::strtoul(end + 2, &end, 10));
 			}
-			while (end != nullptr && (*end == '=' || *end == ',')) {
+			while (end != nullptr && (*end == '=' || *end == ',' || *end == '+')) {
 				forced_result.values.push_back(
 				    static_cast<uint32_t>(std::strtoul(end + 1, &end, 16)));
 			}
@@ -1452,6 +1479,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	// 1, uncompressed), to see an intermediate value on screen. ProbeVgpr() names the copy.
 	const auto probe = ProbePcSetting();
 	if (probe.hash != 0 && probe.hash == result.shader_hash) {
+		vector_limit = IR::NumVectorRegs;
+	}
+	const auto& patch_uv = ExportPatchUvSetting();
+	if (patch_uv.valid && patch_uv.hash == result.shader_hash) {
 		vector_limit = IR::NumVectorRegs;
 	}
 	for (const auto& cfg_block: cfg.blocks) {
@@ -1485,6 +1516,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			if (probe.hash != 0 && probe.hash == result.shader_hash && probe.pc == instruction.pc &&
 			    probe.count != 0) {
 				translator.ProbeCopy(probe);
+			}
+			if (patch_uv.valid && patch_uv.hash == result.shader_hash &&
+			    patch_uv.pc == instruction.pc) {
+				translator.PatchUvCopy(patch_uv);
+			}
+			if (scaled.hash != 0 && scaled.hash == result.shader_hash) {
+				for (const auto& entry: scaled.results) {
+					if (entry.pc == instruction.pc && !entry.values.empty()) {
+						translator.ScaleDestination(instruction, entry.values[0]);
+					}
+				}
 			}
 			if (forced.hash != 0 && forced.hash == result.shader_hash) {
 				for (const auto& forced_result: forced.results) {

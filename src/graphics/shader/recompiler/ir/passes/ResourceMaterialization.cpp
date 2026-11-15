@@ -149,6 +149,108 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
+} // namespace
+
+uint32_t BufferStrideData(const DescriptorValue& value) {
+	ShaderBufferResource descriptor;
+	if (!DecodeBufferDescriptor(value, descriptor) || descriptor.Type() != 0) {
+		return 0;
+	}
+	auto       packed_stride = descriptor.PackedStride();
+	const auto stride        = packed_stride & 0x3fffu;
+	const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+	if (stride == 0u) {
+		packed_stride &= ~((1u << 14u) | (3u << 16u));
+	} else if (!swizzle) {
+		packed_stride &= ~(3u << 16u);
+	}
+	return packed_stride;
+}
+
+uint32_t BufferFormatData(const DescriptorValue& value) {
+	ShaderBufferResource descriptor;
+	if (!DecodeBufferDescriptor(value, descriptor) || descriptor.Type() != 0) {
+		return 0;
+	}
+	const auto stride = descriptor.PackedStride() & 0x3fffu;
+	const auto format = static_cast<uint32_t>(descriptor.RawFormat()) & 0x7fu;
+	const auto info   = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+	const auto layout = static_cast<uint32_t>(Format::kBufferLayouts.id[format]);
+	const auto type   = layout != 0u ? static_cast<uint32_t>(info.type) : 0u;
+	const auto count  = layout != 0u ? info.component_count : 0u;
+	const auto selects = descriptor.DstSelXYZW();
+	uint32_t   code    = 0;
+	uint32_t   scale   = 1;
+	for (uint32_t component = 0; component < 4; component++) {
+		const auto select = (selects >> (component * 3u)) & 7u;
+		const auto state  = select == 1u                       ? 1u
+		                    : select >= 4u && count != 0u      ? 2u + (select - 4u) % count
+		                                                       : 0u;
+		code += state * scale;
+		scale *= 6u;
+	}
+	return stride | (layout << 14u) | (type << 18u) | (code << 21u);
+}
+
+bool DynamicBufferFormat(const ShaderInfo& info, const ResourceSpecialization& specialization,
+                         uint32_t index) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BUFFER_DYNAMIC_FORMAT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || !BufferStrideAsData() || index >= info.buffers.size() || index >= 0xffu ||
+	    index >= specialization.buffers.size()) {
+		return false;
+	}
+	const auto& base = info.buffers[index];
+	const auto& spec = specialization.buffers[index];
+	if (!base.formatted || base.written || base.atomic || base.table_read ||
+	    base.image_alias != BufferResource::NoImageAlias ||
+	    spec.indirect_root != BufferResource::NoIndirectBuffer || spec.zero_stride_oob ||
+	    (spec.packed_stride & (1u << 14u)) != 0u) {
+		return false;
+	}
+	return std::none_of(specialization.buffers.begin(), specialization.buffers.end(),
+	                    [&](const auto& other) { return other.indirect_root == index; });
+}
+
+static bool Image2DAsArray();
+
+void CanonicalizeDynamicFields(const ShaderInfo& info, ResourceSpecialization& specialization) {
+	for (uint32_t i = 0; i < specialization.buffers.size(); i++) {
+		if (DynamicBufferFormat(info, specialization, i)) {
+			specialization.buffers[i].descriptor_format  = Prospero::BufferFormat::kInvalid;
+			specialization.buffers[i].descriptor_swizzle = DstSel(4, 5, 6, 7);
+		}
+	}
+	for (uint32_t i = 0; i < specialization.images.size() && i < info.images.size(); i++) {
+		auto& image = specialization.images[i];
+		const auto& base = info.images[i];
+		// v418's collapse (a filtered array instruction reads a 2D T# as a one-layer array), for
+		// recordings made before it.
+		if (image.dimension == Decoder::ImageDimension::Dim2D &&
+		    base.dimension == Decoder::ImageDimension::Dim2DArray &&
+		    base.resource_class == ImageResourceClass::Sampled && !base.unfiltered && !base.written &&
+		    !base.atomic && !base.cube && !image.bindless && Image2DAsArray()) {
+			image.dimension = Decoder::ImageDimension::Dim2DArray;
+		}
+		if (DynamicImageClass(info, i, image)) {
+			image.numeric_class = Prospero::TextureNumericClass::Float;
+		}
+		if (DynamicImageLayer(info, i, image)) {
+			image.dimension = Decoder::ImageDimension::Dim2DArray;
+		}
+		if (DynamicImageCube(info, i, image)) {
+			image.cube = false;
+		}
+		if (DynamicImage3D(info, i, image)) {
+			image.dimension = Decoder::ImageDimension::Dim3D;
+		}
+	}
+}
+
+namespace {
+
 struct ReadCapture {
 	SrtRuntime                                  source;
 	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
@@ -537,6 +639,24 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
 			return FailIndirect(__LINE__);
 		}
+		// KYTY_DEBUG_RESOURCES=<hash>: each candidate of that shader's indirect descriptors.
+		if (static const std::string debug = [] {
+			    const char* env = std::getenv("KYTY_DEBUG_RESOURCES");
+			    return env != nullptr ? std::string(env) : std::string();
+		    }();
+		    !debug.empty() && debug.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos) {
+			static std::atomic<uint32_t> printed {0};
+			if (printed.fetch_add(1, std::memory_order_relaxed) < 64) {
+				std::string words;
+				for (uint32_t i = 0; i < dword_count; i++) words += fmt::format(" {:08x}", candidate.dwords[i]);
+				std::fprintf(stderr, "[indirect-cand] %016llx res=%u entry=%u/%u key=%u table=0x%llx+%llu null=%d valid=%d:%s\n",
+				             static_cast<unsigned long long>(program.shader_hash), resource_index, entry,
+				             static_cast<uint32_t>(key_count), key,
+				             static_cast<unsigned long long>(table_base),
+				             static_cast<unsigned long long>(table_size), NullImageDescriptor(candidate) ? 1 : 0,
+				             dword_count == 8u && ValidImageDescriptor(candidate) ? 1 : 0, words.c_str());
+			}
+		}
 		if (!normalize(candidate)) return false;
 		uint32_t ordinal = 0;
 		if (entry == 0) {
@@ -642,6 +762,102 @@ private:
 	uint32_t                                    count = 0;
 };
 
+static bool Image2DAsArray() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_2D_AS_ARRAY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool DynamicImageClassEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_DYNAMIC_CLASS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// A direct, sampled slot the shader only loads from or queries (no filtered sampling: a float
+// sampler on an integer view is undefined, and implicit derivatives need one image per sample).
+static bool LoadOnlyImageSlot(const ShaderInfo& info, uint32_t index, const ResourceSpecialization::Image& image) {
+	if (index >= info.images.size() || index >= 32u) {
+		return false;
+	}
+	const auto& base = info.images[index];
+	if (base.resource_class != ImageResourceClass::Sampled || !base.unfiltered || base.written ||
+	    base.atomic || base.depth_compare || base.cube || base.r128 ||
+	    base.mip_mode == ImageMipMode::Dynamic || image.bindless || image.cube || image.fmask ||
+	    image.indirect_root != ImageResource::NoIndirectImage) {
+		return false;
+	}
+	return std::none_of(info.sampled_pairs.begin(), info.sampled_pairs.end(),
+	                    [&](const auto& pair) { return pair.image == index; });
+}
+
+bool DynamicImageLayer(const ShaderInfo& info, uint32_t index, const ResourceSpecialization::Image& image) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_DYNAMIC_LAYER");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && index < info.images.size() &&
+	       info.images[index].dimension == Decoder::ImageDimension::Dim2DArray &&
+	       (image.dimension == Decoder::ImageDimension::Dim2D ||
+	        image.dimension == Decoder::ImageDimension::Dim2DArray) &&
+	       LoadOnlyImageSlot(info, index, image);
+}
+
+bool DynamicImageCube(const ShaderInfo& info, uint32_t index, const ResourceSpecialization::Image& image) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_DYNAMIC_CUBE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || index >= info.images.size() || index >= 32u) {
+		return false;
+	}
+	const auto& base = info.images[index];
+	return base.resource_class == ImageResourceClass::Sampled && !base.written && !base.atomic &&
+	       !base.cube && base.dimension == Decoder::ImageDimension::Dim2DArray && !image.bindless &&
+	       !image.fmask && image.indirect_root == ImageResource::NoIndirectImage &&
+	       image.dimension == Decoder::ImageDimension::Dim2DArray;
+}
+
+bool DynamicImage3D(const ShaderInfo& info, uint32_t index, const ResourceSpecialization::Image& image) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_DYNAMIC_3D");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || index >= info.images.size() || index >= 32u) {
+		return false;
+	}
+	const auto& base = info.images[index];
+	return base.resource_class == ImageResourceClass::Sampled && !base.written && !base.atomic &&
+	       !base.cube && !base.r128 && base.mip_mode != ImageMipMode::Dynamic &&
+	       base.dimension == Decoder::ImageDimension::Dim3D && !image.bindless && !image.fmask &&
+	       !image.cube && image.indirect_root == ImageResource::NoIndirectImage &&
+	       (image.dimension == Decoder::ImageDimension::Dim3D ||
+	        image.dimension == Decoder::ImageDimension::Dim2D) &&
+	       !DynamicImageClass(info, index, image);
+}
+
+bool DynamicImageClass(const ShaderInfo& info, uint32_t index, const ResourceSpecialization::Image& image) {
+	if (!DynamicImageClassEnabled() || !LoadOnlyImageSlot(info, index, image) ||
+	    image.conversion_format != Prospero::BufferFormat::kInvalid ||
+	    (image.numeric_class != Prospero::TextureNumericClass::Float &&
+	     image.numeric_class != Prospero::TextureNumericClass::Uint)) {
+		return false;
+	}
+	switch (image.dimension) {
+		case Decoder::ImageDimension::Dim1D:
+		case Decoder::ImageDimension::Dim1DArray:
+		case Decoder::ImageDimension::Dim2D:
+		case Decoder::ImageDimension::Dim2DArray:
+		case Decoder::ImageDimension::Dim3D: break;
+		default: return false;
+	}
+	return true;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization,
                                         bool                    float_image_atomics) {
@@ -667,6 +883,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			// v421 (Fable, census leftovers): a null T# reads zeros whatever its shape, so it takes
+			// the dimension the instruction samples (the host binds a null image of that view type,
+			// NullImageDescription) instead of making a 2D variant next to the array/3D/1D one.
+			if (!image.bindless && !base.cube && Image2DAsArray() &&
+			    (base.dimension == Decoder::ImageDimension::Dim1D ||
+			     base.dimension == Decoder::ImageDimension::Dim1DArray ||
+			     base.dimension == Decoder::ImageDimension::Dim2DArray ||
+			     base.dimension == Decoder::ImageDimension::Dim3D)) {
+				image.dimension = base.dimension;
+			}
 			if (image.bindless) {
 				// No one descriptor describes a bindless image: keep the dimension the
 				// instruction samples, which picks the set-1 array.
@@ -687,6 +913,20 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]));
 		}
 		image.dimension = descriptor_dimension;
+		// v418 (zero-compile plan, census: 2D vs 2D-array was the largest variant field): an array
+		// instruction that only samples a 2D T# reads it as a one-layer 2D array (the host binds a
+		// 1-layer 2D_ARRAY view, descriptors.cpp). Hardware addresses a 2D T# without the slice and
+		// filtered sampling clamps the layer to 0, so the result is the same and the shader needs
+		// one variant for both. Texel loads and size queries keep the 2D type (an out-of-range
+		// layer is undefined there). KYTY_IMAGE_2D_AS_ARRAY=0 turns it off.
+		if (descriptor_dimension == Decoder::ImageDimension::Dim2D &&
+		    base.dimension == Decoder::ImageDimension::Dim2DArray &&
+		    base.resource_class == ImageResourceClass::Sampled && !base.unfiltered && !base.written &&
+		    !base.atomic && !base.cube && Image2DAsArray() &&
+		    static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
+		        Prospero::ImageType::kColor2D) {
+			image.dimension = Decoder::ImageDimension::Dim2DArray;
+		}
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
@@ -740,6 +980,24 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail(
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
+		}
+		// v429: a load-only slot reads either class through its two bindings (DynamicImageClass):
+		// the specialization keeps Float, the draw tells the shader which binding holds the T#.
+		if (base_index == i && DynamicImageClass(program.info, i, image)) {
+			image.numeric_class = Prospero::TextureNumericClass::Float;
+		}
+		// v430: an array instruction's load-only slot is a 2D array whatever its T# (2D or array):
+		// the draw tells the shader to read layer 0 of a 2D T# (DynamicImageLayer).
+		if (base_index == i && DynamicImageLayer(program.info, i, image)) {
+			image.dimension = Decoder::ImageDimension::Dim2DArray;
+		}
+		// v431: a cube T# under an array instruction shares the 2D-array module (DynamicImageCube).
+		if (base_index == i && DynamicImageCube(program.info, i, image)) {
+			image.cube = false;
+		}
+		// v433: a 3D instruction's slot shares the 3D module for a 3D or 2D T# (DynamicImage3D).
+		if (base_index == i && DynamicImage3D(program.info, i, image)) {
+			image.dimension = Decoder::ImageDimension::Dim3D;
 		}
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
@@ -2510,10 +2768,23 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		}
 		auto& buffer         = specialization.buffers[i];
 		buffer.packed_stride = packed_stride;
+		const bool null_descriptor =
+		    std::all_of(descriptor_value.dwords.begin(), descriptor_value.dwords.begin() + 4,
+		                [](uint32_t word) { return word == 0u; });
 		buffer.descriptor_format =
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		if (BufferStrideAsData()) {
+			// v424: stride and index stride are per-draw data (BufferStrideData below); only the
+			// swizzle enable and ADD_TID stay in the specialization. A null V# (all zero) reads
+			// zeros through the zero bound length whatever its stride, so it is not specialized
+			// as zero-stride either (one variant with the real buffer's).
+			buffer.packed_stride &= (1u << 14u) | (1u << 20u);
+			if (null_descriptor) {
+				buffer.zero_stride_oob = false;
+			}
+		}
 		buffer.gpu_records_flat   = gpu_records_flat;
 		buffer.gpu_records_add_flat = gpu_records_add_flat;
 		buffer.gpu_records_add      = gpu_records_add;
@@ -2590,6 +2861,28 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 				}();
 				if (!null_writes || image.read || image.atomic || !image.written) {
 					return FailIndirect(__LINE__);
+				}
+				if (static const std::string debug = [] {
+					    const char* env = std::getenv("KYTY_DEBUG_RESOURCES");
+					    return env != nullptr ? std::string(env) : std::string();
+				    }();
+				    !debug.empty() &&
+				    debug.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos) {
+					static std::atomic<uint32_t> printed_debug {0};
+					if (printed_debug.fetch_add(1, std::memory_order_relaxed) < 16) {
+						DescriptorValue material_value, table_value;
+						const bool m = indirect.material_source != UINT32_MAX &&
+						               clean.EvaluateDescriptor(indirect.material_source, material_value);
+						const bool t = clean.EvaluateDescriptor(indirect.table_source, table_value);
+						std::fprintf(stderr,
+						             "[null-write-why] %016llx image %u line=%d material(%d,n=%u)=%08x %08x %08x %08x "
+						             "table(%d,n=%u)=%08x %08x %08x %08x\n",
+						             static_cast<unsigned long long>(program.shader_hash), i, g_indirect_failure_line,
+						             m ? 1 : 0, material_value.dword_count, material_value.dwords[0],
+						             material_value.dwords[1], material_value.dwords[2], material_value.dwords[3],
+						             t ? 1 : 0, table_value.dword_count, table_value.dwords[0], table_value.dwords[1],
+						             table_value.dwords[2], table_value.dwords[3]);
+					}
 				}
 				snapshot.flattened_srt.resize(srt_size);
 				snapshot.images.resize(image_count);
@@ -2674,12 +2967,35 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		bool                                          print = false;
 		{
 			std::lock_guard lock(printed_mutex);
-			print = printed_per_shader[program.shader_hash]++ < 3;
+			static const uint32_t limit = [] {
+				const char* env = std::getenv("KYTY_DEBUG_RESOURCES_N");
+				return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 3u;
+			}();
+			print = printed_per_shader[program.shader_hash]++ < limit;
 		}
 		if (print) {
 			std::string text = fmt::format("[debug-res] {:016x} images={} samplers={} buffers={}\n",
 			                               program.shader_hash, snapshot.images.size(),
 			                               snapshot.samplers.size(), snapshot.buffers.size());
+			for (size_t i = 0; i < program.info.images.size(); i++) {
+				const auto& image  = program.info.images[i];
+				const auto* source = Source(program, image.source);
+				text += fmt::format("  info{} pc=0x{:x} dim={} read={} written={} mips={} src={} n={} ind={}",
+				                    i, image.first_use_pc, static_cast<int>(image.dimension),
+				                    image.read ? 1 : 0, image.written ? 1 : 0, image.mip_count,
+				                    image.source, source != nullptr ? source->dword_count : 0u,
+				                    source != nullptr && source->indirect_descriptor.has_value() ? 1 : 0);
+				if (source != nullptr && source->indirect_descriptor.has_value()) {
+					const auto& ind = *source->indirect_descriptor;
+					text += fmt::format(" mat={} table={} sel={}+{} tab={}*{} shift={} key>>{}&{:x} "
+					                    "bindless={} srcs={}",
+					                    ind.material_source, ind.table_source, ind.selector_offset,
+					                    ind.selector_stride, ind.table_offset, ind.table_stride,
+					                    ind.selector_shift, ind.key_shift, ind.key_mask,
+					                    ind.bindless ? 1 : 0, ind.sources.size());
+				}
+				text += "\n";
+			}
 			for (size_t i = 0; i < snapshot.images.size(); i++) {
 				const auto& d = snapshot.images[i].dwords;
 				const auto  w = ((d[2] >> 14u) & 0x3fffu) + 1u;
@@ -2713,6 +3029,13 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	if (!BuildResourceSpecialization(program, snapshot, specialization,
 	                                 runtime.float_image_atomics)) {
 		return FailIndirect(__LINE__);
+	}
+	// v432: read-only formatted buffers read their format and selects from the draw.
+	for (uint32_t i = 0; i < specialization.buffers.size(); i++) {
+		if (DynamicBufferFormat(program.info, specialization, i)) {
+			specialization.buffers[i].descriptor_format  = Prospero::BufferFormat::kInvalid;
+			specialization.buffers[i].descriptor_swizzle = DstSel(4, 5, 6, 7);
+		}
 	}
 	served = trace.FullyServed();
 	trace.Succeeded();
@@ -2815,6 +3138,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();
+	std::vector<uint8_t> dynamic_format(specialization.buffers.size(), 0);
+	for (uint32_t index = 0; index < specialization.buffers.size() && index < original_buffer_count; ++index) {
+		dynamic_format[index] = DynamicBufferFormat(program.info, specialization, index) ? 1u : 0u;
+	}
 	buffers.reserve(specialization.buffers.size());
 	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
 		const auto& source = specialization.buffers[index];
@@ -2834,6 +3161,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.gpu_records_add_flat       = source.gpu_records_add_flat;
 		buffer.gpu_records_add            = source.gpu_records_add;
 		buffer.gpu_records_ssa            = source.gpu_records_ssa;
+		buffer.dynamic_format             = dynamic_format[index] != 0u;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); ++index) {
@@ -2852,6 +3180,11 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			EXIT_IF(source.indirect_root >= original_image_count);
 			images.push_back(images[source.indirect_root]);
 		}
+		// Before the fields below overwrite the plan's (DynamicImageClass reads the plan's cube).
+		const bool dynamic_class = index < original_image_count && DynamicImageClass(program.info, index, source);
+		const bool dynamic_layer = index < original_image_count && DynamicImageLayer(program.info, index, source);
+		const bool dynamic_cube  = index < original_image_count && DynamicImageCube(program.info, index, source);
+		const bool dynamic_3d    = index < original_image_count && DynamicImage3D(program.info, index, source);
 		auto& image                      = images[index];
 		image.numeric_class              = source.numeric_class;
 		image.dimension                  = source.dimension;
@@ -2863,6 +3196,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.bindless                   = source.bindless;
 		image.cube                       = source.cube;
+		image.dynamic_class              = dynamic_class;
+		image.dynamic_layer              = dynamic_layer;
+		image.dynamic_cube               = dynamic_cube;
+		image.dynamic_3d                 = dynamic_3d;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

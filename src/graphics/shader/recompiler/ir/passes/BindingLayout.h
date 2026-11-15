@@ -6,7 +6,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0,
-                      bool lds_storage = false);
+                      bool lds_storage = false, bool clip_space = false);
 
 struct SharedMemoryResources {
 	bool lds = false;

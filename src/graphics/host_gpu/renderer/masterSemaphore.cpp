@@ -1,7 +1,9 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 
 #include "common/assert.h"
@@ -33,12 +35,22 @@ MasterSemaphore::~MasterSemaphore() {
 	}
 }
 
+// When the GPU tick last advanced (steady clock, ns), for device-fault reports: the GPU stops at
+// the fault, seconds before the device loss surfaces.
+std::atomic<int64_t>  g_gpu_progress_ns {0};
+std::atomic<uint64_t> g_gpu_progress_tick {0};
+
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
+	if (known < counter && counter > g_gpu_progress_tick.load(std::memory_order_relaxed)) {
+		g_gpu_progress_tick.store(counter, std::memory_order_relaxed);
+		g_gpu_progress_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+		                        std::memory_order_relaxed);
+	}
 	while (known < counter &&
 	       !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
 	                                         std::memory_order_relaxed)) {
@@ -126,6 +138,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 }
 
 bool MasterSemaphore::WaitFor(uint64_t tick, uint64_t timeout_ns) {
+	const CpuCost::Phase cpu_phase_("MasterSemaphore::WaitFor");
 	if (IsFree(tick)) {
 		return true;
 	}

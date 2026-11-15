@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/LoopGuard.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -92,7 +93,9 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 		}
 	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		if (live_buffers.at(i)) {
+		// G6 (KYTY_G6): a buffer read only through the GPU address table has no Buffer memory
+		// operation, but the host needs its range to keep it present (RenderExecutor::RebindBuffers).
+		if (live_buffers.at(i) || program.info.buffers[i].table_read) {
 			buffers.push_back(i);
 		}
 	}
@@ -117,7 +120,59 @@ bool UsesFlattenedSrt(const Program& program) {
 	       });
 }
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
+bool ClipSpaceData() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CLIP_SPACE_DATA");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool ExportMappingData() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EXPORT_MAPPING_DATA");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool PushDataEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PUSH_DATA");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool StageDescriptorSets() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STAGE_SETS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool ShaderDataUniform() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_DATA_UBO");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool BufferStrideAsData() {
+	// v425 turned it off: at 128 bytes of push constants one data dword per buffer pushed most
+	// stages' shader data into a storage buffer (about 10% fewer fps). v428: on again; with 256
+	// bytes (v426) it costs nothing measurable (g6u_str64b 26.4 fps against 25.8-26.8 without).
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BUFFER_STRIDE_DATA");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage,
+                      bool clip_space) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -134,8 +189,23 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	           });
 	next.srt_verify = SrtVerifyEnabled() && program.stage == ShaderType::Compute &&
 	                  !program.srt_reads.empty();
+	next.loop_guard = !program.dispatcher_fallback && LoopGuardApplies(program.shader_hash);
+	next.clip_space = clip_space && ClipSpaceData();
+	next.buffer_stride_count = BufferStrideAsData() ? static_cast<uint8_t>(std::min<size_t>(program.info.buffers.size(), 0xffu)) : uint8_t {0};
+	next.export_mapping = program.stage == ShaderType::Pixel && ExportMappingData() &&
+	                      std::ranges::any_of(program.export_info, [](const ExportInfo& exp) {
+		                      return exp.kind == ExportTargetKind::Mrt;
+	                      });
+	next.image_flags = 0;
+	for (const auto& image: program.info.images) {
+		next.image_flags |= (image.dynamic_class ? BindingLayout::ImageClassFlags : 0u) |
+		                    (image.dynamic_layer ? BindingLayout::ImageLayerFlags : 0u) |
+		                    (image.dynamic_cube ? BindingLayout::ImageCubeFlags : 0u) |
+		                    (image.dynamic_3d ? BindingLayout::ImageDim3DFlags : 0u);
+	}
 	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	    PushDataEnabled() ? PushData::StartFor(push_data_start_dword, next.ShaderDataDwords())
+	                      : PushData::NoStart;
 
 	if (!buffers.empty()) {
 		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
@@ -160,6 +230,26 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 			     program.info.images[i].mip_count);
 		}
 		resources.insert(resources.end(), count, i);
+		if (program.info.images[i].dynamic_class) {
+			// v429: also in the uint group of its dimension (the second, unsigned-integer binding).
+			auto as_uint          = program.info.images[i];
+			as_uint.numeric_class = Prospero::TextureNumericClass::Uint;
+			const auto uint_kind  = DescriptorBindingForImage(as_uint);
+			if (!uint_kind.has_value() || ImageBindingIndex(*uint_kind) >= image_groups.size()) {
+				EXIT("shader binding layout failed: image %u has no uint binding", i);
+			}
+			image_groups[ImageBindingIndex(*uint_kind)].push_back(i);
+		}
+		if (program.info.images[i].dynamic_3d) {
+			// v433: also in the 2D group of its class (the second binding, for a 2D T#).
+			auto as_2d      = program.info.images[i];
+			as_2d.dimension = Decoder::ImageDimension::Dim2D;
+			const auto kind_2d = DescriptorBindingForImage(as_2d);
+			if (!kind_2d.has_value() || ImageBindingIndex(*kind_2d) >= image_groups.size()) {
+				EXIT("shader binding layout failed: image %u has no 2D binding", i);
+			}
+			image_groups[ImageBindingIndex(*kind_2d)].push_back(i);
+		}
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {

@@ -31,6 +31,20 @@ public:
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	// KYTY_DRAW_PIPE: the draw thread points the command buffer at a packet's copy of the
+	// registers for its draw, and back.
+	struct BoundState {
+		HW::Context*    registers   = nullptr;
+		HW::UserConfig* user_config = nullptr;
+		HW::Shader*     shaders     = nullptr;
+	};
+	[[nodiscard]] BoundState BoundRegisters() const noexcept {
+		return {m_command.m_registers, m_command.m_user_config, m_command.m_shaders};
+	}
+	void RebindRegisters(HW::Context& registers, HW::UserConfig& user_config,
+	                     HW::Shader& shaders) noexcept {
+		m_command.Bind(registers, user_config, shaders);
+	}
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering(std::source_location site = std::source_location::current());
 	void           Flush();
@@ -125,14 +139,28 @@ public:
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	// The last tick whose submission reached vkQueueSubmit (v314): a wait on it from another queue
+	// depends on no further CPU progress.
+	[[nodiscard]] uint64_t VkSubmittedTick() const noexcept {
+		return m_vk_submitted_tick.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	// Waits at most timeout_ns for the GPU to reach a submitted tick; true when it has.
 	bool                           WaitFor(uint64_t tick, uint64_t timeout_ns);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Called on the submitting thread right after every successful vkQueueSubmit of the main
+	// timeline (C4b: bindless translation entries are published there). One hook; null clears.
+	void SetAfterSubmit(Common::UniqueFunction<void> hook) {
+		std::lock_guard lock(m_after_submit_mutex);
+		m_after_submit = std::move(hook);
+	}
 
 private:
+	std::atomic<uint64_t>        m_vk_submitted_tick {0};
+	std::mutex                   m_after_submit_mutex;
+	Common::UniqueFunction<void> m_after_submit;
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);

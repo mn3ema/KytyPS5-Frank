@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/sync.h"
 
 #include "common/assert.h"
+#include "common/floorStats.h"
+#include "common/frameSkips.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -8,13 +10,25 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/presentRt.h"
+#include "graphics/host_gpu/renderer/rtDrawLog.h"
+#include "graphics/host_gpu/renderer/imgTrace.h"
+#include "graphics/host_gpu/renderer/syncToggle.h"
+#include "graphics/host_gpu/renderer/rtSnap.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <cstring>
+#include <string>
+#include <cstdio>
+#include <chrono>
 #include <limits>
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
 
 namespace Libs::Graphics::Sync {
 
@@ -53,6 +67,57 @@ uint64_t ReadReferenceClock() {
 	return value;
 }
 
+// KYTY_GPU_TIMESTAMP_STEP=<reference-clock ticks> (experiment, 100 MHz clock): end-of-pipe
+// timestamps the guest asks the GPU to write come from the host clock when the command processor
+// translates them, so a pass's measured GPU time is the emulator's translation time (tens of
+// milliseconds at 15 fps). An engine that scales its work by measured GPU time sees it is far over
+// budget every frame. With a step, each flip anchors the timestamps at the host clock and every
+// timestamp write in the frame advances them by the step only: the guest's GPU passes look fast.
+// Diagnostic: shows whether the game drops work (decals, shadows) by its GPU-time budget.
+namespace {
+std::atomic<uint64_t> g_timestamp_flips {0};
+} // namespace
+
+void NoteTimestampFlip() {
+	g_timestamp_flips.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t GuestFlipCount() {
+	return g_timestamp_flips.load(std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::Sync
+
+namespace Libs::Graphics::ImgTrace {
+uint64_t CurrentFlip() {
+	return Sync::GuestFlipCount();
+}
+} // namespace Libs::Graphics::ImgTrace
+
+namespace Libs::Graphics::Sync {
+
+uint64_t ReadGpuTimestamp() {
+	static const uint64_t step = [] {
+		const char* value = std::getenv("KYTY_GPU_TIMESTAMP_STEP");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0};
+	}();
+	if (step == 0) {
+		return ReadReferenceClock();
+	}
+	static std::mutex mutex;
+	static uint64_t   anchor_flip = ~uint64_t {0};
+	static uint64_t   last        = 0;
+	std::lock_guard   lock(mutex);
+	const auto        flip = g_timestamp_flips.load(std::memory_order_relaxed);
+	if (flip != anchor_flip) {
+		anchor_flip = flip;
+		last        = std::max(last + step, ReadReferenceClock());
+		return last;
+	}
+	last += step;
+	return last;
+}
+
 enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
 enum class EndOfPipeWriteAction { Write, WriteBack, Interrupt, InterruptWriteBack };
 
@@ -76,6 +141,7 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
                                  uint64_t value, EndOfPipeWriteSize size,
                                  EndOfPipeWriteAction action, int interrupt_event_id = 0,
                                  uint32_t context_id = 0) {
+	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 	EXIT_IF(destination == 0);
 	EXIT_IF(buffer.IsInvalid());
 
@@ -158,6 +224,18 @@ void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
+	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
+	Common::FrameSkips::Flip();
+	NoteTimestampFlip();
+	PresentRt::Flip();
+	RtDrawLog::Flip();
+	SyncToggle::AtFlip(GuestFlipCount());
+	RtSnap::AtFlip(buffer.GetContext());
+	if (SyncToggle::IdleAtFlip()) {
+		// Everything recorded so far, this frame included, has finished on the host GPU before
+		// the flip is submitted; the game's next frame cannot overlap it.
+		(KYTY_SUBMIT_REASON(), buffer.GetContext().GetCommandScheduler().Finish());
+	}
 	for (;;) {
 		uint64_t   request_id = 0;
 		auto&      video_out  = buffer.GetContext().GetVideoOut();
@@ -172,7 +250,20 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			     "\n",
 			     result, handle, index, flip_mode, flip_arg);
 		}
+		// The presenter frees slots under the renderer mutex (KYTY_ASYNC_THREAD holds it here).
+		const RenderContext::UnlockedScope unlocked(buffer.GetContext());
+		const auto wait_begin = std::chrono::steady_clock::now();
+		const auto before     = Common::FloorStats::Enabled() ? video_out.DebugFlipState() : std::string();
 		video_out.WaitForSubmitSlot(handle);
+		if (Common::FloorStats::Enabled()) {
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                    std::chrono::steady_clock::now() - wait_begin)
+			                    .count();
+			if (ms >= 200) {
+				std::fprintf(stderr, "[floor-flip] GPU thread waited %lld ms for a flip slot; queue before: %s\n",
+				             static_cast<long long>(ms), before.c_str());
+			}
+		}
 	}
 }
 
@@ -227,6 +318,7 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 }
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
+	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 	EXIT_IF(buffer.IsInvalid());
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();

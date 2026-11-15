@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <source_location>
+#include <unordered_map>
 #include <unordered_set>
 #include <array>
 #include <memory>
@@ -25,7 +26,11 @@ namespace HW {
 class Context;
 class UserConfig;
 class Shader;
+struct ComputeShaderInfo;
+struct ShaderRegisters;
 } // namespace HW
+
+struct ShaderProgram;
 
 struct GraphicContext;
 struct ShaderBufferResource;
@@ -37,6 +42,9 @@ struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
+namespace DrawPipe {
+struct PreparedPrograms;
+} // namespace DrawPipe
 class CommandScheduler;
 class CommandRecorder;
 struct RenderExecutorTestAccess;
@@ -88,6 +96,7 @@ struct DrawAutoArgs {
 	// With gpu_args_address: the user SGPR (index + 1, 0 = none) START_INST_LOC names, which
 	// the shader loads from the arguments' start instance (the CP writes it on hardware).
 	uint32_t         start_instance_sgpr        = 0;
+	const uint32_t*  indirect_packet             = nullptr;
 };
 
 struct SubmitInfo {
@@ -128,6 +137,9 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering(std::source_location site = std::source_location::current()) const;
+	// Whether a dynamic-rendering instance is open, and with which attachments.
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] const RenderState& CurrentRenderState() const noexcept { return m_render_state; }
 
 	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
 	// this first waits until the thread has run everything queued; hot paths use Recorder().
@@ -178,10 +190,33 @@ public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
+	// KYTY_DRAW_PIPE (drawPipe.h), the command processor: the programs a direct draw's
+	// RefreshShaders would select for these registers, with copies of their snapshots.
+	static bool PrepareDrawProgramsForPipe(RenderContext& context, const HW::Context& ctx,
+	                                       const HW::Shader& sh_ctx, const HW::UserConfig& ucfg,
+	                                       DrawPipe::PreparedPrograms& out);
+	// KYTY_DRAW_PIPE, the draw thread: a direct draw as the command processor would have run it.
+	void RunPipeDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs* index_args,
+	                 const DrawAutoArgs* auto_args);
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
+	// G4 stage 1 (docs/g4_split_plan_20261102.md), the async-compute thread only: a direct
+	// dispatch prepared without the renderer mutex (registers copied, program looked up in the
+	// thread's own program cache, resource snapshot copied) and queued on this thread; the queue
+	// is recorded in order by CommitQueuedDispatches, under the mutex, before the thread's next
+	// packet that needs the renderer.
+	void QueueDispatchDirect(uint64_t submit_id, const HW::ComputeShaderInfo& cs_regs,
+	                         const HW::ShaderRegisters& sh_regs, uint32_t thread_group_x,
+	                         uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	// The same for DISPATCH_INDIRECT (KYTY_ASYNC_BATCH_INDIRECT=1).
+	void QueueDispatchIndirect(uint64_t submit_id, const HW::ComputeShaderInfo& cs_regs,
+	                           const HW::ShaderRegisters& sh_regs, uint64_t args_addr, uint32_t mode);
+	void CommitQueuedDispatches(CommandBuffer& buffer);
+	[[nodiscard]] static size_t QueuedDispatchCount() noexcept;
+	// The CS address of the last queued dispatch (0: none queued).
+	[[nodiscard]] static uint64_t LastQueuedShader() noexcept;
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
@@ -204,10 +239,34 @@ public:
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
+	// KYTY_REBIND_AFTER_JOIN=1 (after chenxiao07/KytyPS5 ed6f063e1 via Jetsku d93c804e): the
+	// bindings resolved again while BufferCache::UnregisterEpoch moved since `epoch` (a later
+	// lookup of the same draw or dispatch joined a buffer an earlier one resolved), at most 4
+	// times; returns whether it resolved them again (off: only reported). Logs the first 16 occurrences and powers of two.
+	bool                           RebindAfterJoin(std::span<PreparedBindings* const> stages,
+	                                               uint64_t& epoch, const char* kind);
+	uint64_t                       m_rebind_epoch = 0; // UnregisterEpoch when the draw's bindings resolved
 	void                           RebindImages(PreparedBindings& bindings);
+	void                           CaptureBuffers(const PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+
+	// KYTY_MULTI_DRAW_REPLAY (RenderStats::MultiDrawReplayActive): around the draws of one
+	// DRAW_INDIRECT_MULTI packet. A draw recorded in full inside it becomes the replay base when
+	// it qualifies; ReplayMultiDraw records a later draw of the packet again from the base, with
+	// only its arguments and the user data the CP wrote changed, when nothing its resources are
+	// resolved from changed and the base's command buffer, rendering and descriptors still hold.
+	// False: draw it in full (nothing was recorded).
+	void BeginMultiDraw();
+	void EndMultiDraw();
+	[[nodiscard]] bool ReplayMultiDraw(uint64_t submit_id, CommandBuffer& buffer,
+	                                   uint32_t vertex_count, uint32_t instance_count,
+	                                   uint32_t first_vertex, uint32_t first_instance);
+	[[nodiscard]] bool ReplayIndirectDraw(uint64_t submit_id, CommandBuffer& buffer,
+	                                      uint64_t gpu_args_address, uint32_t start_instance_sgpr,
+	                                      const uint32_t* packet);
+	void InvalidateIndirectReplay(uint32_t reason);
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -218,6 +277,9 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	// ResolveTexture, plus the second (null) binding of a dynamic-class image (v429).
+	[[nodiscard]] TextureBinding ResolveStageTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                                 const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] TextureBinding FindResolvedTexture(
@@ -250,11 +312,92 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
+	// DispatchIndirect after its program lookup (renderer mutex).
+	void DispatchIndirectRecord(uint64_t submit_id, CommandBuffer& buffer,
+	                            const HW::ComputeShaderInfo& cs_regs, ShaderComputeInputInfo& input_info,
+	                            const ShaderProgram& compute_program, uint64_t args_addr, uint32_t mode);
+	// DispatchDirect after its program lookup: bindings, commit and recording (renderer mutex).
+	void DispatchDirectRecord(uint64_t submit_id, CommandBuffer& buffer,
+	                          const HW::ComputeShaderInfo& cs_regs, ShaderComputeInputInfo& input_info,
+	                          const ShaderProgram& compute_program, uint32_t thread_group_x,
+	                          uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+
+	// KYTY_MULTI_DRAW_REPLAY: called at the end of a draw recorded in full inside a multi-draw.
+	void CaptureReplayBase(CommandBuffer& buffer, const DrawCallInfo& draw, const DrawRenderState& state,
+	                       const DrawEmitInfo& emit, vk::PipelineLayout layout, bool writes,
+	                       vk::Buffer mesh_indirect_buffer = nullptr,
+	                       vk::DeviceSize mesh_indirect_offset = 0,
+	                       const void* gpu_args_buffer = nullptr);
+	// The vertex stage's (commit stage 0) shader data replaced with `data`: uploaded, and the
+	// last commit's descriptors (or push data) issued again. False when the upload moved the
+	// command buffer on (nothing was issued).
+	[[nodiscard]] bool RecommitShaderData(CommandBuffer& buffer, std::span<const uint32_t> data);
+
+	// What the last CommitBindings issued, for RecommitShaderData.
+	struct LastCommit {
+		uint64_t                       generation = 0;
+		vk::PipelineBindPoint          bind_point = vk::PipelineBindPoint::eGraphics;
+		vk::PipelineLayout             layout;
+		vk::DescriptorSetLayout        set_layout;
+		bool                           uses_push_descriptors = false;
+		// KYTY_STAGE_SETS: the pixel shader's set (2); writes [0, pre_writes) go to set 0, the rest
+		// to set 2.
+		vk::DescriptorSetLayout        ps_set_layout;
+		bool                           ps_uses_push = false;
+		size_t                         pre_writes   = 0;
+		bool                           has_push_data         = false;
+		vk::ShaderStageFlags           push_stages;
+		std::array<uint32_t, ShaderRecompiler::IR::PushData::DwordCount> push_dwords {};
+		uint32_t                       push_bytes = 0;
+		// Commit stage 0's shader data: its slot in m_descriptor_buffers (-1: none) and, when it
+		// travels as push data, its first dword there (-1: not push data).
+		int32_t                        stage0_data_slot = -1;
+		int32_t                        stage0_push_start = -1;
+	};
+	LastCommit m_last_commit;
+
+	struct MultiDrawReplayBase {
+		bool                     active = false; // inside a DRAW_INDIRECT_MULTI
+		bool                     valid  = false;
+		uint64_t                 tick   = 0;
+		const CommandBuffer*     buffer = nullptr;
+		RenderState              rendering;
+		uint64_t                 commit_generation = 0;
+		vk::PipelineLayout       layout;
+		ShaderMeshInputInfo      mesh;
+		uint64_t                 vs_params_hash = 0;
+		uint64_t                 vs_shader_hash = 0;
+		uint64_t                 ps_shader_hash = 0;
+		const ShaderRecompiler::IR::CompiledShaderInfo* vs_program = nullptr;
+		std::array<uint32_t, 40> vs_user {};
+		uint32_t                 vs_user_count = 0;
+		uint64_t                 vs_plan_reads = ~0ull;
+		std::array<uint32_t, 32> ps_user {};
+		uint32_t                 ps_user_count = 0;
+		bool                     ps_active     = false;
+		std::vector<uint32_t>    vs_shader_data;
+		std::vector<uint32_t>    bound_data; // the stage's shader data the commit holds now
+		std::vector<uint32_t>    scratch;
+		bool                     indirect = false;
+		uint64_t                 args_run_generation = 0;
+		uint64_t                 buffer_unregister_epoch = 0;
+		const void*              gpu_args_buffer = nullptr;
+		vk::Buffer               mesh_indirect_buffer;
+		vk::DeviceSize           mesh_indirect_offset = 0;
+		uint32_t                 start_instance_sgpr = 0;
+		uint32_t                 indirect_invalid_reason = 1;
+		// Context and user-config registers at capture (bytes): register packets between indirect
+		// draws are allowed only because replay checks the state they leave is the same.
+		std::vector<uint8_t>     ctx_snapshot;
+		std::vector<uint8_t>     ucfg_snapshot;
+		std::vector<uint8_t>     sh_snapshot; // HW::Shader bytes, GS/PS user SGPR values zeroed
+	};
+	MultiDrawReplayBase m_replay;
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
@@ -272,6 +415,9 @@ private:
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
 	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
 	std::vector<ImageId>                       m_bindless_changed;
+	// Images resolved into the bindless storage array (by ImageId index | generation << 32), with
+	// the storage binding a draw that may write them commits again; they stay in the general layout.
+	std::unordered_map<uint64_t, TextureCache::ImageDesc> m_bindless_storage;
 	uint64_t                                   m_bindless_eager_frame = UINT64_MAX;
 	uint32_t                                   m_bindless_eager_left  = 0;
 	bool                                       m_bindless_eager_device_full = false;
@@ -287,6 +433,10 @@ private:
 	std::vector<uint32_t>                 m_verify_srt; // KYTY_SRT_VERIFY: flat SRT with pairs
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
+	std::vector<uint32_t>                 m_draw_bindless_regions; // KYTY_FAULT_MAP draw record
+	// KYTY_FAULT_MAP=1: the last CommitBindings' buffer bindings (and, for dispatches, image
+	// views and bindless regions) into the fault record of the work just noted.
+	void NoteFaultMapBindings(bool with_views) const;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.

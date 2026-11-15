@@ -153,8 +153,10 @@ bool MemoryTracker::TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	return all;
 }
 
-void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
+void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size,
+                                              std::source_location site) {
 	CheckNotInUploadCallback();
+	const ProtectLineScope line_scope {site.line()};
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);

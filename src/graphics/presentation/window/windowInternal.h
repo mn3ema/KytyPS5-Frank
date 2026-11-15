@@ -42,7 +42,9 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
+	// `new_frame`: a guest flip (counted in fps); false for a repeat of the last frame (overlay
+	// refresh, pause), which only refreshes the text.
+	void                                                    UpdateTitle(bool new_frame = true);
 	void                                                    Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);

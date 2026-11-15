@@ -5,6 +5,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -94,8 +95,23 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
 	bool has_writes = false;
+	// Atomics write too: a pass that only marks with atomics (Wolverine's decal-volume PS
+	// fcfb268bca438b2d draws boxes with no colour target) got no barrier, so the pass that reads
+	// the marks saw them half done and a sewer wall's dirt flickered between full and correct.
+	// KYTY_WRITE_BARRIER_ATOMICS=0: plain stores only, as before.
+	static const bool atomics = [] {
+		const char* value = std::getenv("KYTY_WRITE_BARRIER_ATOMICS");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (atomics) {
+		for (const auto& image: program.info.images) {
+			if (image.written || image.atomic || image.atomic64) {
+				return true;
+			}
+		}
+	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		if (!program.info.buffers[i].written) {
+		if (!program.info.buffers[i].written && !(atomics && program.info.buffers[i].atomic)) {
 			continue;
 		}
 		const auto& value = resources.buffers[i];

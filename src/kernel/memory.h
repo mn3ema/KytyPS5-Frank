@@ -181,6 +181,10 @@ MapCost MapCostSnapshot();
 
 // Another module's part of that report (the AMM engine's queued maps).
 void SetUnhandledFaultHook(void (*hook)(uint64_t vaddr));
+// v400: a guest access to memory a still-queued AMM map covers runs that map now (the hardware
+// finishes a map in microseconds; the emulator's ring was 1.5 s behind). True when it did.
+void SetQueuedMapResolver(bool (*resolver)(uint64_t vaddr));
+[[nodiscard]] bool ResolveQueuedMap(uint64_t vaddr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
@@ -188,10 +192,14 @@ void SetUnhandledFaultHook(void (*hook)(uint64_t vaddr));
 // mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
 // so is every range before the kernel's memory is set up (unit tests).
 [[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
+// Diagnostics: every committed guest mapping (start, size), from the kernel's table.
+[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> CommittedRanges();
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// A fault on a page the tracker left stricter than needed (KYTY_LAZY_READ_RELEASE): fixed, retry.
+[[nodiscard]] bool ResolveGpuStaleFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/drawPipe.h"
 
 #include <cstdint>
 #include <source_location>
@@ -127,6 +128,13 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
 	void EmitGlobalBarrier(std::source_location site = std::source_location::current());
+	// The guest's flush/release/suspend barriers: none with SyncToggle::NoGuestBarriers().
+	void EmitGuestBarrier(std::source_location site = std::source_location::current());
+	// v307: a guest partial flush (CS/VS/PS_PARTIAL_FLUSH) as a barrier whose source is the
+	// stage it waits for, when KYTY_PRECISE_FLUSHES=1 or the sync toggle's mode "precise" is on;
+	// otherwise the global barrier.
+	void EmitPartialFlushBarrier(uint32_t event_type,
+	                             std::source_location site = std::source_location::current());
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
@@ -188,6 +196,11 @@ private:
 	// the dispatch is not attempted.
 	[[nodiscard]] bool BeginDispatchDefer();
 	void               EndDispatchDefer();
+	// G4 stage 1, the async-compute thread with KYTY_ASYNC_BATCH (graphicsRun.cpp): the renderer
+	// mutex is held for a run of packets (a segment). Enter takes it if needed, binds this
+	// processor and records the dispatches queued since; Leave records them and releases it.
+	void               AsyncSegmentEnter();
+	void               AsyncSegmentLeave();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -210,6 +223,8 @@ private:
 	uint64_t m_num_instances_args = 0;
 	uint32_t m_start_instance_register = 0;
 	void     WriteIndirectStartInstance(uint32_t start_instance);
+	bool     PipeDraw(DrawPipe::Kind kind, const DrawIndexArgs* index_args,
+	                  const DrawAutoArgs* auto_args);
 	[[nodiscard]] uint32_t NumInstances();
 
 	uint32_t m_de_count    = 0;

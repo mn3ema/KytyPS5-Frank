@@ -19,9 +19,12 @@
 #include <atomic>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <random>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -400,6 +403,26 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+
+namespace {
+// KYTY_LOG_IO_FAIL=1: print every guest path that fails to open/stat (once per path) to stderr, to
+// spot assets the game asks for that the dump or the mount table cannot provide.
+void LogIoFail(const char* what, const char* path, int error) {
+	static const bool enabled = std::getenv("KYTY_LOG_IO_FAIL") != nullptr;
+	if (!enabled || path == nullptr) {
+		return;
+	}
+	static std::mutex              mutex;
+	static std::vector<std::string> seen;
+	std::lock_guard                lock(mutex);
+	if (std::find(seen.begin(), seen.end(), std::string(path)) != seen.end() || seen.size() > 20000) {
+		return;
+	}
+	seen.emplace_back(path);
+	std::fprintf(stderr, "[io-fail] %s %s -> %08x\n", what, path, static_cast<uint32_t>(error));
+}
+} // namespace
+
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
@@ -466,6 +489,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	file->real_name = g_mount_points->ResolvePath(file->name);
 	if (file->real_name.empty()) {
 		g_files->DeleteDescriptor(descriptor);
+		LogIoFail("open(unmounted)", path, KERNEL_ERROR_ENOENT);
 		return KERNEL_ERROR_ENOENT;
 	}
 	if (Common::IsArchivePath(file->real_name) &&
@@ -486,6 +510,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
 		g_files->DeleteDescriptor(descriptor);
+		LogIoFail("open", path, KERNEL_ERROR_ENOENT);
 		return KERNEL_ERROR_ENOENT;
 	}
 
@@ -908,6 +933,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	const auto info = Common::File::GetInfo(real_file_name);
 	if (!info) {
 		LOGF("\t file not found\n");
+		LogIoFail("stat", path, KERNEL_ERROR_ENOENT);
 		return KERNEL_ERROR_ENOENT;
 	}
 

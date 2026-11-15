@@ -930,7 +930,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		DiagLockGuard lock(m_mutex, __func__);
+		DiagSharedLockGuard lock(m_mutex, __func__);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return vaddr >= range.first && vaddr + size <= range.first + range.second;
 		});
@@ -940,7 +940,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		DiagLockGuard lock(m_mutex, __func__);
+		DiagSharedLockGuard lock(m_mutex, __func__);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
 		});
@@ -994,7 +994,7 @@ public:
 			return false;
 		}
 
-		DiagLockGuard lock(m_mutex, __func__);
+		DiagSharedLockGuard lock(m_mutex, __func__);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 

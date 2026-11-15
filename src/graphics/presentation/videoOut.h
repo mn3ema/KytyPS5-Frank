@@ -8,6 +8,7 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <string>
 
 namespace Libs::Graphics {
 class CommandBuffer;
@@ -39,6 +40,8 @@ public:
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(int handle, int index);
+	// The flip queue's requests (id, state, source, buffer), for stall diagnostics.
+	[[nodiscard]] std::string DebugFlipState();
 
 	[[nodiscard]] Impl& State() noexcept;
 

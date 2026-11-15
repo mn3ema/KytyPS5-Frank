@@ -55,6 +55,28 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		}
 		expected[static_cast<size_t>(*kind)].insert(expected[static_cast<size_t>(*kind)].end(),
 		                                            count, i);
+		if (program.info.images[i].dynamic_class) {
+			// v429: also in the uint group (BindingLayout).
+			auto as_uint          = program.info.images[i];
+			as_uint.numeric_class = Prospero::TextureNumericClass::Uint;
+			const auto uint_kind  = IR::DescriptorBindingForImage(as_uint);
+			if (!uint_kind.has_value()) {
+				Fail(program, "native shader plan has a dynamic-class image without a uint group");
+			}
+			present[static_cast<size_t>(*uint_kind)] = true;
+			expected[static_cast<size_t>(*uint_kind)].push_back(i);
+		}
+		if (program.info.images[i].dynamic_3d) {
+			// v433: also in the 2D group of its class (BindingLayout).
+			auto as_2d      = program.info.images[i];
+			as_2d.dimension = Decoder::ImageDimension::Dim2D;
+			const auto kind_2d = IR::DescriptorBindingForImage(as_2d);
+			if (!kind_2d.has_value()) {
+				Fail(program, "native shader plan has a dynamic-3D image without a 2D group");
+			}
+			present[static_cast<size_t>(*kind_2d)] = true;
+			expected[static_cast<size_t>(*kind_2d)].push_back(i);
+		}
 	}
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
@@ -320,6 +342,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (memory.kind == IR::ResourceKind::IndirectBuffer &&
 				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
 					requirements.subgroup_local_invocation_id = true;
+					// A coherent table read polls memory the host-bound stores publish: those
+					// bindings stay Coherent, as when the load itself was a host binding.
+					requirements.coherent_buffers |= memory.coherent;
 				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					requirements.coherent_buffers |= memory.coherent;
@@ -489,10 +514,25 @@ uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo
 }
 
 std::atomic_bool     g_image_min_lod {false};
+std::atomic_bool     g_pixel_interlock {false};
+std::atomic<float>   g_max_sampler_lod_bias {0.0f};
 std::atomic_uint32_t g_device_clock_shift {3};
 std::atomic_bool     g_coherent_load_acquire {false};
 std::atomic_bool     g_denorm_ftz32 {false};
+std::atomic_bool     g_robust_buffer_access {false};
 } // namespace
+
+void SetRobustBufferAccess(bool supported) {
+	g_robust_buffer_access.store(supported, std::memory_order_relaxed);
+}
+
+bool GetRobustBufferAccess() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_ROBUST_BUFFER_BOUNDS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed && g_robust_buffer_access.load(std::memory_order_relaxed);
+}
 
 void SetCoherentLoadAcquire(bool enabled) {
 	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
@@ -528,10 +568,23 @@ uint32_t GetDeviceClockShift() {
 
 void SetHostImageFeatures(const HostImageFeatures& features) {
 	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+	g_pixel_interlock.store(features.pixel_interlock, std::memory_order_relaxed);
+	g_max_sampler_lod_bias.store(features.max_sampler_lod_bias, std::memory_order_relaxed);
 }
 
 HostImageFeatures GetHostImageFeatures() {
-	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
+	return {.min_lod         = g_image_min_lod.load(std::memory_order_relaxed),
+	        .pixel_interlock = g_pixel_interlock.load(std::memory_order_relaxed),
+	        .max_sampler_lod_bias = g_max_sampler_lod_bias.load(std::memory_order_relaxed)};
+}
+
+bool UsesPixelInterlock(const IR::Program& program) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_POPS_INTERLOCK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && program.uses_pops && program.stage == ShaderType::Pixel &&
+	       g_pixel_interlock.load(std::memory_order_relaxed);
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

@@ -18,6 +18,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cstdlib>
 #include <atomic>
@@ -49,6 +50,9 @@ struct ShaderMapEntry {
 	ShaderMappedData data;
 	uint64_t hash;
 };
+// KYTY_SHADER_CREATE_LOG (libs/agc.cpp): shader addresses whose first use was logged.
+static std::unordered_set<uint64_t>* g_shader_first_use = nullptr;
+
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
@@ -78,6 +82,9 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	}
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {mapped, hash};
+	if (g_shader_first_use != nullptr) {
+		g_shader_first_use->erase(addr); // a new shader at a reused address
+	}
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -86,6 +93,14 @@ static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		if (ShaderCreateLogEnabled() &&
+		    (g_shader_first_use == nullptr ? (g_shader_first_use = new std::unordered_set<uint64_t>()) : g_shader_first_use)
+		        ->insert(addr)
+		        .second) {
+			std::fprintf(stderr, "[shader-first-use] t=%.3f hash=%016" PRIx64 " type=%u (%s)\n",
+			             ShaderCreateLogSeconds(), iter->second.hash,
+			             static_cast<uint32_t>(iter->second.data.type), label);
+		}
 		return iter->second;
 	}
 
@@ -234,6 +249,7 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	// EXIT_NOT_IMPLEMENTED(ps.m_spiPsInControl != 0x00000000);
 	constexpr uint32_t baryc_persp_mask =
 	    0x00000003u | 0x00000030u | 0x00000300u | 0x00003000u;
+	// Bits 17:16 POS_FLOAT_LOCATION, 20 POS_FLOAT_ULC, 24 FRONT_FACE_ALL_BITS (the name is historic).
 	constexpr uint32_t baryc_linear_mask = 0x00030000u | 0x00300000u | 0x03000000u;
 	constexpr uint32_t baryc_known_mask  = baryc_persp_mask | baryc_linear_mask;
 	EXIT_NOT_IMPLEMENTED((sh.baryc_cntl & ~baryc_known_mask) != 0);
@@ -566,6 +582,16 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
 	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
 	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;
+	// SPI_BARYC_CNTL bit 24 FRONT_FACE_ALL_BITS (AMD register spec): 0 = sign bit, +1.0f front and
+	// -1.0f back (DX9); 1 = the whole VGPR is 1 front, 0 back (WGF). Shaders built for 1/0 test
+	// `v_cmp_eq_u32 0, front_face`, which never matches +/-1.0f bits, so back faces looked front.
+	// KYTY_FRONT_FACE_LEGACY=1: always +/-1.0f, the old behaviour (diagnostics).
+	static const bool front_face_legacy = [] {
+		const char* value = std::getenv("KYTY_FRONT_FACE_LEGACY");
+		return value != nullptr && value[0] == '1';
+	}();
+	ps_info.ps_front_face_all_bits =
+	    ps_info.ps_front_face && !front_face_legacy && (sh.baryc_cntl & 0x01000000u) != 0;
 	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
 	ps_info.ps_sample_shading            = (active_inputs & 0x00000011u) != 0;
 	ps_info.ps_no_perspective            = (sh.ps_input_ena & sh.ps_input_addr & 0x00000020u) != 0;
@@ -649,7 +675,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
-	if (info.clip_space.enabled) {
+	// v422: per-draw data unless KYTY_CLIP_SPACE_DATA=0 (BindingLayout::clip_space).
+	if (info.clip_space.enabled && !ShaderRecompiler::IR::ClipSpaceData()) {
 		for (const float value: info.clip_space.scale) {
 			key.push_back(std::bit_cast<uint32_t>(value));
 		}
@@ -701,6 +728,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_w));
 	key.push_back(static_cast<uint32_t>(info.ps_front_face));
+	key.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
 	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
@@ -712,7 +740,9 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	key.push_back(info.target_uint_mask);
 	key.push_back(info.target_sint_mask);
-	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
+	// v423: per-draw data unless KYTY_EXPORT_MAPPING_DATA=0 (BindingLayout::export_mapping).
+	for (uint32_t base = 0; base < info.target_export_mapping.size() && !ShaderRecompiler::IR::ExportMappingData();
+	     base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
 			packed |= static_cast<uint32_t>(info.target_export_mapping[base + i].packed)
@@ -856,16 +886,17 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	// The particle ES (4efbcf79c36d8adf) reads the last GS user-data register (slot 28, s36) as an
-	// index into its per-instance records. The game's 29-register SET_SH_REG sometimes leaves stale
-	// command-buffer data in that last dword, which sends the index out of range and draws the
-	// particles as opaque squares. Zero that register for this shader.
+	// index into its per-instance records: it is the draw index, which the CP writes before each
+	// draw of an indexed multi-draw (0, 1, 2, ...; packets of up to 19 draws for Wolverine's scent
+	// trail). Zeroing it made every draw of a packet draw record 0 (a faint trail). Stale values
+	// on other draws are caught by the instance-base guard below. KYTY_PARTICLE_SLOT28=1 restores
+	// the old zeroing (diagnostics).
 	const std::span<const uint32_t> gs_users(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
 	std::span<const uint32_t>       user_data = gs_users;
 	std::array<uint32_t, HW::UserSgprInfo::SGPRS_MAX> gs_users_fixed {};
-	// KYTY_PARTICLE_SLOT28=0 leaves the register as the game set it (diagnostics).
 	static const bool zero_slot28 = [] {
 		const char* value = std::getenv("KYTY_PARTICLE_SLOT28");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	if (zero_slot28 && hash == 0x4efbcf79c36d8adfULL && gs_users.size() > 28u) {
 		std::copy(gs_users.begin(), gs_users.end(), gs_users_fixed.begin());
@@ -1100,6 +1131,19 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	    .partitioning          = (sh.m_vgtTfParam >> 2u) & 0x3u,
 	    .output_topology       = (sh.m_vgtTfParam >> 5u) & 0x3u,
 	};
+	// The guest's OUTPUT_TRIANGLE_CW / _CCW (VGT_TF_PARAM.TOPOLOGY 2 / 3) map directly to
+	// VertexOrderCw / VertexOrderCcw. A swapped mapping once looked right on Wolverine's pond water,
+	// but only because a lowering bug had put a tessellation factor in control point 0's x and
+	// folded most of each patch; with correct patches the direct mapping makes the water's top
+	// back-facing, as the pixel shader needs (above-water path). Changed here so the shader keys
+	// follow it (disk cache included). KYTY_TESS_WINDING_SWAP=1 (diagnostic): the swapped mapping.
+	static const bool winding_swap = [] {
+		const char* value = std::getenv("KYTY_TESS_WINDING_SWAP");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (winding_swap && tess.output_topology >= 2u) {
+		tess.output_topology ^= 1u;
+	}
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
 	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {

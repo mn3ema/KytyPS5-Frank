@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/timeline.h"
+#include "common/fpsLog.h"
 
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -122,6 +124,7 @@ void ReadSet::Add(uint64_t address, const void* data, uint32_t size) {
 // (one dirty-range query per page, as the walk's page cache does); otherwise the range's bytes are
 // read with the exact clean read.
 bool ReadSet::Validate() const {
+	const CpuCost::Phase cpu_phase_("DrawPrep::ReadSet::Validate");
 	KYTY_PROFILER_BLOCK("DrawPrep::Validate");
 	constexpr uint64_t PageSize = 4096;
 	struct Page {
@@ -288,7 +291,12 @@ void LogCountersIfDue() {
 		previous[i]      = value;
 	}
 	const auto c = [&](Counter counter) { return static_cast<unsigned long long>(delta[static_cast<size_t>(counter)]); };
-	static const bool to_stderr = std::getenv("KYTY_FPS_LOG") != nullptr;
+	// KYTY_DRAWPREP_STATS=1 prints the line without the full diagnostics, which change the shader
+	// cache key and so the timing being measured.
+	static const bool to_stderr = Common::FpsLogDiagnostics() || [] {
+		const char* env = std::getenv("KYTY_DRAWPREP_STATS");
+		return env != nullptr && env[0] == '1';
+	}();
 	if (to_stderr) {
 		std::fprintf(stderr,
 		             "[draw-prep] 10 s: scanned %llu prepared %llu skip behind %llu unknown %llu "

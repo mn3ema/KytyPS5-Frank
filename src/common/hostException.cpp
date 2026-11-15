@@ -1,5 +1,7 @@
 #include "common/hostException.h"
 
+#include "common/sampler.h"
+
 #include <atomic>
 #include <cstdio>
 
@@ -153,6 +155,11 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	if (exception_record->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
 		ReportStackOverflow(exception->ContextRecord);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	// The sampler's stack unwinder catches its own faults (Common::Sampler::UnwindStack).
+	if (Common::Sampler::InUnwind()) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 

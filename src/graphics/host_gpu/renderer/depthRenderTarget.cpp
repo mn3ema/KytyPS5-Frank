@@ -1,4 +1,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/htileWatch.h"
+
+#include <cstdlib>
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -231,6 +234,10 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	    (has_htile && !GuestRange {z.htile_data_base_addr, htile_backing_size}.Valid())) {
 		DepthFatal("layered depth backing range is invalid");
 	}
+	if (has_htile) {
+		HtileWatch::NoteDepthTarget(z.htile_data_base_addr, htile_backing_size, depth_address, width,
+		                            height);
+	}
 	TextureCache::ImageDesc desc {};
 	desc.type                 = TextureCache::BindingType::DepthTarget;
 	desc.info.data            = {depth_address, depth_backing_size};
@@ -350,6 +357,17 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_write_enable      = r.depth_test_enable && dc.z_write_enable &&
 	                            !z.depth_view.depth_write_disable && !r.depth_clear_enable;
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
+	// KYTY_DEPTH_EQUAL_AS=<VkCompareOp> (experiment): a depth-equal test without depth writes (a
+	// pass that draws geometry again over its own depth, such as mesh decals) uses that op.
+	// Shows whether such passes lose pixels to depth values that differ in the last bits.
+	static const int equal_as = [] {
+		const char* value = std::getenv("KYTY_DEPTH_EQUAL_AS");
+		return value != nullptr ? std::atoi(value) : -1;
+	}();
+	if (equal_as >= 0 && equal_as <= 7 && r.depth_test_enable && !r.depth_write_enable &&
+	    r.depth_compare_op == vk::CompareOp::eEqual) {
+		r.depth_compare_op = static_cast<vk::CompareOp>(equal_as);
+	}
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();

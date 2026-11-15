@@ -433,6 +433,13 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		DecodeInstruction(code, word_index, program.instructions.back());
 
 		const auto& inst = program.instructions.back();
+		// Code that is not a real program (a source recipe cut short or padded with 0xffffffff)
+		// must end the decode, not index past it (an instruction running past the code would end it
+		// at the boundary below anyway), and a branch target outside the code is not marked: it
+		// wrote outside branch_targets and crashed a later start (fr5 run B, 11-14).
+		if (inst.word_count == 0 || inst.word_count > code.size() - word_index) {
+			EXIT("shader decode: instruction at pc 0x%08x runs past the code", word_index * 4u);
+		}
 		word_index += inst.word_count;
 
 		if (IsDirectBranch(inst.opcode)) {
@@ -440,7 +447,9 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
 			}
-			branch_targets[target_index] = true;
+			if (target_index < code.size()) {
+				branch_targets[target_index] = true;
+			}
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {

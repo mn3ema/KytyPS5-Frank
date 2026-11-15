@@ -1,6 +1,7 @@
 #ifndef KYTY_COMMON_PROFILER_H_
 #define KYTY_COMMON_PROFILER_H_
 
+#include "common/frameSkips.h"
 #include "common/common.h"
 
 #include <atomic>
@@ -93,6 +94,12 @@ struct alignas(64) CounterSlot {
 inline CounterSlot g_counter_slots[static_cast<uint32_t>(Counter::Total)];
 
 inline void Add(Counter counter, int64_t amount = 1) {
+	// KYTY_FRAME_SKIPS: per-flip counts of skipped draws and dispatches (frameSkips.h).
+	if (counter >= Counter::SkippedGaveUp && counter <= Counter::SkippedPipelinePending &&
+	    Common::FrameSkips::Enabled()) {
+		Common::FrameSkips::Skip(static_cast<Common::FrameSkips::Reason>(
+		    static_cast<uint32_t>(counter) - static_cast<uint32_t>(Counter::SkippedGaveUp)));
+	}
 	if (g_counters) {
 		g_counter_slots[static_cast<uint32_t>(counter)].value.fetch_add(amount,
 		                                                                 std::memory_order_relaxed);

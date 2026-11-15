@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
 #include <bit>
@@ -13,6 +14,15 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
 		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
 		                          ConstantU32(state, dword_index));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	}
+	if (state.shader_data_uniform_variable != 0) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassUniform, TypeU32(state)),
+		                          pointer, state.shader_data_uniform_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword_index / 4u), ConstantU32(state, dword_index % 4u));
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	}
@@ -79,6 +89,29 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	return Select(state, TypeU32(state), match, resource, ConstantU32(state, default_resource));
 }
 
+uint32_t StorageBufferStrideData(EmitterState& state, const IR::MemoryInfo& mem) {
+	if (mem.resource >= state.program.bindings.buffer_stride_count) {
+		return 0u;
+	}
+	if (mem.resource < state.buffer_stride_values.size() && state.buffer_stride_values[mem.resource] != 0u) {
+		return state.buffer_stride_values[mem.resource];
+	}
+	return EmitShaderDataDwordLoad(state, state.program.bindings.BufferStrideDword() + mem.resource);
+}
+
+// v424: records x stride in bytes, saturating, with the stride a SPIR-V value (per-draw data).
+uint32_t RecordBytes(EmitterState& state, uint32_t records, uint32_t stride_data) {
+	const auto u32       = TypeU32(state);
+	const auto bool_type = TypeBool(state);
+	const auto max_u32   = ConstantU32(state, UINT32_MAX);
+	const auto stride    = EmitBinaryU32(state, spv::OpBitwiseAnd, stride_data, ConstantU32(state, 0x3fffu));
+	const auto above_one = Binary(state, spv::OpUGreaterThan, bool_type, stride, ConstantU32(state, 1));
+	const auto safe      = Select(state, u32, above_one, stride, ConstantU32(state, 1));
+	const auto limit     = EmitBinaryU32(state, spv::OpUDiv, max_u32, safe);
+	const auto overflow  = Binary(state, spv::OpUGreaterThan, bool_type, records, limit);
+	return Select(state, u32, overflow, max_u32, EmitBinaryU32(state, spv::OpIMul, records, safe));
+}
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -105,6 +138,11 @@ uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryIn
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
+	state.buffer_stride_values.fill(0u);
+	for (uint32_t i = 0; i < state.program.bindings.buffer_stride_count && i < state.buffer_stride_values.size(); i++) {
+		state.buffer_stride_values[i] =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferStrideDword() + i);
+	}
 	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
@@ -158,7 +196,11 @@ void EmitMemoryOffsets(EmitterState& state) {
 			}
 			const uint32_t stride = buffer.packed_stride & 0x3fffu;
 			uint32_t       bytes  = records;
-			if (stride > 1u) {
+			if (resource < state.program.bindings.buffer_stride_count) {
+				IR::MemoryInfo stride_mem {};
+				stride_mem.resource = resource;
+				bytes = RecordBytes(state, records, StorageBufferStrideData(state, stride_mem));
+			} else if (stride > 1u) {
 				const auto overflow = Binary(state, spv::OpUGreaterThan, bool_type, records,
 				                             ConstantU32(state, UINT32_MAX / stride));
 				bytes = Select(state, u32, overflow, max_u32,
@@ -442,6 +484,15 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	// storage indexes bytes or halfwords, 64-bit atomics qwords). A dword length compared with a
 	// byte index dropped every access past the first quarter of the buffer.
 	auto dwords = state.memory_dword_lengths[array_index];
+	// The descriptor range is the bound, to the byte (BufferLengthDword is range / 4): the device
+	// checks it itself, unless a GPU-written record count narrows the bound below.
+	access.device_bounded =
+	    GetRobustBufferAccess() &&
+	    (mem.kind == IR::ResourceKind::Buffer || mem.kind == IR::ResourceKind::ScalarBuffer) &&
+	    mem.resource < state.program.info.buffers.size() &&
+	    state.program.info.buffers[mem.resource].gpu_records_flat ==
+	        IR::BufferResource::NoGpuRecords &&
+	    !state.program.info.buffers[mem.resource].gpu_records_ssa;
 	// gpu_records_ssa: also within the count of the descriptor this access names (the handle's
 	// dword 2, which the shader computes), from the guest base; sums saturate.
 	if ((mem.kind == IR::ResourceKind::Buffer || mem.kind == IR::ResourceKind::ScalarBuffer) &&
@@ -457,7 +508,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 			const auto records   = state.emitting_ctx->Arg(*handle, 2);
 			const uint32_t stride = state.program.info.buffers[mem.resource].packed_stride & 0x3fffu;
 			uint32_t       bytes  = records;
-			if (stride > 1u) {
+			if (mem.resource < state.program.bindings.buffer_stride_count) {
+				bytes = RecordBytes(state, records, StorageBufferStrideData(state, mem));
+			} else if (stride > 1u) {
 				const auto overflow = Binary(state, spv::OpUGreaterThan, bool_type, records,
 				                             ConstantU32(state, UINT32_MAX / stride));
 				bytes = Select(state, u32, overflow, max_u32,
@@ -546,6 +599,12 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
 	return in_bounds;
+}
+
+uint32_t DeviceBoundedIndex(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
+	const auto bytes = (std::max)(access.element_bits / 8u, 1u);
+	const auto last  = (UINT32_MAX / bytes) - 64u;
+	return EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, index, ConstantU32(state, last));
 }
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,

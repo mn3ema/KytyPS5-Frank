@@ -27,6 +27,17 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// v429 (IR::ImageResource::dynamic_class): the binding above is the T#'s view in the group of
+	// its class (uint when real_uint), and alt_* the null image of the other class.
+	// v433 (IR::ImageResource::dynamic_3d) uses the same two bindings: dynamic_class is set (the
+	// image is bound twice), the first occurrence is the 2D group and the second the 3D group, and
+	// real_uint is set when the real view is the second one (a 3D T#).
+	bool                       dynamic_class = false;
+	bool                       real_uint     = false;
+	ImageId                    alt_image_id;
+	vk::ImageView              alt_view   = nullptr;
+	TextureCache::ImageDesc    alt_desc;
+	vk::ImageLayout            alt_layout = vk::ImageLayout::eUndefined;
 };
 
 struct PreparedBindings {
@@ -49,6 +60,12 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	// v422: the draw's screen-space transform (scale x, y, offset x, y, half extent x, y) for a
+	// layout with BindingLayout::clip_space; RebindBuffers writes it at ClipSpaceDword().
+	std::array<float, 6>                  clip_space {};
+	// v423: the draw's colour export mapping (8 x ColorComponentMapping::packed) for a layout with
+	// BindingLayout::export_mapping; RebindBuffers writes it at ExportMappingDword().
+	std::array<uint32_t, 2>               export_mapping {0xe4e4e4e4u, 0xe4e4e4e4u};
 	// Bindless: flattened-SRT words to patch (offset, region, entries) and the heaps whose
 	// resolved images must be readable for this draw (stable: the table keeps heaps in a deque).
 	std::vector<std::array<uint32_t, 3>>  bindless_patches;

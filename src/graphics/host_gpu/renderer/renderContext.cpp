@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/timeline.h"
+#include "common/fpsLog.h"
 
 #include "common/profiler.h"
 
@@ -22,8 +24,171 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace Libs::Graphics {
+
+// vulkanCommon.cpp: run on a device loss reported through RequireVulkanSuccess.
+extern void (*g_device_lost_report)();
+extern void (*g_device_lost_extra)(); // diagnosticCheckpoints.cpp
+extern void (*g_device_fault_guest_scan)(uint64_t lo, uint64_t hi); // diagnosticCheckpoints.cpp
+
+// image.cpp: run before an image's views are destroyed (KYTY_FAULT_MAP=1).
+extern void (*g_image_views_destroying)(const Image& image);
+
+// g_cpu_dirty_epoch when the guest submitted the submission the GPU thread is running (0: unknown).
+std::atomic<uint64_t> g_bda_submission_cpu_epoch {0};
+
+namespace {
+thread_local uint32_t t_renderer_depth    = 0;
+thread_local bool     t_renderer_released = false;
+thread_local RenderContext::LockStats            t_lock_stats;
+thread_local std::chrono::steady_clock::time_point t_released_at;
+RenderContext*        g_render_context    = nullptr;
+} // namespace
+
+namespace {
+// Graphics command-processor threads waiting for the renderer mutex (RenderContext::GraphicsWaiting).
+std::atomic<uint32_t> g_graphics_waiting {0};
+} // namespace
+
+bool RenderContext::PoliteAsync() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_POLITE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool RenderContext::GraphicsWaiting() noexcept {
+	return g_graphics_waiting.load(std::memory_order_acquire) != 0;
+}
+
+void RenderContext::LockRenderer() {
+	t_lock_stats.acquires++;
+	// The graphics thread (the frame's critical path) announces that it waits, so the async
+	// thread hands the mutex over at its next packet instead of finishing its segment.
+	const bool graphics = PoliteAsync() && t_renderer_depth == 0 && GuestGpu::IsGpuThread() &&
+	                      !GuestGpu::IsAsyncThread();
+	if (graphics && !m_mutex.TryLock()) {
+		g_graphics_waiting.fetch_add(1, std::memory_order_acq_rel);
+		const auto begin = std::chrono::steady_clock::now();
+		m_mutex.Lock();
+		g_graphics_waiting.fetch_sub(1, std::memory_order_acq_rel);
+		t_lock_stats.contended++;
+		t_lock_stats.wait_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin)
+		        .count());
+		t_renderer_depth++;
+		return;
+	}
+	if (graphics) {
+		t_renderer_depth++;
+		return;
+	}
+	if (!m_mutex.TryLock()) {
+		const auto begin = std::chrono::steady_clock::now();
+		m_mutex.Lock();
+		t_lock_stats.contended++;
+		t_lock_stats.wait_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin)
+		        .count());
+	}
+	t_renderer_depth++;
+}
+
+RenderContext::LockStats RenderContext::TakeLockStats() noexcept {
+	return std::exchange(t_lock_stats, {});
+}
+
+void RenderContext::UnlockRenderer() {
+	EXIT_IF(t_renderer_depth == 0);
+	t_renderer_depth--;
+	m_mutex.Unlock();
+}
+
+uint32_t RenderContext::ReleaseRenderer() {
+	const auto depth = t_renderer_depth;
+	if (depth == 0) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < depth; i++) {
+		UnlockRenderer();
+	}
+	t_renderer_released = true;
+	t_released_at       = std::chrono::steady_clock::now();
+	LibKernel::Memory::SetGpuReadDelegate(true);
+	return depth;
+}
+
+void RenderContext::ReacquireRenderer(uint32_t depth) {
+	if (depth == 0) {
+		return;
+	}
+	LibKernel::Memory::SetGpuReadDelegate(false);
+	t_renderer_released = false;
+	t_lock_stats.released_ns += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+	                                                         t_released_at)
+	        .count());
+	for (uint32_t i = 0; i < depth; i++) {
+		LockRenderer();
+	}
+}
+
+RenderContext::UnlockedScope::UnlockedScope(RenderContext& context)
+    : m_context(context), m_depth(context.ReleaseRenderer()) {}
+
+RenderContext::UnlockedScope::~UnlockedScope() {
+	if (m_depth != 0) {
+		m_context.ReacquireRenderer(m_depth);
+		GuestGpu::RebindCurrentProcessor();
+	}
+}
+
+bool RenderContext::RendererReleased() noexcept {
+	return t_renderer_released;
+}
+
+bool RenderContext::HoldsRenderer() noexcept {
+	return t_renderer_depth != 0;
+}
+
+void RenderContext::MarkOffLock(bool off) {
+	EXIT_IF(t_renderer_depth != 0);
+	if (off) {
+		t_released_at = std::chrono::steady_clock::now();
+	} else if (t_renderer_released) {
+		t_lock_stats.released_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+		                                                         t_released_at)
+		        .count());
+	}
+	t_renderer_released = off;
+	LibKernel::Memory::SetGpuReadDelegate(off);
+}
+
+RenderContext::ReacquireScope::ReacquireScope(RenderContext& context) {
+	if (t_renderer_released) {
+		m_context = &context;
+		context.ReacquireRenderer(1);
+	}
+}
+
+RenderContext::ReacquireScope::ReacquireScope() {
+	if (t_renderer_released && g_render_context != nullptr) {
+		m_context = g_render_context;
+		m_context->ReacquireRenderer(1);
+	}
+}
+
+RenderContext::ReacquireScope::~ReacquireScope() {
+	if (m_context != nullptr) {
+		m_context->UnlockRenderer();
+		t_renderer_released = true;
+		LibKernel::Memory::SetGpuReadDelegate(true);
+	}
+}
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -33,8 +198,52 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_bindless_table(graphics, m_command_scheduler, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	g_render_context = this;
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
+	};
+	m_buffer_cache.on_cpu_write_range = [this](uint64_t vaddr, uint64_t size) {
+		if (!IsMapped(vaddr, size)) {
+			return;
+		}
+		m_buffer_cache.InvalidateMemory(vaddr, size);
+		m_texture_cache.InvalidateMemory(vaddr, size);
+		m_bindless_table.OnCpuWrite(vaddr, size);
+	};
+	g_device_fault_guest_scan = [](uint64_t lo, uint64_t hi) {
+		if (g_render_context != nullptr && g_render_context->m_bindless_table.Enabled()) {
+			g_render_context->m_bindless_table.DescribeKeysForGuestRange(lo, hi, stderr);
+		}
+	};
+	g_device_lost_extra = [] {
+		if (g_render_context != nullptr) {
+			g_render_context->m_buffer_cache.TakeLoopGuardReport(true);
+		}
+		if (g_render_context != nullptr && g_render_context->m_bindless_table.Enabled() &&
+		    [] { const char* v = std::getenv("KYTY_FAULT_MAP"); return v != nullptr && v[0] == '1'; }()) {
+			g_render_context->m_bindless_table.AuditForFault();
+			g_render_context->m_bindless_table.ReportSweep(0);
+		}
+	};
+	g_device_lost_report = [] {
+		if (g_render_context != nullptr) {
+			DumpDeviceLossDiagnostics(g_render_context->m_graphics);
+		}
+	};
+	g_image_views_destroying = [](const Image& image) {
+		if (g_render_context == nullptr || !g_render_context->m_bindless_table.Enabled()) {
+			return;
+		}
+		std::vector<vk::ImageView> views;
+		for (const auto& cached: image.views) {
+			views.push_back(cached.view);
+		}
+		char what[128];
+		std::snprintf(what, sizeof(what), "a destroyed %ux%u image (fmt %d, guest 0x%llx)",
+		              image.info.extent.width, image.info.extent.height,
+		              static_cast<int>(image.info.pixel_format),
+		              static_cast<unsigned long long>(image.info.data.address));
+		g_render_context->m_bindless_table.ReportHeldViews(views, what);
 	};
 	m_texture_cache.on_image_release = [this](const Image& image) {
 		if (!m_bindless_table.Enabled()) {
@@ -116,12 +325,16 @@ const uint64_t g_fault_granule = FaultGranuleFromEnv();
 } // namespace
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	DrainProtectionHelper(ProtectDrainReason::Fault);
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// A command-processor thread in an off-lock window handles its fault as the GPU thread does,
+	// which needs the renderer.
+	const ReacquireScope reacquire(*this);
 	if (access == PageFaultAccess::Write) {
 		// Diagnostics: KYTY_TRACE_WRITERS=<hex address>:<hex size>: guest CPU write faults in that
 		// range ([cpu-write], first 200), with whether the page holds GPU-written bytes.
@@ -169,8 +382,35 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 
 bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
                                       uint64_t size) const noexcept {
-	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
-	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+	static const bool stats = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	if (!stats) {
+		return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
+		       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+	}
+	// Which check declines a clean-read emulation (KYTY_READBACK_STATS): [clean-read-check].
+	static std::atomic<uint64_t> unmapped {0}, unwatched {0}, dirty {0}, served {0}, next {4096};
+	bool ok = false;
+	if (!IsMapped(vaddr, size)) {
+		unmapped.fetch_add(1, std::memory_order_relaxed);
+	} else if (!m_page_manager.IsReadWatched(fault_vaddr)) {
+		unwatched.fetch_add(1, std::memory_order_relaxed);
+	} else if (!m_buffer_cache.IsCleanForConcurrentRead(vaddr, size)) {
+		dirty.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		served.fetch_add(1, std::memory_order_relaxed);
+		ok = true;
+	}
+	const auto total = unmapped.load() + unwatched.load() + dirty.load() + served.load();
+	auto       due   = next.load(std::memory_order_relaxed);
+	if (total >= due && next.compare_exchange_strong(due, due * 2)) {
+		std::fprintf(stderr,
+		             "[clean-read-check] served=%llu gpu-dirty=%llu not-read-watched=%llu unmapped=%llu\n",
+		             static_cast<unsigned long long>(served.load()),
+		             static_cast<unsigned long long>(dirty.load()),
+		             static_cast<unsigned long long>(unwatched.load()),
+		             static_cast<unsigned long long>(unmapped.load()));
+	}
+	return ok;
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -191,7 +431,69 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+namespace {
+// F4.1 (KYTY_UNMAP_DRAIN=1 restores the old behaviour): a guest unmap used to drain the whole GPU
+// (CommandScheduler::Finish), 28 times a second in the Performance save, ~1.2 ms of waiting each
+// plus the bubble after it. Only one thing an unmap does needs that: dropping a shared buffer,
+// whose Vulkan import points into the guest memory being unmapped and is freed at once
+// (BufferCache::UnmapShared). Everything else is ordered by ticks already: images and buffers
+// over the range are released with DeferRelease after the GPU finished the ticks that used them,
+// GPU-written bytes are downloaded by InvalidateMemory -> ReadMemory, which waits for their own
+// tick, the BDA page table is cleared in command order, and downloads still in flight into the
+// range are waited for (WaitDownloadsLanded, their ticks only) before the range goes.
+bool UnmapDrainAlways() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_UNMAP_DRAIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	return always;
+}
+struct UnmapDrainStats {
+	std::atomic<uint64_t> drained {0}, skipped {0};
+};
+UnmapDrainStats g_unmap_drain_stats;
+void ReportUnmapDrains() {
+	static const bool stats = Common::FpsLogDiagnostics();
+	if (!stats) {
+		return;
+	}
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	const double s = std::chrono::duration<double>(now - last).count();
+	last           = now;
+	std::fprintf(stderr, "[unmap-drain] %.1f/s drained (shared buffer in range), %.1f/s without a drain\n",
+	             static_cast<double>(g_unmap_drain_stats.drained.exchange(0)) / s,
+	             static_cast<double>(g_unmap_drain_stats.skipped.exchange(0)) / s);
+}
+} // namespace
+
+void RenderContext::DrainForUnmap(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	if (!m_command_scheduler.Active()) {
+		return;
+	}
+	bool drain = UnmapDrainAlways();
+	for (size_t i = 0; !drain && i < ranges.size(); i++) {
+		drain = m_buffer_cache.HasSharedBuffersIn(ranges[i].first, ranges[i].second);
+	}
+	if (drain) {
+		g_unmap_drain_stats.drained.fetch_add(1, std::memory_order_relaxed);
+		const auto tick = m_command_scheduler.CurrentTick();
+		(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
+		m_command_scheduler.WaitPriorityOperations(tick);
+	} else {
+		g_unmap_drain_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+		for (const auto& [vaddr, size]: ranges) {
+			m_buffer_cache.WaitDownloadsLanded(vaddr, size);
+		}
+	}
+	ReportUnmapDrains();
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+	m_page_manager.ForgetProtectionFaults(vaddr, size);
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 }
@@ -218,11 +520,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
+		m_page_manager.ForgetStale(vaddr, size);
+		const std::pair<uint64_t, uint64_t> range {vaddr, size};
+		DrainForUnmap({&range, 1});
 		m_buffer_cache.UnmapShared(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
@@ -237,7 +537,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	// KYTY_FPS_LOG: time the GPU-thread round trips of unmaps (each drains the GPU) every 5 s.
-	static const bool stats = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool stats = Common::FpsLogDiagnostics();
 	const auto        begin = std::chrono::steady_clock::now();
 	m_gpu->SendCommandSync(unmap);
 	if (stats) {
@@ -279,12 +579,9 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 		return;
 	}
 	const auto unmap = [this, &mapped] {
-		if (m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
+		DrainForUnmap(mapped);
 		for (const auto& [vaddr, size]: mapped) {
+			m_page_manager.ForgetStale(vaddr, size);
 			m_buffer_cache.UnmapShared(vaddr, size);
 			m_buffer_cache.InvalidateMemory(vaddr, size);
 			m_texture_cache.UnmapMemory(vaddr, size);
@@ -303,6 +600,7 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 }
 
 void RenderContext::PrepareBda() {
+	const CpuCost::Phase cpu_phase_("PrepareBda");
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
@@ -316,12 +614,46 @@ void RenderContext::PrepareBda() {
 	// on the title menu (21 -> 32 fps).
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
 	if (epoch != m_bda_synced_epoch) {
+		// The running submission only reads what the guest wrote before submitting it. The last
+		// walk started at m_bda_synced_epoch: when the guest submitted no later than that, every
+		// page it had dirtied by then was synced (and one written again since faulted, which
+		// moved the epoch past the walk's). The GPU thread runs behind the game, so most
+		// submissions were made before the previous walk (KYTY_BDA_SUBMIT_EPOCH=0: walk anyway).
+		static const bool submit_epoch = [] {
+			const char* value = std::getenv("KYTY_BDA_SUBMIT_EPOCH");
+			return value == nullptr || value[0] != '0';
+		}();
+		// KYTY_BDA_EVERY=1: walk whenever something became CPU-dirty, not once per submission. A
+		// submission can wait on a label and then read what the CPU wrote after it; per-binding
+		// syncs see those writes, buffers read through the table (KYTY_GPU_RESOURCES) do not.
+		static const bool every = [] {
+			const char* value = std::getenv("KYTY_BDA_EVERY");
+			return value != nullptr && value[0] == '1';
+		}();
+		// G6 (KYTY_G6): the table's buffers get no sync per binding, so a WAIT_REG_MEM passed or a
+		// WRITE_DATA since the last walk walks again (g_bda_resync_seq): the CPU may have written
+		// data before the label the submission waited on, after it was submitted, and WRITE_DATA
+		// writes on the CPU in command order (a per-binding sync, made when the GPU thread reaches
+		// the binding, sees both). KYTY_G6_WAIT_SYNC=0: once per submission only.
+		static const bool wait_sync = [] {
+			const char* value = std::getenv("KYTY_G6_WAIT_SYNC");
+			return G6Compute() && (value == nullptr || value[0] != '0');
+		}();
+		const auto waits       = g_bda_resync_seq.load(std::memory_order_relaxed);
+		const bool wait_passed = wait_sync && waits != m_bda_synced_waits;
+		const auto needed      = g_bda_submission_cpu_epoch.load(std::memory_order_relaxed);
+		if (!every && !wait_passed && submit_epoch && needed != 0 && m_bda_synced_epoch != 0 &&
+		    needed <= m_bda_synced_epoch) {
+			m_fault_process_pending = true;
+			return;
+		}
 		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
-		if (submission == m_bda_synced_submission) {
+		if (!every && !wait_passed && submission == m_bda_synced_submission) {
 			m_fault_process_pending = true;
 			return;
 		}
 		m_bda_synced_submission = submission;
+		m_bda_synced_waits      = waits;
 	}
 	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
@@ -411,6 +743,31 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	// v386 [mem-census] every 10 s (KYTY_MEM_CENSUS=0 turns it off): who holds the video memory, to
+	// find what fills the card over a long session (fps fell to ~6 at ~20 min with 22 GB of 24 in use).
+	static const bool census = [] {
+		const char* value = std::getenv("KYTY_MEM_CENSUS");
+		return value == nullptr || value[0] != '0';
+	}();
+	static const auto start = std::chrono::steady_clock::now();
+	static auto       last  = start;
+	if (const auto now = std::chrono::steady_clock::now(); census && now - last >= std::chrono::seconds(10)) {
+		last            = now;
+		auto& graphics  = GetGraphics();
+		const auto gc   = m_texture_cache.GetGcTotals();
+		std::fprintf(stderr,
+		             "[mem-census] t=%.0f device %" PRIu64 "/%" PRIu64 " MB short %" PRIu64 " MB | textures %" PRIu64
+		             " MB (pinned %" PRIu64 ", %zu images, pressure at %" PRIu64 ", evictable %zu; gc freed %" PRIu64
+		             " / %" PRIu64 " MB, bindless %" PRIu64 ", written back %" PRIu64 ", trim runs %" PRIu64 " (backoffs %" PRIu64 ", GPU-written left %" PRIu64 ")"
+		             ") | buffers %" PRIu64 " MB (%zu) |%s\n",
+		             std::chrono::duration<double>(now - start).count(), graphics.GetDeviceMemoryUsage() >> 20u,
+		             graphics.GetTotalMemoryBudget() >> 20u, graphics.MemoryShortfall() >> 20u,
+		             m_texture_cache.TotalUsedMemory() >> 20u, m_texture_cache.PinnedMemory() >> 20u,
+		             m_texture_cache.ImageCount(), m_texture_cache.PressureThreshold() >> 20u,
+		             m_texture_cache.EvictableCount(), gc.freed, gc.freed_mb, gc.bindless, gc.written_back, gc.trim_runs, gc.trim_backoffs, gc.trim_gpu_skipped,
+		             m_buffer_cache.TotalUsedMemory() >> 20u, m_buffer_cache.BufferCount(),
+		             graphics.DescribeDeviceMemory().c_str());
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
@@ -440,6 +797,7 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);

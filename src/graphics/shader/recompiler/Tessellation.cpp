@@ -15,6 +15,9 @@
 #include <utility>
 
 #include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <string>
 #define TESS_LOG(...) do { LOGF(__VA_ARGS__); std::fprintf(stderr, "[tess] " __VA_ARGS__); } while (0)
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -221,6 +224,119 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 	return value;
 }
 
+// The constant an address takes on the lanes a predicated access runs on, or nothing. Exec-masked
+// register writes reach an address as SelectU32(predicate, active, inactive), and definitions
+// made before internal branches as phis: arms that agree, or the arm the access's own predicate
+// selects, decide it. Phi operands that lead back to the phi being evaluated are skipped.
+struct ActiveAddressEvaluator {
+	IR::Value                                        predicate;
+	std::unordered_map<const IR::Inst*, std::optional<uint32_t>> memo;
+	std::unordered_map<const IR::Inst*, bool>        active_phis;
+	static constexpr uint32_t                        Cycle = 0xffffffffu;
+
+	// Cycle marks an operand that only loops back to a phi in progress.
+	std::optional<uint32_t> Evaluate(const IR::Value& value, uint32_t depth = 0) {
+		using namespace IR;
+		const auto resolved = value.Resolve();
+		if (resolved.IsImmediate()) {
+			return resolved.GetType() == Type::U32 ? std::optional<uint32_t>(resolved.U32())
+			                                       : std::nullopt;
+		}
+		const auto* source = resolved.TryInstruction();
+		if (source == nullptr || depth > 64u) {
+			return std::nullopt;
+		}
+		if (const auto found = memo.find(source); found != memo.end()) {
+			return found->second;
+		}
+		if (active_phis.contains(source)) {
+			return Cycle;
+		}
+		const auto result = Compute(*source, depth);
+		if (!result || *result != Cycle) {
+			memo[source] = result;
+		}
+		return result;
+	}
+
+	std::optional<uint32_t> Compute(const IR::Inst& source, uint32_t depth) {
+		using namespace IR;
+		const auto arg = [&](size_t index) { return Evaluate(source.Arg(index), depth + 1u); };
+		const auto plain = [&](size_t index) -> std::optional<uint32_t> {
+			const auto value = arg(index);
+			return value && *value != Cycle ? value : std::nullopt;
+		};
+		switch (source.GetOpcode()) {
+			case ValueOpcode::Phi: {
+				active_phis[&source] = true;
+				std::optional<uint32_t> agreed;
+				bool                    ok = true;
+				for (size_t index = 0; index < source.NumArgs() && ok; index++) {
+					const auto value = arg(index);
+					if (value && *value == Cycle) continue;
+					if (!value || (agreed && *agreed != *value)) {
+						ok = false;
+					} else {
+						agreed = value;
+					}
+				}
+				active_phis.erase(&source);
+				return ok && agreed ? agreed : std::nullopt;
+			}
+			case ValueOpcode::SelectU32: {
+				if (source.Arg(0).Resolve() == predicate.Resolve()) {
+					return plain(1);
+				}
+				const auto active   = plain(1);
+				const auto inactive = plain(2);
+				return active && inactive && *active == *inactive ? active : std::nullopt;
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto base   = plain(0);
+				const auto offset = plain(1);
+				const auto count  = plain(2);
+				if (!base || !offset || !count || *offset >= 32u || *count == 0u) {
+					return std::nullopt;
+				}
+				const auto shifted = *base >> *offset;
+				return *count >= 32u ? shifted : shifted & ((1u << *count) - 1u);
+			}
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto lhs = plain(0);
+				const auto rhs = plain(1);
+				if (!lhs || !rhs) {
+					return std::nullopt;
+				}
+				switch (source.GetOpcode()) {
+					case ValueOpcode::IAdd32: return *lhs + *rhs;
+					case ValueOpcode::ISub32: return *lhs - *rhs;
+					case ValueOpcode::IMul32: return *lhs * *rhs;
+					case ValueOpcode::BitwiseAnd32: return *lhs & *rhs;
+					case ValueOpcode::BitwiseOr32: return *lhs | *rhs;
+					case ValueOpcode::ShiftLeftLogical32:
+						return *rhs < 32u ? std::optional<uint32_t>(*lhs << *rhs) : std::nullopt;
+					default:
+						return *rhs < 32u ? std::optional<uint32_t>(*lhs >> *rhs) : std::nullopt;
+				}
+			}
+			default: return std::nullopt;
+		}
+	}
+};
+
+std::optional<uint32_t> ConstantActiveAddress(const IR::Value& value, const IR::Value& predicate) {
+	ActiveAddressEvaluator evaluator;
+	evaluator.predicate = predicate;
+	const auto result   = evaluator.Evaluate(value);
+	return result && *result != ActiveAddressEvaluator::Cycle ? result : std::nullopt;
+}
+
 } // namespace
 
 bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
@@ -360,15 +476,78 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					          : options.stage != ShaderType::TessellationEvaluation) {
 						return unsupported("a control-point access in the wrong stage");
 					}
-					if (address.IsImmediate() &&
-					    address.U32() >= tess.hs_stride * tess.output_control_points) {
+					// A write past the control points is patch data (the terrain HS a9f31c39ad53f06c
+					// stores its factors there too). Its address can reach here as a select on the
+					// store's EXEC predicate rather than an immediate; taken as a control point it
+					// lands, modulo the stride, on the first dwords of the writer's own control point.
+					auto patch_address = address.IsImmediate() ? std::optional<uint32_t>(address.U32())
+					                                           : std::nullopt;
+					if (!patch_address && write) {
+						patch_address = ConstantActiveAddress(address, predicate);
+					}
+					if (patch_address &&
+					    *patch_address >= tess.hs_stride * tess.output_control_points) {
 						if (!write) {
 							return unsupported("a patch-constant read");
 						}
-						kind = TessellationAttribute::PatchOutput;
+						kind    = TessellationAttribute::PatchOutput;
+						address = Value(*patch_address);
 					}
 				}
 			} else {
+				continue;
+			}
+			// KYTY_TESS_LOG_RING=1: every lowered ring/LDS access, with its kind and address.
+			static const bool log_ring = std::getenv("KYTY_TESS_LOG_RING") != nullptr;
+			if (log_ring && write && kind == TessellationAttribute::ControlOutput) {
+				// The address expression, to see what keeps it from folding.
+				std::string tree;
+				const std::function<void(const Value&, uint32_t)> describe =
+				    [&](const Value& value, uint32_t depth) {
+					    const auto resolved = value.Resolve();
+					    if (resolved.IsImmediate()) {
+						    tree += resolved.GetType() == Type::U32 ? std::to_string(resolved.U32())
+						                                            : std::string("imm");
+						    return;
+					    }
+					    const auto* source = resolved.TryInstruction();
+					    if (source == nullptr) {
+						    tree += "?";
+						    return;
+					    }
+					    tree += ValueOpcodeName(source->GetOpcode());
+					    if (depth >= 5u) {
+						    tree += "(..)";
+						    return;
+					    }
+					    tree += "(";
+					    for (size_t index = 0; index < source->NumArgs() && index < 4u; index++) {
+						    if (index != 0u) tree += ",";
+						    describe(source->Arg(index), depth + 1u);
+					    }
+					    tree += ")";
+				    };
+				describe(address, 0);
+				std::fprintf(stderr, "[tess-ring] HS control write address %s\n", tree.c_str());
+			}
+			if (log_ring) {
+				std::fprintf(stderr, "[tess-ring] %s hash=%016llx %s kind=%u comps=%u offset=%u address=%s\n",
+				             options.stage == ShaderType::Local                 ? "LS"
+				             : options.stage == ShaderType::TessellationControl ? "HS"
+				                                                               : "TES",
+				             static_cast<unsigned long long>(options.shader_hash),
+				             write ? "write" : "read", static_cast<uint32_t>(kind), components,
+				             memory.offset,
+				             address.IsImmediate() ? std::to_string(address.U32()).c_str() : "value");
+			}
+			// KYTY_TESS_PATCH_OUTPUTS=0 (diagnostic): drop the HS's patch-data writes (no TES this
+			// lowering supports reads them).
+			static const bool drop_patch = [] {
+				const char* value = std::getenv("KYTY_TESS_PATCH_OUTPUTS");
+				return value != nullptr && value[0] == '0';
+			}();
+			if (drop_patch && write && kind == TessellationAttribute::PatchOutput) {
+				inst.Invalidate();
 				continue;
 			}
 			const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {

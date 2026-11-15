@@ -17,8 +17,12 @@ namespace Libs::Graphics {
 struct GraphicContext;
 
 struct SystemOverlayVisualState {
-	bool     active;
+	bool     active;   // something is drawn over the game
 	uint64_t revision;
+	// Something changes on its own (dialogs, IME, the trophy toast, the compile progress): the
+	// presenter repeats the last frame at each vblank. A static panel (the shader count) only
+	// needs a repeat when its revision changes.
+	bool     animating = true;
 };
 
 void                     InitializeSystemOverlayInput(SDL_Window* window);

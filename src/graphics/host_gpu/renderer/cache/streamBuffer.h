@@ -81,6 +81,13 @@ public:
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
+	// KYTY_BUFFER_WINDOW_MB: a window buffer is lazily resident - only 64 KB blocks a binding
+	// synced or a BDA fault named have page-table entries and are walked by the BDA sync.
+	bool                  lazy_resident = false;
+	std::vector<uint64_t> resident_blocks;
+	// Bit w set: resident_blocks[w] is all ones (bits past the buffer's end count as resident),
+	// so a range check skips 4,096 resident blocks (256 MB) per summary word.
+	std::vector<uint64_t> resident_full;
 	// The last scheduler tick a draw or dispatch bound the buffer in (the buffer cache's).
 	uint64_t last_use_tick = 0;
 	int    stream_score = 0;

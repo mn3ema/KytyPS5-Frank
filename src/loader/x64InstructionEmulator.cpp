@@ -3,7 +3,10 @@
 #include "common/common.h"
 
 #include <Zydis/Zydis.h>
+#include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -970,13 +973,124 @@ bool IsVectorLoad(ZydisMnemonic mnemonic) {
 	}
 }
 
+
+// x86 condition codes for CMOVcc, from EFLAGS.
+bool ConditionHolds(ZydisMnemonic mnemonic, DWORD flags, bool& known) {
+	const bool cf = (flags & 0x001u) != 0;
+	const bool pf = (flags & 0x004u) != 0;
+	const bool zf = (flags & 0x040u) != 0;
+	const bool sf = (flags & 0x080u) != 0;
+	const bool of = (flags & 0x800u) != 0;
+	known         = true;
+	switch (mnemonic) {
+		case ZYDIS_MNEMONIC_CMOVO: return of;
+		case ZYDIS_MNEMONIC_CMOVNO: return !of;
+		case ZYDIS_MNEMONIC_CMOVB: return cf;
+		case ZYDIS_MNEMONIC_CMOVNB: return !cf;
+		case ZYDIS_MNEMONIC_CMOVZ: return zf;
+		case ZYDIS_MNEMONIC_CMOVNZ: return !zf;
+		case ZYDIS_MNEMONIC_CMOVBE: return cf || zf;
+		case ZYDIS_MNEMONIC_CMOVNBE: return !cf && !zf;
+		case ZYDIS_MNEMONIC_CMOVS: return sf;
+		case ZYDIS_MNEMONIC_CMOVNS: return !sf;
+		case ZYDIS_MNEMONIC_CMOVP: return pf;
+		case ZYDIS_MNEMONIC_CMOVNP: return !pf;
+		case ZYDIS_MNEMONIC_CMOVL: return sf != of;
+		case ZYDIS_MNEMONIC_CMOVNL: return sf == of;
+		case ZYDIS_MNEMONIC_CMOVLE: return zf || sf != of;
+		case ZYDIS_MNEMONIC_CMOVNLE: return !zf && sf == of;
+		default: known = false; return false;
+	}
+}
+
+// KYTY_READBACK_STATS: faulting loads the emulation declined, by mnemonic (what to support next)
+// and by whether the instruction or the reader declined.
+struct LoadRefusals {
+	std::atomic<uint64_t> by_mnemonic[ZYDIS_MNEMONIC_MAX_VALUE + 1] {};
+	std::atomic<uint64_t> unsupported {0};
+	std::atomic<uint64_t> declined {0};
+	std::atomic<uint64_t> emulated {0};
+	std::atomic<uint64_t> next_report {4096};
+};
+LoadRefusals& Refusals() {
+	static LoadRefusals refusals;
+	return refusals;
+}
+bool RefusalStatsEnabled() {
+	static const bool enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	return enabled;
+}
+void NoteLoad(ZydisMnemonic mnemonic, int outcome) { // 0 emulated, 1 unsupported, 2 declined
+	if (!RefusalStatsEnabled()) {
+		return;
+	}
+	auto& r = Refusals();
+	if (outcome == 0) {
+		r.emulated.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		(outcome == 1 ? r.unsupported : r.declined).fetch_add(1, std::memory_order_relaxed);
+		if (mnemonic >= 0 && mnemonic <= ZYDIS_MNEMONIC_MAX_VALUE) {
+			r.by_mnemonic[mnemonic].fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	const auto total = r.emulated.load(std::memory_order_relaxed) +
+	                   r.unsupported.load(std::memory_order_relaxed) +
+	                   r.declined.load(std::memory_order_relaxed);
+	auto due = r.next_report.load(std::memory_order_relaxed);
+	if (total < due || !r.next_report.compare_exchange_strong(due, due * 2)) {
+		return;
+	}
+	char text[512] = {};
+	int  used      = 0;
+	int  chosen[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+	for (int round = 0; round < 8; round++) {
+		uint64_t best   = 0;
+		int      best_m = -1;
+		for (int m = 0; m <= ZYDIS_MNEMONIC_MAX_VALUE; m++) {
+			const auto n     = r.by_mnemonic[m].load(std::memory_order_relaxed);
+			bool       taken = false;
+			for (int k = 0; k < round; k++) {
+				taken = taken || chosen[k] == m;
+			}
+			if (!taken && n > best) {
+				best   = n;
+				best_m = m;
+			}
+		}
+		if (best_m < 0) {
+			break;
+		}
+		chosen[round] = best_m;
+		used += std::snprintf(text + used, sizeof(text) - static_cast<size_t>(used), " %s:%llu",
+		                      ZydisMnemonicGetString(static_cast<ZydisMnemonic>(best_m)),
+		                      static_cast<unsigned long long>(best));
+	}
+	std::fprintf(stderr, "[clean-read] emulated=%llu unsupported=%llu declined=%llu top refused:%s\n",
+	             static_cast<unsigned long long>(r.emulated.load()),
+	             static_cast<unsigned long long>(r.unsupported.load()),
+	             static_cast<unsigned long long>(r.declined.load()), text);
+}
+
+// KYTY_EMULATE_ALU_LOADS=0: only the moves, CMP and TEST, as before.
+bool AluLoadsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EMULATE_ALU_LOADS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 } // namespace
 
-bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read) {
-	auto* context = static_cast<PCONTEXT>(native_context);
-	if (context == nullptr || read == nullptr) {
-		return false;
-	}
+namespace {
+// TryEmulateLoad's body: `declined` when the reader refused, `mnemonic` once decoded.
+bool EmulateLoad(PCONTEXT context, uint64_t fault_vaddr, LoadReader reader, bool& declined,
+                 ZydisMnemonic& mnemonic) {
+	const auto read = [&](uint64_t fault, uint64_t vaddr, void* data, uint64_t size) {
+		const bool ok = reader(fault, vaddr, data, size);
+		declined      = declined || !ok;
+		return ok;
+	};
 	ZydisDecodedInstruction instruction {};
 	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
 	if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&LoadDecoder(),
@@ -986,8 +1100,10 @@ bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read)
 	     instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) ||
 	    (instruction.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
 	    instruction.operand_count_visible != 2) {
+		mnemonic = instruction.mnemonic;
 		return false;
 	}
+	mnemonic = instruction.mnemonic;
 	const auto mem_index = operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY   ? 0
 	                       : operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY ? 1
 	                                                                       : -1;
@@ -1059,6 +1175,109 @@ bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read)
 			}
 			break;
 		}
+		case ZYDIS_MNEMONIC_ADD:
+		case ZYDIS_MNEMONIC_SUB:
+		case ZYDIS_MNEMONIC_AND:
+		case ZYDIS_MNEMONIC_OR:
+		case ZYDIS_MNEMONIC_XOR: {
+			// Register destination, memory source only: with a memory destination the
+			// instruction also stores, which this path cannot complete.
+			const uint32_t bits  = mem.size;
+			uint32_t       shift = 0;
+			auto*          slot  = AluLoadsEnabled() && mem_index == 1 &&
+			                     other.type == ZYDIS_OPERAND_TYPE_REGISTER
+			                           ? GprSlot(context, other.reg.value, shift)
+			                           : nullptr;
+			uint64_t a = 0;
+			if (slot == nullptr || (bits != 8 && bits != 16 && bits != 32 && bits != 64) ||
+			    !ReadGpr(context, other.reg.value, bits, a) || !read(fault_vaddr, address, data, bytes)) {
+				return false;
+			}
+			uint64_t b = 0;
+			std::memcpy(&b, data, bytes);
+			const auto mask = WidthMask(bits);
+			uint64_t   r    = 0;
+			switch (instruction.mnemonic) {
+				case ZYDIS_MNEMONIC_ADD:
+					r = (a + b) & mask;
+					SetResultFlags(context, r, bits, r < a, ((a ^ b ^ r) & 0x10u) != 0,
+					               (((a ^ r) & (b ^ r)) >> (bits - 1u) & 1u) != 0);
+					break;
+				case ZYDIS_MNEMONIC_SUB:
+					r = (a - b) & mask;
+					SetResultFlags(context, r, bits, a < b, ((a ^ b ^ r) & 0x10u) != 0,
+					               (((a ^ b) & (a ^ r)) >> (bits - 1u) & 1u) != 0);
+					break;
+				case ZYDIS_MNEMONIC_AND: r = a & b; SetResultFlags(context, r, bits, false, false, false); break;
+				case ZYDIS_MNEMONIC_OR: r = a | b; SetResultFlags(context, r, bits, false, false, false); break;
+				default: r = a ^ b; SetResultFlags(context, r, bits, false, false, false); break;
+			}
+			WriteGpr(slot, shift, bits, r);
+			break;
+		}
+		case ZYDIS_MNEMONIC_IMUL: {
+			// The two-operand form (reg *= mem); CF and OF tell whether the product overflowed.
+			const uint32_t bits  = mem.size;
+			uint32_t       shift = 0;
+			auto*          slot  = AluLoadsEnabled() && mem_index == 1 &&
+			                     other.type == ZYDIS_OPERAND_TYPE_REGISTER
+			                           ? GprSlot(context, other.reg.value, shift)
+			                           : nullptr;
+			uint64_t a = 0;
+			if (slot == nullptr || (bits != 16 && bits != 32 && bits != 64) ||
+			    !ReadGpr(context, other.reg.value, bits, a) || !read(fault_vaddr, address, data, bytes)) {
+				return false;
+			}
+			uint64_t b = 0;
+			std::memcpy(&b, data, bytes);
+			const auto sign_extend = [bits](uint64_t v) {
+				const auto sign = uint64_t {1} << (bits - 1u);
+				return static_cast<int64_t>((v ^ sign) - sign);
+			};
+			const __int128 product = static_cast<__int128>(sign_extend(a)) * sign_extend(b);
+			const uint64_t r       = static_cast<uint64_t>(product) & WidthMask(bits);
+			const bool     over    = static_cast<__int128>(sign_extend(r)) != product;
+			SetResultFlags(context, r, bits, over, false, over);
+			WriteGpr(slot, shift, bits, r);
+			break;
+		}
+		case ZYDIS_MNEMONIC_CMOVO:
+		case ZYDIS_MNEMONIC_CMOVNO:
+		case ZYDIS_MNEMONIC_CMOVB:
+		case ZYDIS_MNEMONIC_CMOVNB:
+		case ZYDIS_MNEMONIC_CMOVZ:
+		case ZYDIS_MNEMONIC_CMOVNZ:
+		case ZYDIS_MNEMONIC_CMOVBE:
+		case ZYDIS_MNEMONIC_CMOVNBE:
+		case ZYDIS_MNEMONIC_CMOVS:
+		case ZYDIS_MNEMONIC_CMOVNS:
+		case ZYDIS_MNEMONIC_CMOVP:
+		case ZYDIS_MNEMONIC_CMOVNP:
+		case ZYDIS_MNEMONIC_CMOVL:
+		case ZYDIS_MNEMONIC_CMOVNL:
+		case ZYDIS_MNEMONIC_CMOVLE:
+		case ZYDIS_MNEMONIC_CMOVNLE: {
+			// The load happens whatever the condition (that is why it faulted); a 32-bit
+			// destination is zero-extended even when the condition is false.
+			const uint32_t bits  = mem.size;
+			uint32_t       shift = 0;
+			auto*          slot  = AluLoadsEnabled() && mem_index == 1 &&
+			                     other.type == ZYDIS_OPERAND_TYPE_REGISTER
+			                           ? GprSlot(context, other.reg.value, shift)
+			                           : nullptr;
+			bool       known = false;
+			const bool taken = ConditionHolds(instruction.mnemonic, context->EFlags, known);
+			uint64_t   current = 0;
+			if (slot == nullptr || !known || (bits != 16 && bits != 32 && bits != 64) ||
+			    !ReadGpr(context, other.reg.value, bits, current) ||
+			    !read(fault_vaddr, address, data, bytes)) {
+				return false;
+			}
+			uint64_t value = 0;
+			std::memcpy(&value, data, bytes);
+			WriteGpr(slot, shift, bits, taken ? value : current);
+			break;
+		}
 		default: {
 			if (!IsVectorLoad(instruction.mnemonic) || mem_index != 1 ||
 			    other.type != ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -1100,6 +1319,19 @@ bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read)
 	}
 	context->Rip += instruction.length;
 	return true;
+}
+} // namespace
+
+bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read) {
+	auto* context = static_cast<PCONTEXT>(native_context);
+	if (context == nullptr || read == nullptr) {
+		return false;
+	}
+	bool          declined = false;
+	ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+	const bool    done     = EmulateLoad(context, fault_vaddr, read, declined, mnemonic);
+	NoteLoad(mnemonic, done ? 0 : declined ? 2 : 1);
+	return done;
 }
 
 #else

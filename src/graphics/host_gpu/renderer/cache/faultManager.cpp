@@ -7,6 +7,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
@@ -195,8 +199,10 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 			const auto  hash    = (uint64_t {trap.shader_hash_high} << 32) | trap.shader_hash_low;
 			const auto* pending = std::bit_cast<const uint64_t*>(mapped);
 			EXIT("GPU shader trap: hash=0x%016" PRIx64
-			     " pc=0x%08x code=0x%02x pending_pages=%" PRIu64 " first_page=%016" PRIx64 "\n",
-			     hash, trap.pc, trap.code, pending[0], pending[1]);
+			     " pc=0x%08x code=0x%02x pending_pages=%" PRIu64 " first_page=%016" PRIx64
+			     " values=%08x %08x %08x\n",
+			     hash, trap.pc, trap.code, pending[0], pending[1], trap.reserved[0], trap.reserved[1],
+			     trap.reserved[2]);
 		}
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
@@ -218,9 +224,32 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}
-		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+		fault_ranges.ForEach([this, report](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			const auto id = m_buffer_cache.FindBuffer(start, end - start);
+			// Window buffers: the faulting pages become resident (page-table entries) now.
+			m_buffer_cache.MakeRangeResident(start, end - start);
+			// [bda-fault]: the first 256 faulting ranges and the buffer that now backs them (the
+			// "Accessed non-GPU cached memory" log line is silent in normal runs).
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 256 && !id) {
+				std::fprintf(stderr, "[bda-fault] 0x%016" PRIx64 "+0x%" PRIx64 " %s -> no buffer\n",
+				             start, end - start, report != nullptr ? "dispatch" : "other");
+			} else if (reported.load(std::memory_order_relaxed) <= 256) {
+				const auto& buffer = m_buffer_cache.GetBuffer(id);
+				int resident = -1;
+				if (buffer.lazy_resident && start >= buffer.CpuAddress() &&
+				    start < buffer.CpuAddress() + buffer.Size()) {
+					const auto block = (start - buffer.CpuAddress()) >> BufferCache::ResidentBlockBits;
+					resident = ((buffer.resident_blocks[block >> 6u] >> (block & 63u)) & 1u) != 0 ? 1 : 0;
+				}
+				std::fprintf(stderr,
+				             "[bda-fault] 0x%016" PRIx64 "+0x%" PRIx64 " %s -> buffer 0x%016" PRIx64
+				             "+0x%" PRIx64 " id=%u shared=%d lazy=%d resident=%d\n",
+				             start, end - start, report != nullptr ? "dispatch" : "other",
+				             buffer.CpuAddress(), buffer.Size(), static_cast<uint32_t>(id.index),
+				             buffer.IsShared() ? 1 : 0, buffer.lazy_resident ? 1 : 0, resident);
+			}
 		});
 		if (report != nullptr) {
 			fault_ranges.ForEach([this](uint64_t start, uint64_t end) {

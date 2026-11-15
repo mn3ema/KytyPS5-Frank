@@ -16,6 +16,12 @@ namespace Sync {
 [[nodiscard]] bool     ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency,
                                            uint64_t& value);
 [[nodiscard]] uint64_t ReadReferenceClock();
+// The value of an end-of-pipe timestamp write (KYTY_GPU_TIMESTAMP_STEP, see sync.cpp).
+[[nodiscard]] uint64_t ReadGpuTimestamp();
+// Called once per guest flip on the GPU thread (anchors KYTY_GPU_TIMESTAMP_STEP).
+void NoteTimestampFlip();
+// Guest flips submitted so far (counted in PrepareVideoOutFlip; the first is 1).
+uint64_t GuestFlipCount();
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id);
 

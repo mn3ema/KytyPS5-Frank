@@ -1,5 +1,10 @@
 #include "common/sampler.h"
+#include "common/floorStats.h"
+#include "common/fpsLog.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/syncToggle.h"
+#include "graphics/host_gpu/renderer/barrierMerge.h"
+#include "graphics/host_gpu/pageManager.h"
 
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
@@ -195,7 +200,11 @@ struct CommandScheduler::GpuTimer {
 			    stamps[1] >= stamps[0]) {
 				const auto begin = std::max(stamps[0], last_end);
 				if (stamps[1] > begin) {
-					busy_ns += static_cast<double>(stamps[1] - begin) * period_ns;
+					const double span = static_cast<double>(stamps[1] - begin) * period_ns;
+					busy_ns += span;
+					if (Common::FloorStats::Enabled()) {
+						Common::FloorStats::Add(Common::FloorStats::Get().gpu_busy_ns, static_cast<uint64_t>(span));
+					}
 				}
 				last_end = std::max(last_end, stamps[1]);
 				buffers++;
@@ -361,7 +370,12 @@ void CommandScheduler::CompleteReleaseMemInterrupt() {
 }
 
 void CommandScheduler::CompleteDraw() {
-	const auto interval = DrawFlushInterval();
+	// Toggle mode "flush4" (v317): a submit every 4 draws instead of KYTY_DRAW_FLUSH_INTERVAL's 16 in
+	// the on windows, so the work a game thread then waits for reaches the GPU sooner.
+	if (Common::FloorStats::Enabled()) {
+		Common::FloorStats::Add(Common::FloorStats::Get().draws, 1);
+	}
+	const auto interval = SyncToggle::Flush4Window() ? 4u : DrawFlushInterval();
 	if (interval == 0u || ++m_recorded_draws < interval) {
 		return;
 	}
@@ -371,6 +385,9 @@ void CommandScheduler::CompleteDraw() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	if (Common::FloorStats::Enabled()) {
+		Common::FloorStats::Add(Common::FloorStats::Get().cmd_buffers, 1);
+	}
 	Submit(submit);
 	BeginNext();
 }
@@ -484,7 +501,28 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	const CpuCost::Phase cpu_phase_("PopPendingOperations");
+	// Read the GPU's progress (a driver call, ~1 us, once per draw and dispatch before) only when
+	// an operation waits for a tick not known to be done.
+	{
+		uint64_t front = 0;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			if (m_pending_operations.empty()) {
+				return;
+			}
+			front = m_pending_operations.front().tick;
+		}
+		// An operation deferred while recording carries the current tick, which is not submitted
+		// yet: the GPU cannot have reached it, so polling the driver would find nothing to run
+		// (KYTY_HOTPATH).
+		if (front >= m_master.CurrentTick() && SyncToggle::HotPath()) {
+			return;
+		}
+		if (!m_master.IsFree(front)) {
+			m_master.Refresh();
+		}
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -536,16 +574,19 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	}
 	if (g_deferred_callback_scheduler == this) {
 		lock.unlock();
+		DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 		operation();
 		return;
 	}
 	m_operation_available.wait(lock,
 	                           [this] { return m_operation_state == OperationState::Closed; });
 	lock.unlock();
+	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 	operation();
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	Common::Sampler::RegisterCurrentThread("prio-ops");
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -561,9 +602,25 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
-		m_master.Wait(operation.tick);
+		{
+			const auto wait_begin = std::chrono::steady_clock::now();
+			m_master.Wait(operation.tick);
+			if (Common::FloorStats::Enabled()) {
+				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                    std::chrono::steady_clock::now() - wait_begin)
+				                    .count();
+				if (ms >= 200) {
+					std::fprintf(stderr,
+					             "[floor-prio] priority operation waited %lld ms for tick %llu (recording tick now %llu)\n",
+					             static_cast<long long>(ms), static_cast<unsigned long long>(operation.tick),
+					             static_cast<unsigned long long>(CurrentTick()));
+				}
+			}
+		}
 		Timeline::Mark("tick-done", operation.tick);
 		if (!stop.stop_requested()) {
+			// Priority callbacks publish labels, interrupts, fences, and flips to guest waiters.
+			DrainProtectionHelper(ProtectDrainReason::GuestSignal);
 			RunOperation(std::move(operation.callback));
 		}
 		{
@@ -667,7 +724,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			std::fflush(stderr);
 		}
 	}
-	if (static const bool fps_log = std::getenv("KYTY_FPS_LOG") != nullptr; fps_log) {
+	if (static const bool fps_log = Common::FpsLogDiagnostics(); fps_log) {
 		static std::atomic<uint64_t> count {0};
 		static std::atomic<int64_t>  window_start {0};
 		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -771,6 +828,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
 	// KYTY_UPLOAD_WORKER: the staging bytes this submission's copies read are written.
 	WaitUploadWorker(job.upload_reads);
+	// Every guarded write recorded in this command buffer must be protected before it can execute.
+	DrainProtectionHelper(ProtectDrainReason::Submit);
 	auto&      graphics = m_graphics;
 	vk::Result result;
 	{
@@ -798,6 +857,9 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		if (result == vk::Result::eSuccess && job.tick > m_vk_submitted_tick.load(std::memory_order_relaxed)) {
+			m_vk_submitted_tick.store(job.tick, std::memory_order_release);
+		}
 	}
 	Timeline::Mark("vk-submit", job.tick);
 
@@ -810,6 +872,12 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		                  job.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	{
+		std::lock_guard lock(m_after_submit_mutex);
+		if (m_after_submit) {
+			m_after_submit();
+		}
+	}
 }
 
 void CommandScheduler::EnableAsyncSubmit() {
@@ -913,6 +981,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
 	Common::Sampler::RegisterCurrentThread("record");
+	SetBarrierMergeThread();
 	Common::PreferPerformanceCores("Vulkan recording thread");
 	Common::RaiseGpuThreadPriority();
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are

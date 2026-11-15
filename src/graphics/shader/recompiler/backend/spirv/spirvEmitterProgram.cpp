@@ -1,14 +1,19 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/LoopGuard.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <set>
 #include <type_traits>
 #include <unordered_map>
+#include <cstdio>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
@@ -27,8 +32,23 @@ void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	EmitLabel(state, merge_label);
 }
 
+// KYTY_NO_KILL_HASHES=<hash>[,<hash>...] (diagnostics, 11-13 hex holes): those pixel shaders keep
+// the pixels their valid mask kills, to show what they would have drawn there.
+bool NoKillShader(uint64_t hash) {
+	static const std::string hashes = [] {
+		const char* value = std::getenv("KYTY_NO_KILL_HASHES");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	if (hashes.empty()) {
+		return false;
+	}
+	char text[17];
+	std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+	return hashes.find(text) != std::string::npos;
+}
+
 void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
-	if (state.pixel_valid_mask_variable == 0) {
+	if (state.pixel_valid_mask_variable == 0 || NoKillShader(state.program.shader_hash)) {
 		return;
 	}
 
@@ -95,6 +115,9 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
+	if (UsesPixelInterlock(ctx.state.program)) {
+		ctx.state.builder.AddFunction(spv::OpEndInvocationInterlockEXT);
+	}
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
@@ -147,17 +170,19 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				                         st.loop_guard_merges.end();
 				if (true_exits != false_exits) {
 					// Count the decision; past the limit, take the exit. KYTY_LOOP_GUARD_LIMIT
-					// (default 65536) sets the limit (part of the shader cache key via getenv).
-					static const uint32_t LoopGuardLimit = [] {
-						const char* value = std::getenv("KYTY_LOOP_GUARD_LIMIT");
-						const auto  limit = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
-						return limit != 0ul ? static_cast<uint32_t>(limit) : (1u << 16u);
-					}();
+					// (default 65536) sets the limit (LoopGuard.h; part of the shader cache key).
+					const uint32_t LoopGuardLimit = IR::LoopGuardLimit(st.program.shader_hash);
 					const auto         count          = st.builder.AllocateId();
 					st.builder.AddFunction(spv::OpLoad, TypeU32(st), count, st.loop_guard_variable);
 					const auto next = st.builder.AllocateId();
 					st.builder.AddFunction(spv::OpIAdd, TypeU32(st), next, count, ConstantU32(st, 1u));
 					st.builder.AddFunction(spv::OpStore, st.loop_guard_variable, next);
+					// The trip report: once, on the decision that reaches the limit (a call, so
+					// the block, which may be a loop header, is not split).
+					if (st.loop_guard_report_function != 0) {
+						st.builder.AddFunction(spv::OpFunctionCall, TypeVoid(st), st.builder.AllocateId(),
+						                       st.loop_guard_report_function, next);
+					}
 					const auto exhausted = st.builder.AllocateId();
 					st.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(st), exhausted, next,
 					                       ConstantU32(st, LoopGuardLimit));
@@ -703,6 +728,66 @@ void EmitMeshSegmentFunctions(ValueEmitContext& ctx, const MeshSegmentPlan& plan
 	}
 }
 
+// The guard-trip report (BindingLayout::loop_guard): void report(u32 decisions). On the decision
+// that reaches KYTY_LOOP_GUARD_REPORT (default: the shader's KYTY_LOOP_GUARD_LIMIT) the invocation adds 1 to word 0 of the report buffer whose
+// device address the shader data holds (GuardDword) and writes the shader hash into the ring
+// entry that count selects; the host prints the tally per frame ([loop-guard]). Defined before
+// the entry point (as get_bda_pointer).
+void DefineLoopGuardReport(EmitterState& state) {
+	const auto u32            = TypeU32(state);
+	const auto u64            = TypeScalarU64(state);
+	const auto bool_type      = TypeBool(state);
+	const auto function_type  = state.builder.Type(spv::OpTypeFunction, TypeVoid(state), u32);
+	state.loop_guard_report_function = state.builder.AllocateId();
+	const auto decisions      = state.builder.AllocateId();
+	const auto entry_label    = state.builder.AllocateId();
+	const auto report_label   = state.builder.AllocateId();
+	const auto merge_label    = state.builder.AllocateId();
+	state.builder.AddName(state.loop_guard_report_function, "loop_guard_report");
+	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.loop_guard_report_function,
+	                          spv::FunctionControlMaskNone, function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, u32, decisions);
+	EmitLabel(state, entry_label);
+	const auto dword   = state.program.bindings.GuardDword();
+	const auto address = DeviceAddressFromWords(state, EmitShaderDataDwordLoad(state, dword),
+	                                            EmitShaderDataDwordLoad(state, dword + 1u));
+	const auto reached = Binary(state, spv::OpIEqual, bool_type, decisions,
+	                            ConstantU32(state, IR::LoopGuardReport(state.program.shader_hash)));
+	const auto bound   = Binary(state, spv::OpINotEqual, bool_type, address,
+	                            ConstantDeviceAddress(state, 0));
+	const auto fire    = Binary(state, spv::OpLogicalAnd, bool_type, reached, bound);
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, fire, report_label, merge_label);
+	EmitLabel(state, report_label);
+	const auto word = [&](uint32_t index) {
+		const auto offset = Binary(state, spv::OpShiftLeftLogical, u64,
+		                           Unary(state, spv::OpUConvert, u64, index),
+		                           ConstantDeviceAddress(state, 2));
+		return Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+		             Binary(state, spv::OpIAdd, u64, address, offset));
+	};
+	const auto atomic = [&](spv::Op op, uint32_t pointer, uint32_t value) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(op, u32, result, pointer, ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, 0), value);
+		return result;
+	};
+	const auto n    = atomic(spv::OpAtomicIAdd, word(ConstantU32(state, 0)), ConstantU32(state, 1));
+	const auto ring = Binary(state, spv::OpBitwiseAnd, u32, n,
+	                         ConstantU32(state, IR::LoopGuardRingSize - 1u));
+	const auto slot = Binary(state, spv::OpIAdd, u32, ConstantU32(state, 1),
+	                         Binary(state, spv::OpShiftLeftLogical, u32, ring, ConstantU32(state, 1)));
+	const auto hash = state.program.shader_hash;
+	(void)atomic(spv::OpAtomicExchange, word(slot), ConstantU32(state, static_cast<uint32_t>(hash)));
+	(void)atomic(spv::OpAtomicExchange,
+	             word(Binary(state, spv::OpIAdd, u32, slot, ConstantU32(state, 1))),
+	             ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(spv::OpReturn);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
 	auto&       state = ctx.state;
 	const auto* entry = state.program.blocks.front();
@@ -724,7 +809,12 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	// from a buffer an unemulated pass left unwritten) hung the GPU until the driver reset it.
 	// Leave the dispatcher after a bounded number of block transitions instead: the invocation's
 	// results are wrong, the device survives.
-	constexpr uint32_t MaxDispatcherTransitions = 4096;
+	// KYTY_DISPATCHER_MAX_TRANSITIONS=<n> (default 4096): the bound, for shaders whose real
+	// per-pixel work (a loop over lights, over decals) takes more transitions than that.
+	static const uint32_t MaxDispatcherTransitions = [] {
+		const char* value = std::getenv("KYTY_DISPATCHER_MAX_TRANSITIONS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 4096u;
+	}();
 	const auto         iteration                = state.builder.AllocateId();
 	const auto         next_iteration           = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
@@ -1071,12 +1161,14 @@ void EmitProgram(EmitterState& state) {
 		}
 		EmitMeshSegmentFunctions(ctx, PlanMeshSegments(state, std::move(splits)));
 		EmitMeshEntryPoint(state);
+		DefineIndirectFormattedFunction(ctx);
+		DefineBoundFormattedFunctions(ctx);
 		return;
 	}
-	if (static const char* guard_list = std::getenv("KYTY_LOOP_GUARD_HASHES");
-	    guard_list != nullptr && !state.program.dispatcher_fallback &&
-	    std::string_view(guard_list).find(fmt::format("{:016x}", state.program.shader_hash)) !=
-	        std::string_view::npos) {
+	// KYTY_LOOP_GUARD_HASHES (LoopGuard.h: a hash list, "all" or "digits:<hex digits>"): the
+	// binding layout decided (BindingLayout::loop_guard); unstructured programs have the
+	// dispatcher's own transition cap instead.
+	if (program.bindings.loop_guard && !state.program.dispatcher_fallback) {
 		for (const auto& info: program.block_info) {
 			if (info.terminator.loop_header && info.terminator.merge_block != UINT32_MAX) {
 				state.loop_guard_merges.push_back(info.terminator.merge_block);
@@ -1084,6 +1176,7 @@ void EmitProgram(EmitterState& state) {
 		}
 		if (!state.loop_guard_merges.empty()) {
 			state.loop_guard_variable = state.builder.AllocateId();
+			DefineLoopGuardReport(state);
 		}
 	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
@@ -1155,6 +1248,11 @@ void EmitProgram(EmitterState& state) {
 		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
+	if (UsesPixelInterlock(state.program)) {
+		// POPS: the guest orders overlapping pixels itself (POPS_EXITING_WAVE_ID); here the
+		// whole shader is the ordered critical section.
+		state.builder.AddFunction(spv::OpBeginInvocationInterlockEXT);
+	}
 	EmitMemoryOffsets(state);
 	EmitSrtVerify(state);
 	if (program.blocks.empty()) {
@@ -1168,6 +1266,8 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}
+	DefineIndirectFormattedFunction(ctx);
+	DefineBoundFormattedFunctions(ctx);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

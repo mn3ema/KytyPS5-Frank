@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompileProgress.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
@@ -19,8 +20,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -479,13 +482,69 @@ void ShutdownSystemOverlayInput() {
 	g_input_window = nullptr;
 }
 
+// The startup shader precompile panel (plan 4.12): shown while it runs, then with the count.
+
+// After the replay it stays for the whole session with the ledger's count (Mac, 10-25 14:07).
+static bool PrecompilePanelVisible() {
+	const auto& progress = GetShaderPrecompileProgress();
+	if (progress.active.load(std::memory_order_acquire)) {
+		return true;
+	}
+	if (!(progress.ledger_known.load(std::memory_order_acquire) && progress.SecondsSinceFinish() >= 0.0 &&
+	      progress.ledger_total.load(std::memory_order_relaxed) != 0u)) {
+		return false;
+	}
+	if (progress.gpl_warm_active.load(std::memory_order_acquire) ||
+	    progress.pipelines_active.load(std::memory_order_acquire) ||
+	    !progress.startup_wait_done.load(std::memory_order_acquire)) {
+		return true;
+	}
+	// v438g (Mac 11-15: "only in the title, not the gameplay"): the "Shaders ready" summary stays
+	// for KYTY_READY_PANEL_SECONDS (default 30) after the startup wait, then hides for the session
+	// (-1: always shown, 0: never).
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_READY_PANEL_SECONDS");
+		return value != nullptr ? std::atoi(value) : 30;
+	}();
+	if (limit < 0) {
+		return true;
+	}
+	static std::atomic<int64_t> ready_since {0};
+	const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	int64_t since = ready_since.load(std::memory_order_relaxed);
+	if (since == 0) {
+		ready_since.compare_exchange_strong(since, now);
+		since = ready_since.load(std::memory_order_relaxed);
+	}
+	return now - since < static_cast<int64_t>(limit) * 1000;
+}
+
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
-	return {core.active || dialog.active || system.active || trophy_active,
-	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u)};
+	const bool precompile    = PrecompilePanelVisible();
+	const auto& progress     = GetShaderPrecompileProgress();
+	const bool  compiling    = precompile && (progress.active.load(std::memory_order_relaxed) ||
+	                                          progress.pipelines_active.load(std::memory_order_relaxed) ||
+	                                          progress.gpl_warm_active.load(std::memory_order_relaxed));
+	return {core.active || dialog.active || system.active || trophy_active || precompile,
+	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
+	            static_cast<uint32_t>(progress.skip_state.load(std::memory_order_relaxed)) * 0x01000000u +
+	            (progress.skip_offered.load(std::memory_order_relaxed) ? 0x02000000u : 0u) +
+	            (precompile ? 1u + progress.done.load(std::memory_order_relaxed) +
+	                              progress.import_done.load(std::memory_order_relaxed) / 256u +
+	                              progress.ledger_total.load(std::memory_order_relaxed) +
+	                              progress.pipelines_done.load(std::memory_order_relaxed) +
+	                              progress.gpl_warm_done.load(std::memory_order_relaxed) +
+	                              (progress.gpl_warm_active.load(std::memory_order_relaxed) ? 0x40000000u : 0u) +
+	                              (progress.pipelines_finished.load(std::memory_order_relaxed) ? 0x20000000u : 0u) +
+	                              (progress.active.load(std::memory_order_relaxed) ? 0u : 0x10000000u)
+	                        : 0u),
+	        core.active || dialog.active || system.active || trophy_active || compiling};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1153,11 +1212,117 @@ struct SystemOverlay::Impl {
 		draw->PopClipRect();
 	}
 
+	// "Compiling shaders" with a bar and N / M at the bottom left, then "Shaders ready".
+	void DrawPrecompilePanel(vk::Extent2D frame_extent) {
+		const auto&    progress = GetShaderPrecompileProgress();
+		const bool     running  = progress.active.load(std::memory_order_acquire);
+		const uint32_t total    = std::max(progress.total.load(std::memory_order_relaxed), 1u);
+		const uint32_t done     = std::min(progress.done.load(std::memory_order_relaxed), total);
+		const float    scale =
+		    std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                        static_cast<float>(frame_extent.height) / 1080.0f),
+		               0.65f, 1.5f);
+		const float margin = 28.0f * scale;
+		const float width  = std::min(360.0f * scale, static_cast<float>(frame_extent.width) - 2.0f * margin);
+		ImGui::SetNextWindowPos({margin, static_cast<float>(frame_extent.height) - margin},
+		                        ImGuiCond_Always, {0.0f, 1.0f});
+		ImGui::SetNextWindowSize({width, 0.0f}, ImGuiCond_Always);
+		ImGui::SetNextWindowBgAlpha(0.72f);
+		constexpr ImGuiWindowFlags flags =
+		    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+		    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings |
+		    ImGuiWindowFlags_NoBringToFrontOnFocus;
+		ImGui::Begin("##ShaderPrecompile", nullptr, flags);
+		ImGui::SetWindowFontScale(1.15f * scale);
+		if (progress.importing.load(std::memory_order_acquire)) {
+			// The one-time import of the disk cache's keys (plan 4.13).
+			const uint32_t files = std::max(progress.import_total.load(std::memory_order_relaxed), 1u);
+			const uint32_t read  = std::min(progress.import_done.load(std::memory_order_relaxed), files);
+			ImGui::TextUnformatted("Preparing shaders: reading the cache");
+			char overlay[48];
+			std::snprintf(overlay, sizeof(overlay), "%u / %u", read, files);
+			ImGui::ProgressBar(static_cast<float>(read) / static_cast<float>(files), {-1.0f, 0.0f},
+			                   overlay);
+		} else if (running) {
+			ImGui::TextUnformatted(progress.skipped.load(std::memory_order_relaxed)
+			                           ? "Shaders: preparing in the background (you can play)"
+			                           : "Compiling shaders");
+			char overlay[48];
+			std::snprintf(overlay, sizeof(overlay), "%u / %u", done, total);
+			ImGui::ProgressBar(static_cast<float>(done) / static_cast<float>(total),
+			                   {-1.0f, 0.0f}, overlay);
+		} else if (progress.pipelines_active.load(std::memory_order_acquire)) {
+			// The graphics pipelines of every recipe recorded before (pipelineRecipe.h).
+			const uint32_t pipes = std::max(progress.pipelines_total.load(std::memory_order_relaxed), 1u);
+			const uint32_t made  = std::min(progress.pipelines_done.load(std::memory_order_relaxed), pipes);
+			ImGui::TextUnformatted("Compiling pipelines");
+			char overlay[48];
+			std::snprintf(overlay, sizeof(overlay), "%u / %u", made, pipes);
+			ImGui::ProgressBar(static_cast<float>(made) / static_cast<float>(pipes), {-1.0f, 0.0f},
+			                   overlay);
+		} else if (progress.gpl_warm_active.load(std::memory_order_acquire)) {
+			// The pipeline libraries of the shader list's permutations (step D4).
+			const uint32_t all  = std::max(progress.gpl_warm_total.load(std::memory_order_relaxed), 1u);
+			const uint32_t made = std::min(progress.gpl_warm_done.load(std::memory_order_relaxed), all);
+			ImGui::TextUnformatted(progress.skipped.load(std::memory_order_relaxed)
+			                           ? "Pipelines: preparing in the background (you can play)"
+			                           : "Preparing pipelines");
+			char overlay[48];
+			std::snprintf(overlay, sizeof(overlay), "%u / %u", made, all);
+			ImGui::ProgressBar(static_cast<float>(made) / static_cast<float>(all), {-1.0f, 0.0f}, overlay);
+		} else {
+			const auto shaders = progress.ledger_total.load(std::memory_order_relaxed);
+			const auto base    = progress.ledger_base.load(std::memory_order_relaxed);
+			char       text[96];
+			std::snprintf(text, sizeof(text), "Shaders ready: %u (+%u new)", shaders,
+			              shaders > base ? shaders - base : 0u);
+			ImGui::TextUnformatted(text);
+			// The recipes rebuilt at startup plus the ones first built this session.
+			const auto pipes_new = progress.pipelines_new.load(std::memory_order_relaxed);
+			if (progress.pipelines_finished.load(std::memory_order_acquire) &&
+			    (progress.pipelines_total.load(std::memory_order_relaxed) != 0u || pipes_new != 0u)) {
+				std::snprintf(text, sizeof(text), "Pipelines ready: %u (+%u new)",
+				              progress.pipelines_built.load(std::memory_order_relaxed) + pipes_new, pipes_new);
+				ImGui::TextUnformatted(text);
+			}
+		}
+		const bool offered = progress.skip_offered.load(std::memory_order_acquire) &&
+		                     !progress.startup_wait_done.load(std::memory_order_acquire);
+		const int  skip    = progress.skip_state.load(std::memory_order_acquire);
+		if (offered && skip == 0) {
+			ImGui::TextDisabled("Press Esc or Cross to skip and play now");
+		}
+		ImGui::End();
+		if (offered && skip == 1) {
+			// v438i: the confirmation (window.cpp takes Y/Enter and N/Esc).
+			const float box = std::min(620.0f * scale, static_cast<float>(frame_extent.width) - 2.0f * margin);
+			ImGui::SetNextWindowPos({static_cast<float>(frame_extent.width) * 0.5f,
+			                         static_cast<float>(frame_extent.height) * 0.5f},
+			                        ImGuiCond_Always, {0.5f, 0.5f});
+			ImGui::SetNextWindowSize({box, 0.0f}, ImGuiCond_Always);
+			ImGui::SetNextWindowBgAlpha(0.92f);
+			ImGui::Begin("##SkipPrecompile", nullptr, flags);
+			ImGui::SetWindowFontScale(1.25f * scale);
+			ImGui::TextUnformatted("Skip preparing shaders?");
+			ImGui::Spacing();
+			ImGui::PushTextWrapPos(0.0f);
+			ImGui::TextUnformatted(
+			    "The game starts now and the rest is prepared in the background while you play. "
+			    "Until it finishes, the game may stutter whenever something new appears.");
+			ImGui::PopTextWrapPos();
+			ImGui::Spacing();
+			ImGui::TextUnformatted("Y / Circle: skip and play now        N / Square: keep preparing");
+			ImGui::End();
+		}
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
-		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire)) {
+		const bool precompile_panel = PrecompilePanelVisible();
+		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
+		    !precompile_panel) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1200,6 +1365,9 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now);
+		if (precompile_panel) {
+			DrawPrecompilePanel(frame_extent);
+		}
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

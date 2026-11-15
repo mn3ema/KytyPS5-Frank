@@ -24,7 +24,11 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderLedger.h"
+#include "xxhash.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -57,6 +61,70 @@
 
 namespace Libs::Graphics {
 namespace {
+
+// KYTY_BATCH_LEDGER=<folder>: every shader's source recipe (the source part of the disk-cache key,
+// with the stage input this tool builds) goes to <folder>/ledger.bin, in the emulator's format, so
+// it can be compared with the recipes the game recorded (zero-compile plan, step 5: how much of a
+// shader's draw-time key the header alone predicts).
+std::unique_ptr<ShaderLedger::Ledger> g_ledger;
+
+// KYTY_BATCH_PAIRING=1 (zero-compile plan step 5): a pixel shader's SPI_PS_INPUT_CNTL comes from
+// the game's AGC library (AgcCreateInterpolantMapping) against the vertex-shader output layouts
+// found in the folder (the game has 7), using the first layout that supplies every input semantic,
+// instead of identity settings. A pixel shader with KILL_ENABLE also records the source the game
+// uses with kill off (and early Z): both occur in play.
+bool                                     g_pairing = false;
+
+// KYTY_BATCH_RESOURCES=1: one RES line per buffer and image of the translated program, with its
+// usage (what the instructions ask of it) and where its descriptor comes from (a structural
+// signature of the descriptor's first dword: opcodes, user-data registers and immediates), for
+// learning which specializations unplayed shaders get (zero-compile plan step 5).
+bool g_resources = false;
+
+std::string ValueSignature(const ShaderRecompiler::IR::Value& input, int depth) {
+	using namespace ShaderRecompiler::IR;
+	const Value value = input.Resolve();
+	if (value.IsEmpty()) {
+		return "_";
+	}
+	if (value.IsImmediate()) {
+		return fmt::format("#{:x}", value.ImmediateBits());
+	}
+	if (value.GetType() == Type::ScalarReg) {
+		return fmt::format("s{}", RegIndex(value.ScalarRegister()));
+	}
+	if (value.GetType() == Type::VectorReg) {
+		return "v";
+	}
+	const Inst* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return "?";
+	}
+	if (value.IsPhi()) {
+		return "phi";
+	}
+	std::string text(ValueOpcodeName(inst->GetOpcode()));
+	if (depth <= 0) {
+		return text + "(..)";
+	}
+	text += '(';
+	for (size_t i = 0; i < inst->NumArgs(); i++) {
+		text += (i == 0 ? "" : ",") + ValueSignature(inst->Arg(i), depth - 1);
+	}
+	return text + ')';
+}
+std::vector<std::vector<ShaderSemantic>> g_vs_layouts;
+
+bool LayoutFits(const Shader& ps, const std::vector<ShaderSemantic>& layout) {
+	for (uint32_t i = 0; i < ps.num_input_semantics; i++) {
+		if (std::none_of(layout.begin(), layout.end(), [&](const ShaderSemantic& out) {
+			    return out.semantic == ps.input_semantics[i].semantic;
+		    })) {
+			return false;
+		}
+	}
+	return true;
+}
 
 #ifdef _WIN32
 // A crash (not a fatal error, which exits with 321) would lose the buffered log. Print the
@@ -580,8 +648,23 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 			stage_input.compute   = &compute_info;
 			break;
 		case Prospero::ShaderBinaryType::kPs: {
+			std::array<ShaderRegister, 32> mapping {};
+			bool                           mapped = false;
+			if (g_pairing && shader->num_input_semantics != 0 && shader->input_semantics != nullptr) {
+				for (const auto& layout: g_vs_layouts) {
+					if (!LayoutFits(*shader, layout)) {
+						continue;
+					}
+					Shader gs {};
+					gs.output_semantics     = const_cast<ShaderSemantic*>(layout.data());
+					gs.num_output_semantics = static_cast<uint16_t>(layout.size());
+					mapped = Gen5::AgcCreateInterpolantMapping(mapping.data(), &gs, shader) == 0;
+					break;
+				}
+				AppendNote(note, mapped ? "paired" : "no fitting vertex layout");
+			}
 			for (uint32_t i = 0; i < 32; i++) {
-				state.context.SetPsInputSettings(i, i);
+				state.context.SetPsInputSettings(i, mapped ? mapping[i].value : i);
 			}
 			const std::array<Prospero::ColorComponentMapping, 8> export_mapping {};
 			params = PrepareProgram(state.pixel, state.context.GetShaderRegisters(), export_mapping,
@@ -668,6 +751,29 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	options.non_fatal       = true;
 	options.bindless_images = true;
 
+	uint64_t ledger_source_id = 0;
+	if (g_ledger != nullptr) {
+		const ShaderLedger::SourceFields fields {.stage          = static_cast<uint32_t>(stage),
+		                                         .shader_hash    = params.hash,
+		                                         .wave_size      = wave_size,
+		                                         .user_data_base = user_data_base,
+		                                         .bindless       = options.bindless_images,
+		                                         .non_fatal      = options.non_fatal,
+		                                         .user_data      = options.user_data,
+		                                         .code           = params.code,
+		                                         .back_code      = params.back_code};
+		const uint64_t id = stage == ShaderType::Compute ? g_ledger->RecordSource(fields, compute_info)
+		                    : stage == ShaderType::Pixel ? g_ledger->RecordSource(fields, pixel_info)
+		                                                 : g_ledger->RecordSource(fields, vertex_info);
+		AppendNote(note, fmt::format("source {:016x}", id));
+		ledger_source_id = id;
+		if (g_pairing && stage == ShaderType::Pixel && pixel_info.ps_pixel_kill_enable) {
+			auto no_kill                 = pixel_info;
+			no_kill.ps_pixel_kill_enable = false;
+			no_kill.ps_early_z = !no_kill.ps_depth_export_enable && !no_kill.ps_sample_mask_export_enable;
+			AppendNote(note, fmt::format("no-kill source {:016x}", g_ledger->RecordSource(fields, no_kill)));
+		}
+	}
 	const auto unsupported     = UnsupportedInstructions(params.code);
 	const auto translate_begin = std::chrono::steady_clock::now();
 	auto       translated      = ShaderRecompiler::TranslateProgram(params.code, options);
@@ -687,6 +793,46 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 		const auto plan_begin = std::chrono::steady_clock::now();
 		const auto plan       = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		plan_ms               = MillisecondsSince(plan_begin);
+		if (g_resources) {
+			const auto source_signature = [&](uint32_t source) {
+				if (source >= plan.descriptor_sources.size() || plan.descriptor_sources[source].dword_count == 0) {
+					return std::string("-");
+				}
+				const auto& descriptor = plan.descriptor_sources[source];
+				return ValueSignature(descriptor.dwords[0], 6) +
+				       (descriptor.indirect_descriptor.has_value() ? " indirect" : "");
+			};
+			for (size_t i = 0; i < plan.info.buffers.size(); i++) {
+				const auto& b = plan.info.buffers[i];
+				std::printf("RES\t%s\t%016" PRIx64 "\tB\t%zu\tr%dw%da%df%ds%d alias%d ext%u\t%s\n", name.c_str(),
+				            ledger_source_id, i, b.read, b.written, b.atomic, b.formatted, b.scalar,
+				            b.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias,
+				            b.max_byte_extent, source_signature(b.source).c_str());
+			}
+			for (size_t i = 0; i < plan.info.images.size(); i++) {
+				const auto& m = plan.info.images[i];
+				std::printf("RES\t%s\t%016" PRIx64 "\tI\t%zu\tc%ud%um%ur%dw%da%dz%dk%dq%du%db%d\t%s\n", name.c_str(),
+				            ledger_source_id, i, static_cast<uint32_t>(m.resource_class),
+				            static_cast<uint32_t>(m.dimension), static_cast<uint32_t>(m.mip_mode), m.read,
+				            m.written, m.atomic, m.depth_compare, m.cube, m.r128, m.unfiltered, m.bindless,
+				            source_signature(m.source).c_str());
+			}
+		}
+		// The plan fingerprint the emulator records permutations under (the source entry's payload).
+		uint64_t plan_fingerprint = 0;
+		if (g_ledger != nullptr) {
+			bool uses_clock = false;
+			for (auto* block: translated.program.blocks) {
+				for (const auto& inst: *block) {
+					uses_clock = uses_clock ||
+					             inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ReadClockRealtime64;
+				}
+			}
+			std::vector<uint8_t> record;
+			if (ShaderDiskCache::EncodeSourceRecord(false, uses_clock, &plan, record)) {
+				plan_fingerprint = XXH3_64bits(record.data(), record.size());
+			}
+		}
 		Phase("materialize");
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -701,6 +847,11 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 			spirv = fmt::format("materialization failed (line {})",
 			                    ShaderRecompiler::IR::LastIndirectImageFailureLine());
 		} else {
+			if (g_ledger != nullptr && ledger_source_id != 0) {
+				// The specialization of this tool's stand-in draw (unbound descriptors), for comparison
+				// with the game's recorded permutations.
+				g_ledger->RecordPermutation(ledger_source_id, 0, specialization, plan_fingerprint);
+			}
 			Phase("emit");
 			const auto emit_begin = std::chrono::steady_clock::now();
 			const auto push_data  = stage == ShaderType::Mesh
@@ -758,11 +909,61 @@ int main(int argc, char* argv[]) {
 	AddVectoredExceptionHandler(1, ReportCrash);
 #endif
 
+	if (const char* ledger = std::getenv("KYTY_BATCH_LEDGER"); ledger != nullptr && ledger[0] != '\0') {
+		g_ledger = ShaderLedger::Ledger::Open(ledger);
+	}
+	// The emulator's device setup turns on bindless storage images on every GPU this build targets
+	// (bindlessTable.cpp); without it the batch tool planned store-only GPU-selected images
+	// differently, so their permutations carried another plan fingerprint (fr3 review, 11-14).
+	// KYTY_BATCH_BINDLESS_STORAGE=0 plans them as before.
+	if (const char* storage = std::getenv("KYTY_BATCH_BINDLESS_STORAGE"); storage == nullptr || storage[0] != '0') {
+		ShaderRecompiler::IR::g_bindless_storage_supported.store(true, std::memory_order_relaxed);
+	}
 	const auto rows = ReadManifest(folder);
+	if (const char* resources = std::getenv("KYTY_BATCH_RESOURCES"); resources != nullptr && resources[0] == '1') {
+		g_resources = true;
+	}
+	if (const char* pairing = std::getenv("KYTY_BATCH_PAIRING"); pairing != nullptr && pairing[0] == '1') {
+		g_pairing = true;
+		for (const auto& row: rows) {
+			const auto name   = fmt::format("{:016x}", row.hash);
+			auto*      header = CopyAligned(ReadFile(folder / (name + ".header")), 16);
+			auto*      code   = CopyAligned(ReadFile(folder / (name + ".code")), 256);
+			Shader*    shader = nullptr;
+			if (Gen5::AgcCreateShader(&shader, header, code) != 0 || shader == nullptr ||
+			    shader->num_output_semantics == 0 || shader->output_semantics == nullptr) {
+				continue;
+			}
+			std::vector<ShaderSemantic> layout(shader->output_semantics,
+			                                   shader->output_semantics + shader->num_output_semantics);
+			if (std::none_of(g_vs_layouts.begin(), g_vs_layouts.end(), [&](const auto& known) {
+				    return known.size() == layout.size() &&
+				           std::memcmp(known.data(), layout.data(), layout.size() * sizeof(ShaderSemantic)) == 0;
+			    })) {
+				g_vs_layouts.push_back(std::move(layout));
+			}
+		}
+		std::printf("PAIRING\t%zu vertex output layouts\n", g_vs_layouts.size());
+	}
 	for (size_t i = first; i < std::min(end, rows.size()); i++) {
 		std::printf("START\t%zu\t%016" PRIx64 "\n", i, rows[i].hash);
 		std::fflush(stdout);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+		// A fatal error of the recompiler (EXIT) ends only this shader: one RESULT line with the
+		// message, then the next row, instead of exit 321 and a restart by the driver.
+		try {
+			Common::RecoverableExitScope recoverable;
+			RunShader(folder, rows[i]);
+		} catch (const Common::RecoverableExit& failure) {
+			auto text = failure.text;
+			std::replace(text.begin(), text.end(), '\n', ' ');
+			std::replace(text.begin(), text.end(), '\t', ' ');
+			std::printf("RESULT\t%016" PRIx64 "\t%s\t-\tfatal\t0\t0\t0\t0\t%s\t\n", rows[i].hash,
+			            rows[i].type.c_str(), text.c_str());
+		}
+#else
 		RunShader(folder, rows[i]);
+#endif
 		std::fflush(stdout);
 	}
 	std::printf("DONE\t%zu\n", rows.size());

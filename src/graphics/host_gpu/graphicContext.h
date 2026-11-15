@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 
+#include <string>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
@@ -68,6 +69,11 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// KYTY_GPL=1 and VK_EXT_graphics_pipeline_library: graphics pipelines are linked from libraries.
+	bool                               graphics_pipeline_library_enabled     = false;
+	bool                               pipeline_robustness_enabled           = false;
+	// KYTY_GPL: VK_EXT_extended_dynamic_state3 depth clip enable, depth clip -1..1, polygon mode.
+	bool                               eds3_raster_enabled                   = false;
 	bool                               depth_color_copy_enabled               = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
@@ -76,6 +82,10 @@ struct GraphicContext {
 	bool                               bindless_enabled                      = false;
 	uint32_t                           bindless_max_sampled_images           = 0;
 	uint32_t                           bindless_max_samplers                 = 0;
+	// Storage images in the bindless set too: indexed non-uniformly, updated after bind.
+	bool                               bindless_storage_enabled              = false;
+	uint32_t                           bindless_max_storage_images           = 0;
+	bool                               occlusion_query_precise               = false;
 	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
 	vk::DescriptorSet                  bindless_set                          = nullptr;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -91,6 +101,11 @@ struct GraphicContext {
 	// the GPU thread submits to it.
 	uint32_t                           queue_count    = 1;
 	vk::Queue                          readback_queue = nullptr;
+	// KYTY_DMA_READBACK (v309, default on since v311): a queue of a transfer-only family (the copy engines, which run
+	// alongside the graphics engine) for copy-queue readbacks; buffers are then shared by both
+	// families (concurrent). transfer_family is -1 without it.
+	uint32_t                           transfer_family = static_cast<uint32_t>(-1);
+	vk::Queue                          transfer_queue  = nullptr;
 	// Frames presented so far: the clock the caches age their entries by.
 	std::atomic<uint64_t>              presented_frames {0};
 
@@ -158,6 +173,9 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	// v386 [mem-census]: one line of device memory (VMA heaps: usage, budget, allocated, blocks;
+	// the free-delay quarantine) for the census.
+	[[nodiscard]] std::string DescribeDeviceMemory() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
@@ -170,6 +188,11 @@ struct GraphicContext {
 	// - everything the device holds past 90 % of the budget, which KYTY_VRAM_TARGET_MB caps
 	//   (default 14336: the emulator plans for a 16 GB card whatever card it runs on).
 	[[nodiscard]] uint64_t MemoryShortfall() const;
+	// v387: everything the device holds past percent of the budget (no commit part), read at most
+	// every 250 ms. The texture collector trims at KYTY_VRAM_TRIM_PERCENT (default 85) so the total
+	// stays clear of the budget, past which the driver moves allocations to system memory (fps ~6
+	// after ~20 min of play, 2026-11-11).
+	[[nodiscard]] uint64_t DeviceExcessOver(uint32_t percent) const;
 	// Whether everything the device holds (images, buffers, the driver's own) has reached percent
 	// of the device-local budget, or memory is short (MemoryShortfall). False when the driver
 	// cannot report usage and nothing is short.
@@ -185,6 +208,9 @@ struct GraphicContext {
 	}
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// vmaDestroyBuffer, or, with KYTY_FREE_DELAY_MS=<ms>, that long later (diagnostics: GPU reads
+	// of freed memory stop faulting while the memory is held).
+	void                   DestroyBufferMemory(VkBuffer buffer, VmaAllocation allocation);
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;

@@ -262,7 +262,7 @@ void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_
 	DrawPrep::Recycle(result);
 	result.key = key;
 	if (m_renderer.GetPipelineCache().DrawPrepCompute(cs, m_state->cp->GetCtx().GetShaderRegisters(),
-	                                                  input_info, result)) {
+	                                                  input_info, result, m_queue)) {
 		DrawPrep::Publish(std::move(result));
 	}
 }

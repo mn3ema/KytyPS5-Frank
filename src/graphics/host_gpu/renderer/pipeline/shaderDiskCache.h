@@ -135,6 +135,9 @@ void AppendInputKey(ByteWriter& key, const ShaderVertexInputInfo& info);
 void AppendInputKey(ByteWriter& key, const ShaderPixelInputInfo& info);
 void AppendInputKey(ByteWriter& key, const ShaderComputeInputInfo& info);
 void AppendSpecialization(ByteWriter& key, const ShaderRecompiler::IR::ResourceSpecialization& value);
+// The inverse of AppendSpecialization (the shader ledger replays permutations from it).
+[[nodiscard]] bool DecodeSpecialization(std::span<const uint8_t> bytes,
+                                        ShaderRecompiler::IR::ResourceSpecialization& value);
 
 struct SourceRecord {
 	bool                             unsupported = false;
@@ -172,6 +175,7 @@ public:
 		std::atomic<uint64_t> source_misses {0};
 		std::atomic<uint64_t> permutation_hits {0};
 		std::atomic<uint64_t> permutation_misses {0};
+		std::atomic<uint64_t> permutation_compatible {0}; // v425: a null buffer used another stride's module
 		std::atomic<uint64_t> rejected {0};
 		std::atomic<uint64_t> writes {0};
 		std::atomic<uint64_t> write_failures {0};
@@ -193,6 +197,9 @@ public:
 	// The payload stored under exactly this key. A file under the key's name with another key or
 	// a damaged payload counts as rejected and is a miss.
 	[[nodiscard]] bool Load(std::span<const uint8_t> key, std::vector<uint8_t>& payload);
+	// Whether a file exists under this key's name, without reading it (the startup precompile's
+	// presence check; Load still verifies the whole key when the game asks).
+	[[nodiscard]] bool Contains(std::span<const uint8_t> key) const;
 	void               Save(std::span<const uint8_t> key, std::span<const uint8_t> payload);
 	void               Flush();
 	void               LogTotals(std::string_view when);

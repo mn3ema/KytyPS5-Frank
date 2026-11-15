@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -127,6 +128,11 @@ struct EmitterState {
 	// SignedZeroInfNanPreserve for 32-bit floats: NaN-aware GLSL.std.450 operations (NMin, NMax,
 	// OpIsNan) then have the defined results the guest's IEEE instructions need.
 	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
+	// SPIR-V ids whose FP32 value is known to carry no denormal: results of the software flush
+	// (EmitFlushF32DenormAlways), and bitcasts, negations and selects of such ids. Flushing one
+	// again is the identity, so it is skipped (the legacy MAD chains flushed each operand that the
+	// previous MAD had just flushed).
+	std::unordered_set<uint32_t> f32_flushed;
 	uint32_t                                         lane_count              = 1;
 	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
@@ -138,6 +144,9 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
+	// v424g: the per-draw stride data words (BindingLayout::BufferStrideDword), loaded once at
+	// function entry (EmitMemoryOffsets) so accesses inside loops do not reload them.
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_stride_values {};
 	// Write bitmap (BindingLayout::write_tracking): the bitmap's device address, each memory
 	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
 	// instruction being emitted writes memory.
@@ -151,10 +160,16 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
+	// One formatted component through a GPU-selected descriptor (see spirvEmitterMemory.cpp);
+	// allocated on first use, defined after the program's functions.
+	uint32_t                                         indirect_formatted_function = 0;
+	// v432: BoundFormattedLoad's decode function, without and with coherent (volatile) loads.
+	std::array<uint32_t, 2>                          bound_formatted_function {};
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
+	uint32_t shader_data_uniform_variable = 0; // KYTY_SHADER_DATA_UBO
 	uint32_t                                         flattened_srt_variable  = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
@@ -200,8 +215,12 @@ struct EmitterState {
 	// loop exit is taken, so a loop whose trip count comes from bad data ends instead of hanging
 	// the GPU (structured loops; the dispatcher has its own bound).
 	uint32_t                   loop_guard_variable                   = 0;
+	uint32_t                   loop_guard_report_function            = 0; // void(u32 decisions)
 	std::vector<uint32_t>      loop_guard_merges;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	// KYTY_PROBE_TESS_LEVELS=1 with a probed evaluation shader: gl_TessLevelOuter / Inner inputs.
+	uint32_t                   probe_tess_outer_variable = 0;
+	uint32_t                   probe_tess_inner_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -245,6 +264,14 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 
 // Diagnostics: KYTY_PROBE_RECT is set and KYTY_PROBE_PC names this non-pixel shader, so it
 // appends its probed values to the bindless feedback buffer (EmitProbeAppend).
+inline bool ProbeTessLevelsWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_PROBE_TESS_LEVELS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return wanted;
+}
+
 inline bool ProbeAppendWanted(const EmitterState& state) {
 	static const uint64_t hash = [] {
 		const char* probe = std::getenv("KYTY_PROBE_PC");
@@ -278,6 +305,20 @@ template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
+	if constexpr ((std::is_same_v<Args, uint32_t> && ...)) {
+		// Same bits (bitcast), sign flip (negate) or one of two flushed values (select): flushed.
+		if constexpr ((opcode == spv::OpBitcast || opcode == spv::OpFNegate) && sizeof...(Args) == 1) {
+			const uint32_t ids[] = {args...};
+			if (state.f32_flushed.contains(ids[0])) {
+				state.f32_flushed.insert(result);
+			}
+		} else if constexpr (opcode == spv::OpSelect && sizeof...(Args) == 3) {
+			const uint32_t ids[] = {args...};
+			if (state.f32_flushed.contains(ids[1]) && state.f32_flushed.contains(ids[2])) {
+				state.f32_flushed.insert(result);
+			}
+		}
+	}
 	if constexpr (type == IR::Type::F64 &&
 	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
 		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
@@ -402,6 +443,9 @@ uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass nume
 uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass numeric_class,
                          uint32_t components);
 
+// A bindless 1D image: the host keeps 1D textures in the 2D bindless array as 2D views of height
+// 1, so the shader declares it 2D and samples row 0 (y at the row's centre).
+bool     BindlessAs2D(const IR::ImageResource& image);
 uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
@@ -409,6 +453,20 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                                 uint32_t array_index = 0);
 
+// v429 (ImageResource::dynamic_class): the image's uint binding, the per-draw class bit, and a
+// component-wise select of two 4 x u32 results.
+uint32_t LoadDynamicClassUintDescriptor(EmitterState& state, uint32_t resource);
+uint32_t DynamicClassIsUint(EmitterState& state, uint32_t resource);
+// v430 (ImageResource::dynamic_layer): the per-draw bit "the T# is a plain 2D texture".
+uint32_t DynamicLayerIs2D(EmitterState& state, uint32_t resource);
+// v431 (ImageResource::dynamic_cube): the per-draw bit "the T# is a cube", and a select of two
+// values of `type` with `components` components.
+uint32_t DynamicCubeIs(EmitterState& state, uint32_t resource);
+// v433: the draw's bit for a dynamic_3d image (ImageDim3DDword): its T# is a 2D texture.
+uint32_t DynamicImage3DIs2D(EmitterState& state, uint32_t resource);
+uint32_t SelectVector(EmitterState& state, uint32_t type, uint32_t components, uint32_t condition,
+                      uint32_t if_true, uint32_t if_false);
+uint32_t SelectU32x4(EmitterState& state, uint32_t condition, uint32_t if_true, uint32_t if_false);
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
@@ -490,6 +548,10 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 [[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
+// v424: the buffer's per-draw canonical packed stride (BindingLayout::buffer_stride_count), or 0
+// when the layout has none for it; and records x stride in bytes from such a value.
+uint32_t StorageBufferStrideData(EmitterState& state, const IR::MemoryInfo& mem);
+uint32_t RecordBytes(EmitterState& state, uint32_t records, uint32_t stride_data);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
@@ -509,7 +571,13 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 	// Write-tracked binding, while a writing instruction is emitted: its guest base (u64 id).
 	uint32_t              write_base       = 0;
+	// The length is the descriptor range and the device bounds-checks it (GetRobustBufferAccess).
+	bool                  device_bounded   = false;
 };
+
+// For a device_bounded access: the element index, clamped so that the device's 32-bit byte
+// offset cannot wrap back into the range (every clamped index is past the range anyway).
+uint32_t DeviceBoundedIndex(EmitterState& state, const MemoryResourceAccess& access, uint32_t index);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
@@ -624,6 +692,8 @@ void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBvhIntersect(EmitterState& state);
+void DefineIndirectFormattedFunction(ValueEmitContext& ctx);
+void DefineBoundFormattedFunctions(ValueEmitContext& ctx);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
 uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);

@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
+#include <chrono>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -18,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -61,9 +63,18 @@ public:
 	// Texture dump (KYTY_DUMP_TEXTURES_TRIGGER): textures bound in the frame after `frame`, plus
 	// the bindless images the usage probe saw sampled (AddTextureDumpImages), are written out.
 	void BeginTextureDump(uint64_t frame);
+	// KYTY_WATCH_IMAGE_ADDR (descriptors.cpp): copies every layer of mip 0 of one image out, with
+	// the guest bytes at the same moment, and writes both to _ShaderDump once the copy lands.
+	void WatchImageDump(ImageId id, uint64_t frame, const char* tag = "");
+	// Diagnostics (KYTY_GBUF_PATCHES): an 8x5 grid of 16x16 patches of the image, read back
+	// in command order; PollWatchImageDumps prints one hash a patch ([gpatch]).
+	void WatchImagePatches(ImageId id, uint64_t frame, std::string label);
+	void PollWatchImageDumps();
 	void AddTextureDumpImages(std::span<const ImageId> ids);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// Null when the slot is free (diagnostics outside the renderer, KYTY_PRESENT_RT).
+	[[nodiscard]] Image*        TryGetImage(ImageId id) { return m_slot_images.try_get(id); }
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -75,6 +86,10 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// A shader bound a written storage buffer starting at address: images that start there and
+	// hold guest-memory contents (not GPU-rendered ones, whose data lives only in the image) are
+	// refreshed from the buffer before their next use.
+	void               NoteShaderBufferWrite(uint64_t address);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -100,9 +115,27 @@ public:
 	[[nodiscard]] bool UnderPressure() const noexcept {
 		return m_total_used_memory >= m_pressure_gc_memory;
 	}
+	// v386 [mem-census]: what the cache holds.
+	[[nodiscard]] uint64_t TotalUsedMemory() const noexcept { return m_total_used_memory; }
+	[[nodiscard]] uint64_t PinnedMemory() const noexcept { return m_pinned_bytes; }
+	[[nodiscard]] size_t   ImageCount() const noexcept { return m_slot_images.size(); }
+	[[nodiscard]] uint64_t PressureThreshold() const noexcept { return m_pressure_gc_memory; }
+	[[nodiscard]] size_t   EvictableCount() const noexcept { return m_bindless_evictable.size(); }
+	// v387: the collector's totals since start ([mem-census]): images freed, MB freed, of them
+	// bindless ones (unsampled in the last usage probe), GPU-written ones written back first.
+	struct GcTotals {
+		uint64_t freed = 0, freed_mb = 0, bindless = 0, written_back = 0, trim_runs = 0, trim_backoffs = 0,
+		         trim_gpu_skipped = 0;
+	};
+	[[nodiscard]] GcTotals GetGcTotals() const;
 	// Image bytes the collector may free: all but the bindless-pinned ones (refreshed once a frame).
+	// v392: under memory pressure (the trim mark or the shared shortfall) the pinned images the
+	// last usage probe found unsampled count too: the collector may free them then, and with only
+	// the unpinned bytes counted it stopped short of them (an early return under 512 MB) while
+	// the pinned ones were what grew.
 	[[nodiscard]] uint64_t CollectableMemory() const noexcept {
-		return m_total_used_memory - std::min(m_total_used_memory, m_pinned_bytes);
+		const uint64_t fixed = m_pinned_bytes - std::min(m_pinned_bytes, m_pressure_counts_evictable ? m_evictable_bytes : 0);
+		return m_total_used_memory - std::min(m_total_used_memory, fixed);
 	}
 
 private:
@@ -213,6 +246,26 @@ private:
 		uint64_t                bytes = 0;
 	};
 	void                     DumpTextureNote(ImageId id); // caller holds m_lock
+	struct WatchDump {
+		ImageId                 id;
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                bytes = 0;
+		uint64_t                tick  = 0;
+		uint64_t                frame = 0;
+		std::string             tag;
+		std::vector<uint8_t>    guest;
+	};
+	std::vector<WatchDump>   m_watch_dumps;
+	struct WatchPatches {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                bytes = 0;
+		uint64_t                tick  = 0;
+		uint64_t                frame = 0;
+		uint32_t                patch_bytes = 0;
+		uint32_t                count       = 0;
+		std::string             label;
+	};
+	std::vector<WatchPatches> m_watch_patches;
 	uint64_t                 m_dump_checked_frame = UINT64_MAX;
 	uint64_t                 m_dump_frame         = UINT64_MAX;
 	uint64_t                 m_dump_tick          = 0;
@@ -247,6 +300,8 @@ private:
 	// Engine method: images the guest dropped from its texture heaps (no key refers to them any
 	// more), freed once no draw has used them for a few frames, whatever the memory pressure.
 	uint64_t                                          m_pinned_bytes = 0;
+	uint64_t                                          m_evictable_bytes = 0; // v392: pinned and in m_bindless_evictable
+	bool                                              m_pressure_counts_evictable = false; // v392
 	uint64_t                                          m_pinned_frame = UINT64_MAX;
 	std::vector<ImageId>                              m_guest_dropped;
 	uint64_t                                          m_guest_dropped_freed       = 0;
@@ -256,6 +311,12 @@ private:
 	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.
 	uint64_t         m_gc_budget_frame        = 0;
 	uint64_t         m_gc_freed_bytes_frame   = 0;
+	// v388: the trim (device memory past KYTY_VRAM_TRIM_PERCENT, below the shared 90 % shortfall)
+	// frees only images it can drop without a write-back, and backs off for 2 s after a pass that
+	// freed nothing (the 70 % test spun tens of thousands of passes writing GPU images back).
+	bool                                  m_trim_only = false;
+	uint64_t                              m_trim_freed_bytes_run = 0;
+	std::chrono::steady_clock::time_point m_trim_backoff_until {};
 	size_t           m_gc_freed_images_frame  = 0;
 	uint64_t         m_gc_written_back_bytes_frame = 0;
 	// Two-phase eviction of GPU-written images: the write-back is deferred until the GPU is done,

@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
+#include "common/tracePoints.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
@@ -13,6 +14,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -682,6 +684,12 @@ FaultStats g_fault_stats;
 
 void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bool gpu_thread,
                         uint64_t micros, bool emulated) {
+	// Everything below only feeds LOGF. With the log silent (the normal case) it was a global
+	// mutex, a linear search of the sites and, every 5,000 faults, three sorts on every fault of
+	// every game thread: ~77,000 write faults a second in the sewer.
+	if (::Log::IsSilent()) {
+		return;
+	}
 	if (gpu_thread && !emulated) {
 		// The GPU thread faulting on GPU-owned memory drains the whole pipeline; the first few
 		// get a full host stack so the command-processor path responsible can be named.
@@ -771,6 +779,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// complete the load from the backing store and leave the page protected. Otherwise the
 		// fault waits for the GPU thread, which downloads the page and drains the GPU.
 		// KYTY_NO_CLEAN_READ_EMULATION=1 restores that for every read.
+		// A page left no-access by a lazy release: it gets its real protection and the access
+		// runs again (before the emulation below, which would leave it faulting every read).
+		if (Libs::LibKernel::Memory::ResolveGpuStaleFault(access, info->access_violation_vaddr)) {
+			return true;
+		}
 		static const bool emulate_clean_reads =
 		    std::getenv("KYTY_NO_CLEAN_READ_EMULATION") == nullptr;
 		if (access == GpuAccess::Read && emulate_clean_reads &&
@@ -787,6 +800,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			                   elapsed(), false);
 			return true;
 		}
+	}
+	// v400 (11-11, mac_v397_2 at 46 min): the Render Thread wrote into memory whose AMM map had
+	// sat in its ring for 1.5 s; a map takes microseconds on the hardware. Run it now and retry.
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    Libs::LibKernel::Memory::ResolveQueuedMap(info->access_violation_vaddr)) {
+		return true;
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
@@ -826,6 +845,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 	if (info->access_violation_vaddr != 0) {
 		Libs::LibKernel::Memory::DescribeUnhandledFault(info->access_violation_vaddr);
+	}
+	// A GPU crash dump may be in flight (a driver or layer thread can fault on the device loss
+	// before the dump callback ran); let it land and decode before the process goes.
+	if (Libs::Graphics::Aftermath::Enabled()) {
+		std::printf("Aftermath: waiting for a crash dump before exiting on the host exception\n");
+		std::fflush(stdout);
+		Libs::Graphics::Aftermath::WaitForCrashDump();
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
@@ -1388,6 +1414,11 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		                      m_programs)) {
 			EXIT("Failed to apply game cheat\n");
 		}
+	}
+	if (!m_programs.empty()) {
+		auto* main_program = m_programs.front();
+		Common::TracePoints::Install(main_program->base_vaddr, main_program->mapped_size,
+		                             main_program->file_name.filename().string().c_str());
 	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);

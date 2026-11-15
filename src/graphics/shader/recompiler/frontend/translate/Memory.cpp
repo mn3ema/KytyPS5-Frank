@@ -966,9 +966,14 @@ void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOp
 }
 
 void Translator::DS_ADDTID(const Decoder::Instruction& inst, bool write) {
+	// LDS address = M0[15:0] + the 16-bit instruction offset + lane * 4. The offset was dropped
+	// before, so every DS_*_ADDTID of a shader hit the same dwords (Wolverine's particle
+	// simulation keeps its per-particle curve results in LDS this way: the scent-trail puffs
+	// read a stale slot as their size).
 	const auto memory = MemoryInfoFromDecoded(inst);
-	const auto base =
-	    ir.BitwiseAnd(ReadU32(MemorySourceAt(inst, write ? 1u : 0u)), IR::U32(IR::Value(0xffffu)));
+	const auto base   = ir.IAdd(
+	    ir.BitwiseAnd(ReadU32(MemorySourceAt(inst, write ? 1u : 0u)), IR::U32(IR::Value(0xffffu))),
+	    IR::U32(IR::Value(inst.offset & 0xffffu)));
 	const auto lane    = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto address = ir.IAdd(base, ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
 	if (write) {

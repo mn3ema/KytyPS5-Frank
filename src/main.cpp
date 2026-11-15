@@ -1,5 +1,6 @@
 #include "common/archive.h"
 #include "common/common.h"
+#include "common/cpuAffinity.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
@@ -108,11 +109,16 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --exact-denormals                    Flush FP32 denormals in software as the PS5\n"
+	         "                                       does (exact below 1.2e-38; slower on GPUs\n"
+	         "                                       without hardware flush, e.g. NVIDIA).\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --output-resolution <1080|2160|auto> TV resolution the game is told. Default: auto\n"
+	         "                                       (2160 unless the game asks for detection).\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -260,6 +266,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--fullscreen") {
 			options.config.fullscreen_enabled = true;
+			continue;
+		}
+
+		if (arg == "--exact-denormals") {
+			// The guest's FP32 denormal flushes, emulated in software (KYTY_DENORM_FLUSH=1).
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			_putenv_s("KYTY_DENORM_FLUSH", "1");
+#else
+			setenv("KYTY_DENORM_FLUSH", "1", 1);
+#endif
 			continue;
 		}
 
@@ -419,6 +435,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid gpu index: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--output-resolution") {
+			// The TV resolution the game is told (VideoOutGetOutputStatus): 1080 or 2160.
+			if (value != "1080" && value != "2160" && value != "auto") {
+				::printf("invalid output resolution: %s (1080, 2160 or auto)\n", value.c_str());
+				return false;
+			}
+			if (value != "auto") {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				_putenv_s("KYTY_OUTPUT_RESOLUTION", value.c_str());
+#else
+				setenv("KYTY_OUTPUT_RESOLUTION", value.c_str(), 1);
+#endif
+			}
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
@@ -531,7 +560,14 @@ static void ApplyFrankEnvironmentDefaults() {
 	}
 	static constexpr std::pair<const char*, const char*> Defaults[] = {
 	    {"KYTY_BINDLESS_EVICT", "0"},
-	    {"KYTY_BINDLESS_SLOT_REUSE", "0"},
+	    // Slot reuse on (2026-11-01): with it off the 2D-array binding's 65,536 slots run out after
+	    // ~25 minutes of play (black silhouettes, 3-10 fps; plan 10-23, v122 fixed the double free
+	    // reuse exposed). KYTY_BINDLESS_SLOT_REUSE=0 restores the old setting.
+	    {"KYTY_BINDLESS_SLOT_REUSE", "1"},
+	    // Multi-draw replay on (2026-11-01): ~100 ms/s off the GPU thread in Mac's opening stretch,
+	    // no artifacts in 7 runs (m87 toggled, m88 and m90-m94 always on). KYTY_MULTI_DRAW_REPLAY=0
+	    // turns it off.
+	    {"KYTY_MULTI_DRAW_REPLAY", "1"},
 	    {"KYTY_SHARED_BUFFERS", "1"},
 	    {"KYTY_WRITE_BITMAP", "1"},
 	    // Ray traversal (dc76e1223a9bf673) loops without end on our side: a 2048-step cap.
@@ -550,6 +586,26 @@ static void ApplyFrankEnvironmentDefaults() {
 	    {"KYTY_HOST_ZONES", "1"},
 	    // Repeated syncs of a range with no page changed skip the tracker walk (37-52 % skipped).
 	    {"KYTY_SYNC_SKIP", "1"},
+	    // A tracked binding's predicted ranges synced and marked in one pass (s1tbatch, 2026-11-09,
+	    // in-run A/B over 18 pairs: GPU thread 827 vs 832 ms/s, fps 26.6 vs 25.8; Mac: keep).
+	    // KYTY_TRACKED_BATCH=0 turns it off.
+	    {"KYTY_TRACKED_BATCH", "1"},
+	    // Exact per-draw/per-dispatch cuts (s2hot, 2026-11-09, in-run A/B over 18 pairs: GPU thread
+	    // 830 vs 843 ms/s, lower in 14 of 18 pairs; fps 26.5 vs 25.7). KYTY_HOTPATH=0 turns them off.
+	    {"KYTY_HOTPATH", "1"},
+	    // Pages the write bitmap releases stay no-access until a CPU access resolves them (the next
+	    // written binding arms them again): s10lazy, 2026-11-09, in-run A/B over 18 pairs: GPU
+	    // thread 807 vs 816 ms/s, fps 28.05 vs 27.55 (one release site; v366 adds the settle).
+	    // KYTY_LAZY_READ_RELEASE=0 turns it off.
+	    {"KYTY_LAZY_READ_RELEASE", "1"},
+	    // Zero-compile (v0.4): graphics pipeline libraries (used only when the driver offers
+	    // VK_EXT_graphics_pipeline_library) with per-stage descriptor sets, the startup library and
+	    // compute warm-up and the sharded driver caches. KYTY_GPL=0 / KYTY_STAGE_SETS=0 turn them off.
+	    {"KYTY_GPL", "1"},
+	    {"KYTY_STAGE_SETS", "1"},
+	    // v438g (Mac 11-15): the frame keeps its aspect ratio (16:9 on a 16:10 panel gets black
+	    // bars instead of a stretch). KYTY_KEEP_ASPECT=0: fill the window.
+	    {"KYTY_KEEP_ASPECT", "1"},
 	};
 	for (const auto& [name, value]: Defaults) {
 		if (std::getenv(name) == nullptr) {
@@ -577,6 +633,7 @@ static void ApplyFrankOptionDefaults(RunOptions& options) {
 
 static int Main(int argc, char* argv[]) {
 	ApplyFrankEnvironmentDefaults();
+	Common::OptOutOfPowerThrottling();
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)

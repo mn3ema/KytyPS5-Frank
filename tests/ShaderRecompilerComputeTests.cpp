@@ -30813,6 +30813,48 @@ TestCase DsMiscVariants() {
   return test;
 }
 
+TestCase DsAddtidOffset() {
+  using O = ShaderOpcode;
+
+  // Two ds_write_addtid with different instruction offsets must land in different dwords:
+  // LDS[M0 + offset + lane * 4]. Wolverine's particle simulation keeps per-particle curve
+  // results this way and read the wrong slot when the offset was ignored.
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(124, InlineU32(0)));
+  AppendVMovLiteral(&code, 1, 0x11111111u);
+  code.push_back(EncodeDs0(0xb0, 0));
+  code.push_back(EncodeDs1(0, 1, 0));
+  AppendVMovLiteral(&code, 2, 0x22222222u);
+  code.push_back(EncodeDs0(0xb0, 0x204));
+  code.push_back(EncodeDs1(0, 2, 0));
+  code.push_back(EncodeDs0(0xb1, 0));
+  code.push_back(EncodeDs1(3, 0, 0));
+  code.push_back(EncodeDs0(0xb1, 0x204));
+  code.push_back(EncodeDs1(4, 0, 0));
+  code.push_back(EncodeSMovB32(124, InlineU32(64)));
+  code.push_back(EncodeDs0(0xb1, 0x1c4));
+  code.push_back(EncodeDs1(5, 0, 0));
+
+  const u32 results[] = {3, 4, 5};
+  for (u32 i = 0; i < static_cast<u32>(std::size(results)); i++) {
+    AppendStoreVgpr(&code, results[i], i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsAddtidOffset";
+  test.code = code;
+  test.initial = std::vector<u32>(3, 0);
+  test.expected = {0x11111111u, 0x22222222u, 0x22222222u};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_ADDTID_B32, O::DS_READ_ADDTID_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase DsFloatMinMaxIgnoresData1() {
   using O = ShaderOpcode;
 
@@ -35167,6 +35209,7 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
+  AddCase(DsAddtidOffset);
   AddCase(DsFloatMinMaxIgnoresData1);
   AddCase([] { return DsFloatMinMaxClasses(false); });
   AddCase([] { return DsFloatMinMaxClasses(true); });

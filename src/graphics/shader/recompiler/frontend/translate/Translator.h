@@ -20,6 +20,20 @@ struct ProbePc {
 // KYTY_PROBE_PC (Translate.cpp).
 const ProbePc& ProbePcSetting();
 constexpr uint32_t ProbeVgpr = 253; // 253..255
+// Diagnostics: KYTY_EXPORT_PATCH_UV=<hash>@<pc>:v<x>,v<z>,v<u>,v<v>:<export target> (hex hash,
+// pc and target; u<n> in place of v<n> converts an unsigned integer). After <pc>, v250 = v<x> + 0.5*v<u> and v251 = v<z> + 0.5*v<v> (floats); the
+// export to <target> then writes them as components 0 and 2. With a patch corner in x/z and
+// gl_TessCoord in u/v, a pixel probe of that attribute names the patch and (u, v) that drew it.
+struct ExportPatchUv {
+	uint64_t hash   = 0;
+	uint32_t pc     = 0;
+	uint32_t regs[4] = {0, 0, 0, 0};
+	bool     as_uint[4] = {false, false, false, false}; // u<n>: the register holds an integer
+	uint32_t target = 0;
+	bool     valid  = false;
+};
+const ExportPatchUv& ExportPatchUvSetting();
+constexpr uint32_t PatchUvVgpr = 250; // 250..251
 
 class Translator {
 public:
@@ -36,8 +50,11 @@ public:
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
 	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
+	// Diagnostics (KYTY_SCALE_PC): multiplies an instruction's F32 destination by a factor.
+	void ScaleDestination(const Decoder::Instruction& inst, uint32_t factor_bits);
 	// Diagnostics (KYTY_PROBE_PC): copies the probed registers to v253..v255.
 	void ProbeCopy(const ProbePc& probe);
+	void PatchUvCopy(const ExportPatchUv& setting);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

@@ -117,7 +117,14 @@ vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 	return index < kFormatLookup.size() ? kFormatLookup[index] : vk::Format::eUndefined;
 }
 
+// Set by the renderer: the device-fault report, for a device loss seen outside the semaphore
+// waits (readback fences, ...).
+void (*g_device_lost_report)() = nullptr;
+
 void RequireVulkanSuccess(vk::Result result, const char* operation) {
+	if (result == vk::Result::eErrorDeviceLost && g_device_lost_report != nullptr) {
+		g_device_lost_report();
+	}
 	if (result != vk::Result::eSuccess) {
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));

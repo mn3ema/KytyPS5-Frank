@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/fpsLog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -13,6 +14,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
+#include "graphics/host_gpu/renderer/sync.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
@@ -377,6 +379,9 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 
 static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_offset,
                                          uint32_t value) {
+	if (cmd_offset == Pm4::DB_COUNT_CONTROL) {
+		cp.GetCtx().SetDbCountControl(value);
+	}
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
 		control.force_z_valid       = (value & 0x20000000u) != 0;
@@ -1690,10 +1695,51 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	return 6;
 }
 
+// KYTY_LOG_DRAW_PACKET_ES=<hash> (diagnostics): every DRAW_INDEX packet whose ES, GS or PS has
+// that hash: its dwords, the 48 dwords before it in the command buffer, and GS user data
+// slots 12..20, with the guest flip (40 lines a flip at most).
+static void LogDrawPacket(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer, uint32_t count) {
+	static const uint64_t watch = [] {
+		const char* value = std::getenv("KYTY_LOG_DRAW_PACKET_ES");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	if (watch == 0) {
+		return;
+	}
+	const auto& vs   = cp.GetShCtx().GetVs();
+	const auto& ps   = cp.GetShCtx().GetPs();
+	const auto  hash = [](uint64_t a) { return a != 0 ? ShaderDeclaredHash(a) : 0ull; };
+	if (hash(vs.es_regs.data_addr) != watch && hash(vs.gs_regs.data_addr) != watch &&
+	    hash(ps.ps_regs.data_addr) != watch) {
+		return;
+	}
+	static std::atomic<uint64_t> last_flip {0};
+	static std::atomic<uint32_t> lines {0};
+	const auto flip = Sync::GuestFlipCount();
+	if (last_flip.exchange(flip) != flip) lines.store(0);
+	if (lines.fetch_add(1) >= 40) {
+		return;
+	}
+	std::string text = fmt::format("[draw-packet] flip={} hdr={:08x}:", flip, cmd_id);
+	for (uint32_t i = 0; i < count; i++) {
+		text += fmt::format(" {:08x}", buffer[i]);
+	}
+	text += " | gs12..20:";
+	for (uint32_t i = 12; i <= 20; i++) {
+		text += fmt::format(" {:08x}", vs.gs_user_sgpr.value[i]);
+	}
+	text += " | before:";
+	for (int i = -49; i <= -2; i++) {
+		text += fmt::format(" {:08x}", buffer[i]);
+	}
+	std::fprintf(stderr, "%s\n", text.c_str());
+}
+
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
+	LogDrawPacket(cp, cmd_id, buffer, cmd_id == 0xc0073a00 ? 8u : 5u);
 
 	if (cmd_id == 0xc0073a00) {
 		uint32_t index_count = buffer[0];
@@ -1802,6 +1848,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0033500);
+	LogDrawPacket(cp, cmd_id, buffer, 4u);
 
 	uint32_t max_index_size = buffer[0];
 	uint32_t index_offset   = buffer[1];
@@ -1820,6 +1867,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012d00);
+	LogDrawPacket(cp, cmd_id, buffer, 2u);
 
 	uint32_t index_count = buffer[0];
 	uint32_t flags       = buffer[1];
@@ -2411,7 +2459,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (data_sel == 0 || interrupt_selector == 4) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
+			cp.EmitGuestBarrier();
 		}
 
 		trigger_interrupt();
@@ -2421,7 +2469,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
-			cp.EmitGlobalBarrier();
+			cp.EmitGuestBarrier();
 		}
 
 		trigger_interrupt();
@@ -2430,7 +2478,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	}
 
 	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
-		cp.EmitGlobalBarrier();
+		cp.EmitGuestBarrier();
 	}
 
 	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);
@@ -3215,7 +3263,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 	// KYTY_FPS_LOG: the distinct tessellation clamps the game programs (the hardware clamps tess
 	// factors to [min, max]; the host pipeline does not apply them yet).
 	static const auto log_tess_level = [](const char* which, uint32_t value) {
-		if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; !log) {
+		if (static const bool log = Common::FpsLogDiagnostics(); !log) {
 			return;
 		}
 		static std::mutex                    mutex;

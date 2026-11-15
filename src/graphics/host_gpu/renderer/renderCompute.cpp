@@ -12,8 +12,10 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/chainWatch.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/dispatchRun.h"
+#include "graphics/host_gpu/renderer/syncToggle.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/timeline.h"
@@ -38,6 +40,10 @@
 #include <cinttypes>
 #include <deque>
 #include <chrono>
+#include <xxhash.h>
+#include "graphics/host_gpu/renderer/reuseProbe.h"
+#include "graphics/host_gpu/renderer/htileWatch.h"
+#include "graphics/host_gpu/renderer/rtSnap.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +59,170 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+// KYTY_CS_WATCH=<guest address> (hex): every dispatch binding a buffer that contains the
+// address logs its hash, group counts and buffer sources, with the dwords at the address
+// before it runs ([cs-watch]). Finds the compute shader that writes a buffer a draw reads.
+uint64_t CsWatchAddress() {
+	static const uint64_t address = [] {
+		const char* value = std::getenv("KYTY_CS_WATCH");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	return address;
+}
+
+void LogCsWatch(uint64_t hash, uint32_t gx, uint32_t gy, uint32_t gz, const PreparedBindings& bindings,
+                const uint32_t* users, uint32_t user_count) {
+	const uint64_t watched = CsWatchAddress();
+	if (watched == 0) return;
+	int hit = -1;
+	for (size_t i = 0; i < bindings.buffer_sources.size(); i++) {
+		const auto& src = bindings.buffer_sources[i];
+		if (src.address != 0 && watched >= src.address && watched < src.address + src.size) {
+			hit = static_cast<int>(i);
+			break;
+		}
+	}
+	if (hit < 0) return;
+	static std::atomic<uint32_t> lines {0};
+	if (lines.fetch_add(1) >= 4000) return;
+	std::string text;
+	for (uint32_t i = 0; i < user_count && i < 16u; i++) {
+		text += fmt::format("{}{:08x}", i == 0 ? " ud:" : " ", users[i]);
+	}
+	for (const auto& src: bindings.buffer_sources) {
+		text += fmt::format(" buf:{:x}+{:x}", src.address, src.size);
+	}
+	// KYTY_CS_WATCH_DUMP=<source>:<offset>:<dwords>[:<user sgpr>:<stride>] (hex): the dwords at
+	// <offset> (+ user data register × stride) of buffer source <source> of the dispatch.
+	static const auto dump = [] {
+		std::array<uint32_t, 5> result {0, 0, 0, UINT32_MAX, 0};
+		const char*             value = std::getenv("KYTY_CS_WATCH_DUMP");
+		if (value != nullptr) {
+			char* end = nullptr;
+			result[0] = static_cast<uint32_t>(std::strtoul(value, &end, 16));
+			if (end != nullptr && *end == ':') result[1] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			if (end != nullptr && *end == ':') result[2] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			if (end != nullptr && *end == ':') result[3] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			if (end != nullptr && *end == ':') result[4] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		}
+		return result;
+	}();
+	if (dump[2] != 0 && dump[0] < bindings.buffer_sources.size()) {
+		const auto& src    = bindings.buffer_sources[dump[0]];
+		uint64_t    offset = dump[1];
+		if (dump[3] < user_count) {
+			offset += static_cast<uint64_t>(users[dump[3]]) * dump[4];
+		}
+		text += fmt::format(" dump[{}]+{:x}:", dump[0], offset);
+		for (uint32_t i = 0; i < dump[2]; i++) {
+			const uint64_t at = src.address + offset + i * 4u;
+			uint32_t       w  = 0xdeadbeefu;
+			if (src.address != 0 && offset + i * 4u + 4u <= src.size && GuestRange {at, 4}.Valid()) {
+				std::memcpy(&w, reinterpret_cast<const void*>(at), 4);
+			}
+			text += fmt::format(" {:08x}", w);
+		}
+	}
+	// KYTY_CS_WATCH_EMITTERS=<record offset>:<dwords> (hex): source 0 is a table of 0x50-byte
+	// entries (count at +192, record index at +204, from +0); print each new record of source 1
+	// (stride 0x300) once, the dwords at <record offset> ([cs-emitter]).
+	static const std::array<uint32_t, 2> emitters = [] {
+		std::array<uint32_t, 2> result {0, 0};
+		if (const char* value = std::getenv("KYTY_CS_WATCH_EMITTERS"); value != nullptr) {
+			char* end = nullptr;
+			result[0] = static_cast<uint32_t>(std::strtoul(value, &end, 16));
+			if (end != nullptr && *end == ':') result[1] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		}
+		return result;
+	}();
+	// The buffer sources' descriptors (stride, records, dword 3), once per shader.
+	std::vector<ShaderBufferResource> descriptors;
+	if (bindings.runtime != nullptr && bindings.runtime->program != nullptr &&
+	    bindings.runtime->resources != nullptr &&
+	    !bindings.runtime->program->bindings.descriptors.empty()) {
+		for (const auto resource: bindings.runtime->program->bindings.descriptors.front().resources) {
+			descriptors.push_back(
+			    DecodeNativeDescriptor<ShaderBufferResource>(bindings.runtime->resources->buffers[resource]));
+		}
+		static std::unordered_set<uint64_t> described;
+		if (described.insert(hash).second) {
+			std::string d;
+			for (size_t i = 0; i < descriptors.size(); i++) {
+				d += fmt::format(" [{}]{:x}:s{}:n{:x}:{:08x}", i, descriptors[i].Base48(), descriptors[i].Stride(),
+				                 descriptors[i].NumRecords(), descriptors[i].fields[3]);
+			}
+			std::fprintf(stderr, "[cs-desc] hash=%016llx%s\n", static_cast<unsigned long long>(hash), d.c_str());
+		}
+	}
+	if (emitters[1] != 0 && bindings.buffer_sources.size() > 1) {
+		static std::unordered_set<uint64_t> seen;
+		const auto& table  = bindings.buffer_sources[0];
+		const auto& record = bindings.buffer_sources[1];
+		for (uint64_t at = 192; at + 64 <= table.size; at += 0x50) {
+			uint32_t entry[16] = {};
+			if (!GuestRange {table.address + at, 64}.Valid()) break;
+			std::memcpy(entry, reinterpret_cast<const void*>(table.address + at), 64);
+			if (entry[0] == 0 || entry[0] > 0x100000u || entry[3] >= 0x800u) continue;
+			const uint64_t base = static_cast<uint64_t>(entry[3]) * 0x300u + emitters[0];
+			std::string    values;
+			uint64_t       key = entry[3] * 0x100000001b3ull ^ entry[15];
+			for (uint32_t i = 0; i < emitters[1]; i++) {
+				uint32_t w = 0xdeadbeefu;
+				if (base + i * 4u + 4u <= record.size && GuestRange {record.address + base + i * 4u, 4}.Valid()) {
+					std::memcpy(&w, reinterpret_cast<const void*>(record.address + base + i * 4u), 4);
+				}
+				key = key * 1099511628211ull ^ w;
+				values += fmt::format(" {:08x}", w);
+			}
+			if (seen.size() < 20000 && seen.insert(key).second) {
+				// Curve keys (16 bytes, in the 16-byte-stride sources): for each curve block of the
+				// simulation (record + 424, 456, ..., 744: index, key count), the first two keys at
+				// record[304] + index.
+				const uint64_t rec  = record.address + entry[3] * 0x300u;
+				uint32_t       base = 0;
+				std::string    keys;
+				if (GuestRange {rec, 0x300}.Valid()) {
+					std::memcpy(&base, reinterpret_cast<const void*>(rec + 304u), 4);
+					static constexpr uint32_t kCurves[] = {424, 456, 488, 520, 552, 584, 616, 648, 680, 712, 744};
+					for (size_t i = 2; i < descriptors.size() && i < bindings.buffer_sources.size(); i++) {
+						const auto& src = bindings.buffer_sources[i];
+						if (descriptors[i].Stride() != 16 || src.address != 0x1210000000ull) continue;
+						for (const auto field: kCurves) {
+							uint32_t index = 0, count = 0;
+							std::memcpy(&index, reinterpret_cast<const void*>(rec + field), 4);
+							std::memcpy(&count, reinterpret_cast<const void*>(rec + field + 4u), 4);
+							if (count == 0 || count > 64) continue;
+							const uint64_t at = static_cast<uint64_t>(base + index) * 16u;
+							keys += fmt::format(" c{}n{}:", field, count);
+							for (uint32_t w = 0; w < 8u; w++) {
+								uint32_t v = 0xdeadbeefu;
+								if (at + w * 4u + 4u <= src.size && GuestRange {src.address + at + w * 4u, 4}.Valid()) {
+									std::memcpy(&v, reinterpret_cast<const void*>(src.address + at + w * 4u), 4);
+								}
+								keys += fmt::format(" {:08x}", v);
+							}
+						}
+						break;
+					}
+				}
+				std::fprintf(stderr, "[cs-emitter] hash=%016llx emitter=%x count=%u base=%08x %08x rows=%08x |%s | keys%s\n",
+				             static_cast<unsigned long long>(hash), entry[3], entry[0], entry[1], entry[2],
+				             entry[15], values.c_str(), keys.c_str());
+			}
+		}
+	}
+	uint32_t words[8] = {};
+	if (GuestRange {watched, sizeof(words)}.Valid()) {
+		std::memcpy(words, reinterpret_cast<const void*>(watched), sizeof(words));
+	}
+	std::fprintf(stderr,
+	             "[cs-watch] hash=%016llx groups=%ux%ux%u hit=%d%s | %08x %08x %08x %08x %08x %08x %08x %08x\n",
+	             static_cast<unsigned long long>(hash), gx, gy, gz, hit, text.c_str(), words[0], words[1],
+	             words[2], words[3], words[4], words[5], words[6], words[7]);
+}
+} // namespace
 
 void NoteTickWork(uint64_t tick, char kind, uint64_t a, uint64_t b); // diagnosticCheckpoints.cpp
 
@@ -112,8 +282,42 @@ struct DispatchRecoveryPolicy {
 	uint64_t                               retries              = 0;
 	uint64_t                               rearms               = 0;
 
+	uint64_t saved_bytes = 0, saved_buffers = 0;
+	double   drain_ms    = 0;
+	uint64_t window_protected = 0, window_trusted = 0, window_rearms = 0, window_retries = 0;
+	uint64_t window_saved_bytes = 0, window_saved_buffers = 0;
+	double   window_drain_ms = 0;
+	std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
+
+	// [dispatch-recovery] every 5 s on stderr: what the rollback protection cost.
+	void Report() {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - window_start < std::chrono::seconds(5)) {
+			return;
+		}
+		const double seconds = std::chrono::duration<double>(now - window_start).count();
+		std::fprintf(stderr,
+		             "[dispatch-recovery] %.0f s: protected %" PRIu64 " trusted %" PRIu64
+		             " rearms %" PRIu64 " retries %" PRIu64 " saved %" PRIu64 " buffers %" PRIu64
+		             " MB drain %.0f ms (unattributed faults so far %" PRIu64 ")\n",
+		             seconds, protected_dispatches - window_protected,
+		             trusted_dispatches - window_trusted, rearms - window_rearms,
+		             retries - window_retries, saved_buffers - window_saved_buffers,
+		             (saved_bytes - window_saved_bytes) >> 20u, drain_ms - window_drain_ms,
+		             seen_faults);
+		window_protected     = protected_dispatches;
+		window_trusted       = trusted_dispatches;
+		window_rearms        = rearms;
+		window_retries       = retries;
+		window_saved_bytes   = saved_bytes;
+		window_saved_buffers = saved_buffers;
+		window_drain_ms      = drain_ms;
+		window_start         = now;
+	}
+
 	void Count(bool trusted) {
 		(trusted ? trusted_dispatches : protected_dispatches)++;
+		Report();
 		if (((protected_dispatches + trusted_dispatches) & 0x3fff) == 0) {
 			LOGF("DispatchRecovery: protected=%" PRIu64 " trusted=%" PRIu64 " retries=%" PRIu64
 			     " rearms=%" PRIu64 " shaders=%zu\n",
@@ -175,15 +379,24 @@ public:
 		}
 		policy.Count(false);
 		// Reports from earlier work cannot be attributed to this transaction.
+		const auto drain_start = std::chrono::steady_clock::now();
 		cache.ProcessFaultBuffer();
 		(KYTY_SUBMIT_REASON(), scheduler.Finish());
+		policy.drain_ms += std::chrono::duration<double, std::milli>(
+		                       std::chrono::steady_clock::now() - drain_start)
+		                       .count();
 		RangeSet ranges;
-		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
-			const auto& source = bindings.buffer_sources[i];
-			if (!program.info.buffers[i].written || source.size == 0) continue;
-			const auto start = source.address & ~uint64_t {3};
-			const auto end   = (source.address + source.size + 3) & ~uint64_t {3};
-			ranges.Add(start, end - start);
+		// buffer_sources follows the binding layout's buffers, which can be fewer than the
+		// shader's buffer resources (only the live ones are bound).
+		if (!bindings.buffer_sources.empty() && !program.bindings.descriptors.empty()) {
+			const auto& bound = program.bindings.descriptors.front().resources;
+			for (size_t i = 0; i < bindings.buffer_sources.size() && i < bound.size(); ++i) {
+				const auto& source = bindings.buffer_sources[i];
+				if (!program.info.buffers[bound[i]].written || source.size == 0) continue;
+				const auto start = source.address & ~uint64_t {3};
+				const auto end   = (source.address + source.size + 3) & ~uint64_t {3};
+				ranges.Add(start, end - start);
+			}
 		}
 		ranges.ForEach([&](uint64_t start, uint64_t end) {
 			const auto id = cache.FindBuffer(start, end - start);
@@ -210,8 +423,9 @@ public:
 				const auto hash =
 				    (uint64_t {report.trap.shader_hash_high} << 32) | report.trap.shader_hash_low;
 				EXIT("GPU shader trap after page residency: hash=0x%016" PRIx64
-				     " pc=0x%08x code=0x%02x\n",
-				     hash, report.trap.pc, report.trap.code);
+				     " pc=0x%08x code=0x%02x values=%08x %08x %08x\n",
+				     hash, report.trap.pc, report.trap.code, report.trap.reserved[0],
+				     report.trap.reserved[1], report.trap.reserved[2]);
 			}
 			if (m_attempts == 0) {
 				policy.clean_runs[m_shader_address]++;
@@ -220,9 +434,26 @@ public:
 		}
 		policy.clean_runs[m_shader_address] = 0;
 		policy.retries++;
-		if (++m_attempts > 128) {
-			EXIT("GPU shader paging did not converge: shader=0x%016" PRIx64 " pages=%" PRIu64 "\n",
-			     m_shader_address, report.page_count);
+		// KYTY_RECOVERY_STRICT=1: a dispatch whose pages never become resident ends the session
+		// (as before). Otherwise, after 16 attempts it keeps its last result (the missing pages read
+		// zero) and the GPU thread goes on: one unbackable page must not end a test run.
+		static const bool strict = [] {
+			const char* value = std::getenv("KYTY_RECOVERY_STRICT");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (++m_attempts > (strict ? 128u : 16u)) {
+			if (strict) {
+				EXIT("GPU shader paging did not converge: shader=0x%016" PRIx64 " pages=%" PRIu64 "\n",
+				     m_shader_address, report.page_count);
+			}
+			static std::atomic<uint32_t> gave_up {0};
+			if (gave_up.fetch_add(1, std::memory_order_relaxed) < 64) {
+				std::fprintf(stderr,
+				             "[dispatch-recovery] gave up: shader=0x%016" PRIx64 " pages=%" PRIu64
+				             " after %u attempts\n",
+				             m_shader_address, report.page_count, m_attempts - 1);
+			}
+			return false;
 		}
 		static uint32_t reports = 0;
 		if (reports++ < 32) {
@@ -249,6 +480,8 @@ public:
 
 private:
 	void Save(const Buffer& source, uint64_t offset, uint64_t address, uint64_t size, bool gds) {
+		RecoveryPolicy().saved_bytes += size;
+		RecoveryPolicy().saved_buffers++;
 		auto saved =
 		    std::make_unique<Buffer>(m_context.GetGraphics(), m_context.GetCommandScheduler(),
 		                             MemoryUsage::DeviceLocal, 0, AllFlags, size);
@@ -281,8 +514,29 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+static bool ConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+                                    const CommandBuffer&          buffer);
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
+	const bool consumed = ConsumeComputeMetaClear(input, buffer);
+	if (HtileWatch::MetaClearLog()) {
+		const auto& program   = *input.stage.program;
+		const auto& resources = *input.stage.resources;
+		for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+			const auto& resource = program.info.buffers[i];
+			if (!resource.written) continue;
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			HtileWatch::NoteComputeWrite(program.shader_hash, descriptor.Base48(),
+			                             descriptor.GetSize(), resource.read, consumed,
+			                             program.info.has_bitwise_xor);
+		}
+	}
+	return consumed;
+}
+
+static bool ConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+                                    const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -847,10 +1101,103 @@ static bool RunSkipsBarrierAfter() {
 	return true;
 }
 
+// The renderer mutex for a dispatch, at a tracked depth (RenderContext::LockRenderer) so the
+// async-compute thread's program-lookup window can release it.
+class DispatchRendererLock {
+public:
+	explicit DispatchRendererLock(RenderContext& context): m_context(context) {
+		KYTY_PROFILER_BLOCK("Renderer mutex wait");
+		m_context.LockRenderer();
+	}
+	~DispatchRendererLock() { m_context.UnlockRenderer(); }
+	KYTY_CLASS_NO_COPY(DispatchRendererLock);
+
+private:
+	RenderContext& m_context;
+};
+
+// KYTY_ASYNC_THREAD: on the async-compute thread, the program lookup and SRT refresh
+// (GetComputeProgram, with that thread's own program cache) run without the renderer mutex.
+// Afterwards the thread's registers are bound to the scheduler's command buffer again.
+class ProgramLookupWindow {
+public:
+	explicit ProgramLookupWindow(RenderContext& context): m_context(context) {
+		if (GuestGpu::IsAsyncThread() && context.GetPipelineCache().HasAsyncProgramCache()) {
+			m_active = true;
+			m_depth  = context.ReleaseRenderer();
+		}
+	}
+	~ProgramLookupWindow() {
+		if (m_active) {
+			KYTY_PROFILER_BLOCK("Renderer mutex wait (after program lookup)");
+			m_context.ReacquireRenderer(m_depth);
+			GuestGpu::RebindCurrentProcessor();
+		}
+	}
+	KYTY_CLASS_NO_COPY(ProgramLookupWindow);
+
+private:
+	RenderContext& m_context;
+	uint32_t       m_depth  = 0;
+	bool           m_active = false;
+};
+
+void QueueStatsNoteDispatch(uint64_t program_ns, uint64_t total_ns); // graphicsRun.cpp
+void QueueStatsNoteDispatchParts(uint64_t prepare_ns, uint64_t record_ns); // graphicsRun.cpp
+void QueueStatsNoteBindings(uint64_t shader_hash, uint64_t bindings_hash, uint64_t srt_hash); // graphicsRun.cpp
+static void NoteDispatchBindings(uint64_t shader_hash, const ShaderRecompiler::IR::ResourceSnapshot& r) {
+	static const bool enabled = std::getenv("KYTY_QUEUE_STATS") != nullptr;
+	if (!enabled) return;
+	uint64_t h = XXH3_64bits(r.buffers.data(), r.buffers.size() * sizeof(r.buffers[0]));
+	h ^= XXH3_64bits(r.images.data(), r.images.size() * sizeof(r.images[0])) * 0x9e3779b97f4a7c15ull;
+	h ^= XXH3_64bits(r.samplers.data(), r.samplers.size() * sizeof(r.samplers[0])) * 0xc2b2ae3d27d4eb4full;
+	const uint64_t srt = XXH3_64bits(r.flattened_srt.data(), r.flattened_srt.size() * 4u);
+	QueueStatsNoteBindings(shader_hash, h, srt);
+}
+namespace {
+// KYTY_QUEUE_STATS: a dispatch's whole time and its program-lookup part, per guest queue. The
+// clock is read only when the stats are on (two to four clock reads a dispatch otherwise, ~1% of
+// the GPU thread at 50k dispatches a second).
+bool QueueTimingEnabled() {
+	static const bool enabled = std::getenv("KYTY_QUEUE_STATS") != nullptr;
+	return enabled;
+}
+struct QueueDispatchTimer {
+	bool                                  on    = QueueTimingEnabled();
+	std::chrono::steady_clock::time_point begin = on ? std::chrono::steady_clock::now()
+	                                                 : std::chrono::steady_clock::time_point {};
+	uint64_t                              program_ns = 0;
+	~QueueDispatchTimer() {
+		if (!on) {
+			return;
+		}
+		QueueStatsNoteDispatch(program_ns,
+		                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                 std::chrono::steady_clock::now() - begin)
+		                                                 .count()));
+	}
+};
+struct ScopedNs {
+	uint64_t&                             out;
+	bool                                  on    = QueueTimingEnabled();
+	std::chrono::steady_clock::time_point begin = on ? std::chrono::steady_clock::now()
+	                                                 : std::chrono::steady_clock::time_point {};
+	~ScopedNs() {
+		if (!on) {
+			return;
+		}
+		out += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now() - begin)
+		                                 .count());
+	}
+};
+} // namespace
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
+	QueueDispatchTimer queue_timer;
 	DispatchRunPost run_post(m_context, buffer);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -871,11 +1218,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	if (ReuseProbe::Enabled()) {
+		ReuseProbe::NoteDispatch(sh_ctx, thread_group_x, thread_group_y, thread_group_z, 0);
+	}
 	// The zone is the wait for the renderer mutex (another thread holding it).
-	Common::LockGuard lock = [&]() -> Common::LockGuard {
-		KYTY_PROFILER_BLOCK("Renderer mutex wait");
-		return Common::LockGuard(m_context.GetMutex());
-	}();
+	DispatchRendererLock lock(m_context);
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -934,6 +1281,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderProgram compute_program;
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
+		ScopedNs program_time {queue_timer.program_ns};
+		ProgramLookupWindow window(m_context);
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}
@@ -956,8 +1305,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		input_info.dispatch_threads_num[2] = thread_group_z;
 	}
 
+	DispatchDirectRecord(submit_id, buffer, cs_regs, input_info, compute_program, thread_group_x,
+	                     thread_group_y, thread_group_z, mode);
+}
+
+void RenderExecutor::DispatchDirectRecord(uint64_t submit_id, CommandBuffer& buffer,
+                                          const HW::ComputeShaderInfo& cs_regs,
+                                          ShaderComputeInputInfo&      input_info,
+                                          const ShaderProgram&         compute_program,
+                                          uint32_t thread_group_x, uint32_t thread_group_y,
+                                          uint32_t thread_group_z, uint32_t mode) {
+	(void)submit_id;
+	const bool use_thread_dimensions = input_info.dispatch_thread_dimensions;
 	const auto& program   = *input_info.stage.program;
 	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
+	NoteDispatchBindings(program.shader_hash, *input_info.stage.resources);
 	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'C', program.shader_hash, cs_regs.cs_regs.data_addr);
 	const auto& resources = *input_info.stage.resources;
 	// KYTY_LOG_CS_IMAGES=1: each compute shader's written images (extent, format), once per shape.
@@ -969,9 +1331,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const uint64_t key = program.shader_hash ^ (uint64_t {r.Width5()} << 1u) ^
 			                     (uint64_t {r.Height5()} << 17u) ^ (uint64_t {static_cast<uint32_t>(r.Format())} << 33u) ^ (uint64_t {i} << 45u);
 			if (seen.insert(key).second) {
-				std::fprintf(stderr, "[cs-image] hash=%016llx image[%u] %ux%u fmt=%u groups=%ux%ux%u\n",
+				std::fprintf(stderr, "[cs-image] hash=%016llx image[%u] %ux%ux%u type=%u fmt=%u groups=%ux%ux%u\n",
 				             static_cast<unsigned long long>(program.shader_hash), i,
 				             static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+				             static_cast<uint32_t>(r.Depth()) + 1u, static_cast<uint32_t>(r.Type()),
 				             static_cast<uint32_t>(r.Format()), thread_group_x, thread_group_y, thread_group_z);
 			}
 		}
@@ -1006,6 +1369,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	// KYTY_QUEUE_STATS: the parts after the program lookup ([queue-stats2]).
+	struct PartsNote {
+		using Clock = std::chrono::steady_clock;
+		bool              on    = QueueTimingEnabled();
+		Clock::time_point begin = on ? Clock::now() : Clock::time_point {};
+		Clock::time_point mid {};
+		void              Mid() {
+			if (on) mid = Clock::now();
+		}
+		~PartsNote() {
+			if (!on || mid == Clock::time_point {}) return;
+			const auto end = Clock::now();
+			QueueStatsNoteDispatchParts(
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(mid - begin).count()),
+			    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - mid).count()));
+		}
+	} parts_note;
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
@@ -1016,11 +1396,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
 	FindBuffers(bindings);
+	LogCsWatch(program.shader_hash, thread_group_x, thread_group_y, thread_group_z, bindings,
+	           cs_regs.cs_user_sgpr.value, cs_regs.cs_user_sgpr.count);
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
+	// The dispatch loop below resolves the images again before recording, and nothing in between
+	// reads them: with single rebind, this first pass only repeated each image's view lookup
+	// (KYTY_HOTPATH).
+	if (!SingleRebind() || !SyncToggle::HotPath()) RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	// The dispatch loop below binds the buffers again before recording; this first pass only
 	// repeated every buffer's sync and the flattened SRT upload (KYTY_SINGLE_REBIND=0: as before).
@@ -1036,7 +1421,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		     " hash=0x%016" PRIx64 " tick=%" PRIu64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
+		     frame_num, cs_regs.cs_regs.data_addr, program.shader_hash,
 		     m_context.GetCommandScheduler().CurrentTick(),
 		     thread_group_x, thread_group_y, thread_group_z, mode,
 		     input_info.threads_num[0], input_info.threads_num[1],
@@ -1086,14 +1471,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	parts_note.Mid();
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
+		uint64_t join_epoch = m_context.GetBufferCache().UnregisterEpoch();
 		RebindBuffers(bindings);
+		{
+			PreparedBindings* join_stage = &bindings;
+			(void)RebindAfterJoin(std::span {&join_stage, 1u}, join_epoch, "dispatch");
+		}
+		ChainWatch::Note(program.shader_hash,
+		                 m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+		                 cs_regs.cs_user_sgpr.value, cs_regs.cs_user_sgpr.count, bindings.buffer_sources);
 		const auto        vk_buffer        = buffer.Recorder();
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
+		NoteFaultMapBindings(true);
 		KYTY_PROFILER_BLOCK("Dispatch::Record");
 		bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 		    HasShaderBufferWrites(input_info.stage);
@@ -1121,13 +1516,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		{
 			// Name each compute shader once by its code address, so a device-fault checkpoint
 			// (which prints the address) can be matched to a hash for KYTY_SKIP_SHADER_HASHES.
+			// Repeated dispatches of one shader skip the set (the common case in dispatch runs).
 			static std::unordered_set<uint64_t> named;
-			if (named.insert(cs_regs.cs_regs.data_addr).second) {
+			static thread_local uint64_t        last_named = ~uint64_t {0};
+			if (const auto addr = static_cast<uint64_t>(cs_regs.cs_regs.data_addr);
+			    addr != last_named && (last_named = addr, named.insert(addr).second)) {
 				std::fprintf(stderr, "[cs] addr=0x%016" PRIx64 " hash=0x%016" PRIx64 "\n",
 				             static_cast<uint64_t>(cs_regs.cs_regs.data_addr), program.shader_hash);
 			}
 		}
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		RtSnap::BufferProbeAfterDispatch(m_context, program.shader_hash, bindings, cs_regs.cs_user_sgpr.value,
+		                                 cs_regs.cs_user_sgpr.count);
+		if (RtSnap::Enabled()) {
+			PreparedBindings* const snap_stage = &bindings;
+			RtSnap::AfterCommand(m_context, "dispatch", std::span(&snap_stage, 1));
+		}
 		Profiler::Add(Profiler::Counter::Dispatches);
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
@@ -1144,13 +1548,292 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
+namespace {
+// G4 stage 1: the async-compute thread's queued direct dispatches (QueueDispatchDirect).
+struct QueuedDispatch {
+	uint64_t                                 submit_id = 0;
+	HW::ComputeShaderInfo                    cs_regs {};
+	ShaderComputeInputInfo                   input_info {};
+	ShaderProgram                            program {};
+	ShaderRecompiler::IR::ResourceSnapshot   resources;
+	uint32_t                                 groups[3] {};
+	uint32_t                                 mode = 0;
+	bool                                     indirect  = false;
+	uint64_t                                 args_addr = 0;
+	// Nothing to record (the dispatch was dropped when queued), only its place in its dispatch
+	// run: a run's last dispatch closes the run (DispatchRunPost) even when it is dropped.
+	bool                                     post_only = false;
+	// DispatchRun() as the command processor set it for this dispatch.
+	const uint32_t*                          run_packet    = nullptr;
+	bool                                     run_continues = false;
+	bool                                     run_more      = false;
+	uint64_t                                 program_ns    = 0;
+};
+struct DispatchQueue {
+	std::vector<std::unique_ptr<QueuedDispatch>> entries; // reused, so the snapshots keep their storage
+	size_t                                       count       = 0;
+	uint64_t                                     last_shader = 0; // CS address of the last entry
+};
+thread_local DispatchQueue t_dispatch_queue;
+
+QueuedDispatch& NextQueuedEntry(uint64_t shader_addr) {
+	auto& queue = t_dispatch_queue;
+	if (queue.count == queue.entries.size()) {
+		queue.entries.push_back(std::make_unique<QueuedDispatch>());
+	}
+	queue.last_shader = shader_addr;
+	auto& entry       = *queue.entries[queue.count];
+	entry.post_only   = false;
+	return entry;
+}
+
+// A dropped dispatch keeps its place in its dispatch run (QueuedDispatch::post_only).
+void QueueRunPostOnly(uint64_t shader_addr) {
+	if (!DispatchRunsEnabled() || !DispatchSyncEnabled()) {
+		return;
+	}
+	auto&       entry   = NextQueuedEntry(shader_addr);
+	const auto& run     = DispatchRun();
+	entry.post_only     = true;
+	entry.run_packet    = run.packet;
+	entry.run_continues = run.continues;
+	entry.run_more      = run.more;
+	entry.program_ns    = 0;
+	t_dispatch_queue.count++;
+}
+
+// Marks the thread off-lock unless it already is (the command processor marks the whole packet).
+struct OffLockMark {
+	bool marked = !RenderContext::RendererReleased();
+	OffLockMark() {
+		if (marked) RenderContext::MarkOffLock(true);
+	}
+	~OffLockMark() {
+		if (marked) RenderContext::MarkOffLock(false);
+	}
+	KYTY_CLASS_NO_COPY(OffLockMark);
+};
+} // namespace
+
+uint64_t RenderExecutor::LastQueuedShader() noexcept {
+	return t_dispatch_queue.count != 0 ? t_dispatch_queue.last_shader : 0;
+}
+
+size_t RenderExecutor::QueuedDispatchCount() noexcept {
+	return t_dispatch_queue.count;
+}
+
+void RenderExecutor::QueueDispatchDirect(uint64_t submit_id, const HW::ComputeShaderInfo& cs_regs,
+                                         const HW::ShaderRegisters& sh_regs, uint32_t thread_group_x,
+                                         uint32_t thread_group_y, uint32_t thread_group_z,
+                                         uint32_t mode) {
+	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
+			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 " (queued)\n",
+			     thread_group_x, thread_group_y, thread_group_z, mode, cs_regs.cs_regs.data_addr);
+		}
+		QueueRunPostOnly(cs_regs.cs_regs.data_addr);
+		return;
+	}
+	if (cs_regs.cs_regs.data_addr == 0) {
+		QueueRunPostOnly(0);
+		return;
+	}
+	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
+		Profiler::Add(Profiler::Counter::SkippedSkipList);
+		QueueRunPostOnly(cs_regs.cs_regs.data_addr);
+		return;
+	}
+	auto& queue = t_dispatch_queue;
+	auto& entry = NextQueuedEntry(cs_regs.cs_regs.data_addr);
+
+	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
+	ShaderComputeInputInfo& input_info = entry.input_info;
+	input_info                         = {};
+	const bool use_thread_dimensions   = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	input_info.workgroup_counts[0]        = thread_group_x;
+	input_info.workgroup_counts[1]        = thread_group_y;
+	input_info.workgroup_counts[2]        = thread_group_z;
+	if (use_thread_dimensions) {
+		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+		                                cs_regs.cs_regs.num_thread_z};
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			const auto size    = std::max(group_sizes[axis], 1u);
+			const auto threads = input_info.workgroup_counts[axis];
+			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
+		}
+	}
+	const auto program_begin = std::chrono::steady_clock::now();
+	ShaderProgram compute_program;
+	{
+		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram (queued)");
+		const OffLockMark off_lock;
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}
+	const auto program_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                                  std::chrono::steady_clock::now() - program_begin)
+	                                                  .count());
+	if (!compute_program) {
+		if (!PipelineCache::SrtDeferPending()) {
+			char groups[48];
+			std::snprintf(groups, sizeof(groups), "%ux%ux%u", thread_group_x, thread_group_y,
+			              thread_group_z);
+			LogSkippedDispatch(cs_regs, groups);
+		}
+		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER), or skipped.
+		if (QueueTimingEnabled()) QueueStatsNoteDispatch(program_ns, program_ns);
+		QueueRunPostOnly(cs_regs.cs_regs.data_addr);
+		return;
+	}
+	if (use_thread_dimensions) {
+		input_info.dispatch_threads_num[0] = thread_group_x;
+		input_info.dispatch_threads_num[1] = thread_group_y;
+		input_info.dispatch_threads_num[2] = thread_group_z;
+	}
+	// The snapshot lives in the program cache's entry, which the next lookup of the shader
+	// overwrites: the queued dispatch keeps a copy.
+	entry.resources             = *input_info.stage.resources;
+	input_info.stage.resources  = &entry.resources;
+	entry.submit_id             = submit_id;
+	entry.cs_regs               = cs_regs;
+	entry.program               = compute_program;
+	entry.groups[0]             = thread_group_x;
+	entry.groups[1]             = thread_group_y;
+	entry.groups[2]             = thread_group_z;
+	entry.mode                  = mode;
+	entry.indirect              = false;
+	entry.args_addr             = 0;
+	const auto& run             = DispatchRun();
+	entry.run_packet            = run.packet;
+	entry.run_continues         = run.continues;
+	entry.run_more              = run.more;
+	entry.program_ns            = program_ns;
+	queue.count++;
+}
+
+void RenderExecutor::QueueDispatchIndirect(uint64_t submit_id, const HW::ComputeShaderInfo& cs_regs,
+                                           const HW::ShaderRegisters& sh_regs, uint64_t args_addr,
+                                           uint32_t mode) {
+	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0);
+	if (cs_regs.cs_regs.data_addr == 0) {
+		QueueRunPostOnly(0);
+		return;
+	}
+	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
+		Profiler::Add(Profiler::Counter::SkippedSkipList);
+		QueueRunPostOnly(cs_regs.cs_regs.data_addr);
+		return;
+	}
+	auto& queue = t_dispatch_queue;
+	auto& entry = NextQueuedEntry(cs_regs.cs_regs.data_addr);
+
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	ShaderComputeInputInfo& input_info      = entry.input_info;
+	input_info                              = {};
+	input_info.dispatch_thread_dimensions   = use_thread_dimensions;
+	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
+	const auto    program_begin = std::chrono::steady_clock::now();
+	ShaderProgram compute_program;
+	{
+		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram (queued indirect)");
+		const OffLockMark off_lock;
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}
+	const auto program_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                                  std::chrono::steady_clock::now() - program_begin)
+	                                                  .count());
+	if (!compute_program) {
+		if (!PipelineCache::SrtDeferPending()) {
+			LogSkippedDispatch(cs_regs, "indirect");
+		}
+		if (QueueTimingEnabled()) QueueStatsNoteDispatch(program_ns, program_ns);
+		QueueRunPostOnly(cs_regs.cs_regs.data_addr);
+		return;
+	}
+	entry.resources            = *input_info.stage.resources;
+	input_info.stage.resources = &entry.resources;
+	entry.submit_id            = submit_id;
+	entry.cs_regs              = cs_regs;
+	entry.program              = compute_program;
+	entry.groups[0] = entry.groups[1] = entry.groups[2] = 0;
+	entry.mode                 = mode;
+	entry.indirect             = true;
+	entry.args_addr            = args_addr;
+	const auto& run            = DispatchRun();
+	entry.run_packet           = run.packet;
+	entry.run_continues        = run.continues;
+	entry.run_more             = run.more;
+	entry.program_ns           = program_ns;
+	queue.count++;
+}
+
+void RenderExecutor::CommitQueuedDispatches(CommandBuffer& buffer) {
+	auto& queue = t_dispatch_queue;
+	if (queue.count == 0) {
+		return;
+	}
+	// Restored after: the command processor's current packet may be a dispatch of the run.
+	auto&      run            = DispatchRun();
+	const auto saved_packet   = run.packet;
+	const auto saved_continue = run.continues;
+	const auto saved_more     = run.more;
+	for (size_t i = 0; i < queue.count; i++) {
+		auto& entry = *queue.entries[i];
+		EXIT_IF(buffer.IsInvalid());
+		if (entry.post_only) {
+			run.packet    = entry.run_packet;
+			run.continues = entry.run_continues;
+			run.more      = entry.run_more;
+			const DispatchRunPost run_post(m_context, buffer);
+			continue;
+		}
+		const auto commit_begin = QueueTimingEnabled() ? std::chrono::steady_clock::now()
+		                                               : std::chrono::steady_clock::time_point {};
+		run.packet    = entry.run_packet;
+		run.continues = entry.run_continues;
+		run.more      = entry.run_more;
+		{
+			DispatchRunPost run_post(m_context, buffer);
+			m_context.GetCommandScheduler().PopPendingOperations();
+			if (entry.indirect) {
+				buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect),
+				                    entry.submit_id, static_cast<uint32_t>(entry.args_addr),
+				                    static_cast<uint32_t>(entry.args_addr >> 32u), 0, entry.mode,
+				                    entry.cs_regs.cs_regs.data_addr);
+				DispatchRendererLock lock(m_context);
+				DispatchIndirectRecord(entry.submit_id, buffer, entry.cs_regs, entry.input_info,
+				                       entry.program, entry.args_addr, entry.mode);
+			} else {
+				buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect),
+				                    entry.submit_id, entry.groups[0], entry.groups[1], entry.groups[2],
+				                    entry.mode, entry.cs_regs.cs_regs.data_addr);
+				DispatchRendererLock lock(m_context);
+				DispatchDirectRecord(entry.submit_id, buffer, entry.cs_regs, entry.input_info,
+				                     entry.program, entry.groups[0], entry.groups[1], entry.groups[2],
+				                     entry.mode);
+			}
+		}
+		if (QueueTimingEnabled()) {
+			const auto commit_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                 std::chrono::steady_clock::now() - commit_begin)
+			                                                 .count());
+			QueueStatsNoteDispatch(entry.program_ns, entry.program_ns + commit_ns);
+		}
+	}
+	queue.count = 0;
+	run.packet    = saved_packet;
+	run.continues = saved_continue;
+	run.more      = saved_more;
+}
+
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
-	static const bool merged_barriers = [] {
-		const char* value = std::getenv("KYTY_INDIRECT_MERGED_BARRIERS");
-		return value != nullptr && value[0] == '1';
-	}();
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	QueueDispatchTimer queue_timer;
 	DispatchRunPost run_post(m_context, buffer);
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
 	// shader bounds its threads by the counts it reads from the same memory.
@@ -1161,13 +1844,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	// The zone is the wait for the renderer mutex (another thread holding it).
-	Common::LockGuard lock = [&]() -> Common::LockGuard {
-		KYTY_PROFILER_BLOCK("Renderer mutex wait");
-		return Common::LockGuard(m_context.GetMutex());
-	}();
+	DispatchRendererLock lock(m_context);
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
+	}
+	if (ReuseProbe::Enabled()) {
+		ReuseProbe::NoteDispatch(buffer.GetShaders(), 0, 0, 0, args_addr);
 	}
 	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
 		Profiler::Add(Profiler::Counter::SkippedSkipList);
@@ -1177,8 +1860,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.dispatch_thread_dimensions   = use_thread_dimensions;
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	ShaderProgram compute_program;
+	{
+		ScopedNs program_time {queue_timer.program_ns};
+		const auto&         sh_regs = buffer.GetRegisters().GetShaderRegisters();
+		ProgramLookupWindow window(m_context);
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}
 	if (!compute_program && PipelineCache::SrtDeferPending()) {
 		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER); not skipped.
 		ResetBindings();
@@ -1189,9 +1877,29 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	DispatchIndirectRecord(submit_id, buffer, cs_regs, input_info, compute_program, args_addr, mode);
+}
+
+void RenderExecutor::DispatchIndirectRecord(uint64_t submit_id, CommandBuffer& buffer,
+                                            const HW::ComputeShaderInfo& cs_regs,
+                                            ShaderComputeInputInfo&      input_info,
+                                            const ShaderProgram&         compute_program,
+                                            uint64_t args_addr, uint32_t mode) {
+	(void)submit_id;
+	static const bool merged_env = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_MERGED_BARRIERS");
+		return value != nullptr && value[0] == '1';
+	}();
+	// v305: also in the sync toggle's on windows with mode "mbarrier" (constant within a frame).
+	const bool merged_barriers = merged_env || SyncToggle::MergedBarrierWindow();
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	{
+		// Repeated dispatches of one shader skip the set (the common case in dispatch runs).
 		static std::unordered_set<uint64_t> named;
-		if (named.insert(cs_regs.cs_regs.data_addr).second) {
+		static thread_local uint64_t        last_named = ~uint64_t {0};
+		if (const auto addr = static_cast<uint64_t>(cs_regs.cs_regs.data_addr);
+		    addr != last_named && (last_named = addr, named.insert(addr).second)) {
 			std::fprintf(stderr, "[cs-indirect] addr=0x%016" PRIx64 " hash=0x%016" PRIx64 "\n",
 			             static_cast<uint64_t>(cs_regs.cs_regs.data_addr),
 			             input_info.stage.program->shader_hash);
@@ -1271,7 +1979,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	LogCsWatch(program.shader_hash, 0u, 0u, 0u, bindings, cs_regs.cs_user_sgpr.value,
+	           cs_regs.cs_user_sgpr.count);
 	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
+	NoteDispatchBindings(program.shader_hash, *input_info.stage.resources);
 	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'C', program.shader_hash, cs_regs.cs_regs.data_addr);
 	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
 		static std::unordered_set<uint64_t> seen;
@@ -1282,9 +1993,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			const uint64_t key = program.shader_hash ^ (uint64_t {r.Width5()} << 1u) ^
 			                     (uint64_t {r.Height5()} << 17u) ^ (uint64_t {static_cast<uint32_t>(r.Format())} << 33u) ^ (uint64_t {i} << 45u);
 			if (seen.insert(key).second) {
-				std::fprintf(stderr, "[cs-image] hash=%016llx image[%u] %ux%u fmt=%u indirect\n",
+				std::fprintf(stderr, "[cs-image] hash=%016llx image[%u] %ux%ux%u type=%u fmt=%u indirect\n",
 				             static_cast<unsigned long long>(program.shader_hash), i,
 				             static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+				             static_cast<uint32_t>(r.Depth()) + 1u, static_cast<uint32_t>(r.Type()),
 				             static_cast<uint32_t>(r.Format()));
 			}
 		}
@@ -1293,13 +2005,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
-	RebindImages(bindings);
+	// As in DispatchDirectRecord: the loop below resolves the images again (KYTY_HOTPATH).
+	if (!SingleRebind() || !SyncToggle::HotPath()) RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; the loop below finalizes the shader bindings
 	// afterward (KYTY_SINGLE_REBIND=0: also bind them here first, as before).
 	if (!SingleRebind()) RebindBuffers(bindings);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
+		// KYTY_REBIND_AFTER_JOIN: the argument lookup or a binding's can join a buffer another
+		// binding resolved (the arguments are only read, so only the bindings are resolved again).
+		uint64_t       join_epoch      = m_context.GetBufferCache().UnregisterEpoch();
 		vk::Buffer     indirect_buffer = nullptr;
 		vk::DeviceSize indirect_offset = 0;
 		if (run_converted) {
@@ -1362,8 +2078,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		RebindBuffers(bindings);
 		PreparedBindings* descriptor_stage = &bindings;
+		(void)RebindAfterJoin(std::span {&descriptor_stage, 1u}, join_epoch, "indirect dispatch");
+		ChainWatch::Note(program.shader_hash,
+		                 m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+		                 cs_regs.cs_user_sgpr.value, cs_regs.cs_user_sgpr.count, bindings.buffer_sources);
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
+		NoteFaultMapBindings(true);
 		const auto vk_buffer = buffer.Recorder();
 		const bool has_storage_writes =
 		    bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage) ||
@@ -1400,6 +2121,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		GpuTiming::Before(m_context, buffer);
 		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		RtSnap::BufferProbeAfterDispatch(m_context, program.shader_hash, bindings, cs_regs.cs_user_sgpr.value,
+		                                 cs_regs.cs_user_sgpr.count);
+		if (RtSnap::Enabled()) {
+			PreparedBindings* const snap_stage = &bindings;
+			RtSnap::AfterCommand(m_context, "dispatch", std::span(&snap_stage, 1));
+		}
 		Profiler::Add(Profiler::Counter::Dispatches);
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
