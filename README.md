@@ -24,6 +24,11 @@ v0.3 measured other spots (see "New in v0.3" below); the closest match, grass / 
 
 Target: 60 FPS in Performance mode, 30 in Fidelity.
 
+### v0.4.1 (November 19)
+
+- **Fixed:** the crash "Fatal Error: condition (!m_threaded || size > Chunk::Size)" in `commandScheduler.cpp`, some minutes into gameplay. A command bigger than the recording thread's block size now gets a block of its own. Same shader list and caches as v0.4: copy the new `kyty_emulator.exe` over the old one, or use the full download.
+- Error messages name source files from the project root (`src/...`), not the path of the build machine.
+
 ### New in v0.4
 
 - **Shader compile stutter mostly gone, even on a first play.** The download ships a shader list for Wolverine; the first start builds it before the title screen ("Preparing pipelines", about 45–50 minutes on the test laptop, resumable; Esc or Cross skips it, with a warning that the game may stutter). In a 10-minute cold run of the opening and first gameplay, 7 shaders still compiled during play, a few milliseconds each (875 in a 40-minute session before). A restart compiles nothing.

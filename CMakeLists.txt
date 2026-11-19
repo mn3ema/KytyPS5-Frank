@@ -193,6 +193,25 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
 
+# __FILE__ in assert and log messages names files from the source root (src/...), not the path of
+# the machine that built the release (fetched dependencies: from the build directory). Debug info
+# keeps full paths, so the PDB still finds the sources; the exe names its PDB without a directory.
+if(CLANG OR GCC)
+	# Both spellings: the generator passes some sources with backslashes.
+	string(REPLACE "/" "\\" kyty_source_dir_bs "${CMAKE_SOURCE_DIR}")
+	string(REPLACE "/" "\\" kyty_binary_dir_bs "${CMAKE_BINARY_DIR}")
+	foreach(kyty_prefix "${CMAKE_SOURCE_DIR}/" "${CMAKE_BINARY_DIR}/" "${kyty_source_dir_bs}\\" "${kyty_binary_dir_bs}\\")
+		if(KYTY_CLANG_CL)
+			add_compile_options("/clang:-fmacro-prefix-map=${kyty_prefix}=")
+		else()
+			add_compile_options("-fmacro-prefix-map=${kyty_prefix}=")
+		endif()
+	endforeach()
+	if(KYTY_CLANG_CL)
+		add_link_options("/PDBALTPATH:%_PDB%")
+	endif()
+endif()
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 
 # Profile-guided optimization (clang and clang-cl), after Jetsku's U59 build. Use a separate build
@@ -479,6 +498,9 @@ file(GLOB_RECURSE shader_cache_headers CONFIGURE_DEPENDS
 set(shader_cache_seeds_file "${PROJECT_BINARY_DIR}/shaderCacheSeeds.txt")
 list(JOIN shader_cache_seeds "\n" shader_cache_seeds_text)
 file(CONFIGURE OUTPUT "${shader_cache_seeds_file}" CONTENT "${shader_cache_seeds_text}\n" @ONLY)
+# Empty: the hash. A release rebuilt from the same recompiler sources on a checkout with other line
+# endings can name the release's version here (16 hex digits) to keep its shader caches valid.
+set(KYTY_SHADER_CACHE_SOURCE_VERSION "" CACHE STRING "Shader disk cache source version override (empty: hash of the sources)")
 set(shader_cache_version_header "${PROJECT_BINARY_DIR}/shaderCacheVersion.h")
 set(shader_cache_version_stamp "${PROJECT_BINARY_DIR}/shaderCacheVersion.stamp")
 add_custom_command(
@@ -491,6 +513,7 @@ add_custom_command(
 	        "-DEXTRA=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE} ${CMAKE_SYSTEM_PROCESSOR}"
 	        "-DOUTPUT=${shader_cache_version_header}"
 	        "-DSTAMP=${shader_cache_version_stamp}"
+	        "-DVERSION_OVERRIDE=${KYTY_SHADER_CACHE_SOURCE_VERSION}"
 	        -P "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
 	DEPENDS ${shader_cache_seeds} ${shader_cache_headers} "${shader_cache_seeds_file}"
 	        "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"

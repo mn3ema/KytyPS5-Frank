@@ -923,7 +923,17 @@ void CommandScheduler::EnableRecordingThread() {
 }
 
 void* CommandScheduler::Allocate(size_t size, size_t alignment) {
-	EXIT_IF(!m_threaded || size > Chunk::Size);
+	EXIT_IF(!m_threaded);
+	if (size > Chunk::Size) {
+		// v441d: a stash bigger than a chunk (a player hit 'size > Chunk::Size' here) gets its own
+		// block; the next recorded command's chunk keeps it (Record), so it lives as long as the
+		// data that command reads.
+		auto block = std::make_unique<std::byte[]>(size + alignment);
+		auto raw   = reinterpret_cast<uintptr_t>(block.get());
+		auto* data = reinterpret_cast<void*>((raw + alignment - 1) & ~(uintptr_t {alignment} - 1));
+		m_pending_big.push_back(std::move(block));
+		return data;
+	}
 	const auto take = [this] {
 		std::lock_guard lock(m_record_mutex);
 		if (m_free_chunks.empty()) {
@@ -1016,6 +1026,7 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 		{
 			std::lock_guard lock(m_record_mutex);
 			if (recycled != nullptr) {
+				recycled->big.clear();
 				m_free_chunks.push_back(std::move(recycled));
 			}
 			m_chunks_executed++;

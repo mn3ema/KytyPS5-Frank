@@ -119,6 +119,11 @@ public:
 			m_chunk->first = command;
 		}
 		m_chunk->last = command;
+		// v441d: oversized stashes made since the last command belong to this command's chunk.
+		for (auto& block: m_pending_big) {
+			m_chunk->big.push_back(std::move(block));
+		}
+		m_pending_big.clear();
 	}
 	// Copies count elements into memory that stays valid until the recording thread has run the
 	// next command recorded after this call (threaded only).
@@ -224,6 +229,8 @@ private:
 		size_t           used  = 0;
 		RecordedCommand* first = nullptr;
 		RecordedCommand* last  = nullptr;
+		// v441d: stashes larger than a chunk (a big barrier or region list), freed with the chunk.
+		std::vector<std::unique_ptr<std::byte[]>> big;
 	};
 	void* Allocate(size_t size, size_t alignment);
 	void  DispatchChunk();
@@ -268,6 +275,7 @@ private:
 	// free list and counters to m_record_mutex; m_worker_buffer to the recording thread (read by
 	// the producer only after a drain).
 	bool                                m_threaded = false;
+	std::vector<std::unique_ptr<std::byte[]>> m_pending_big; // v441d: see Allocate
 	std::unique_ptr<Chunk>              m_chunk;
 	std::mutex                          m_record_mutex;
 	std::condition_variable_any         m_record_available;
