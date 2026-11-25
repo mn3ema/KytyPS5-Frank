@@ -1,4 +1,5 @@
 #include "common/emulatorConfig.h"
+#include "common/proConfig.h"
 
 #include "common/assert.h"
 
@@ -78,6 +79,31 @@ bool HideCursorEnabled() {
 
 bool VrEnabled() {
 	return g_config->vr_enabled;
+}
+
+ProOptions& MutableProOptions() {
+	static ProOptions options;
+	return options;
+}
+
+bool Ps5ProEnabled() {
+	return MutableProOptions().pro_enabled;
+}
+
+PssrUpscaler GetPssrUpscaler() {
+	return MutableProOptions().pssr_upscaler;
+}
+
+const std::filesystem::path& GetDlssFolder() {
+	return MutableProOptions().dlss_folder;
+}
+
+uint32_t GetDlssPreset() {
+	return MutableProOptions().dlss_preset;
+}
+
+const std::filesystem::path& GetFsrFolder() {
+	return MutableProOptions().fsr_folder;
 }
 
 bool AmdCpuEnabled() {

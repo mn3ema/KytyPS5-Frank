@@ -7,6 +7,8 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/barrierMerge.h"
+#include "graphics/host_gpu/renderer/fsr3FrameGen.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -50,6 +52,8 @@ struct Presenter::Frame {
 	// The guest flip that produced this frame (sync.cpp's flip count when it was prepared):
 	// lines up KYTY_FRAME_PROBE samples with per-flip renderer logs.
 	uint64_t      guest_flip   = 0;
+	// Frame generation's newest prepared frame when this flip was made (0: none, no motion).
+	uint64_t      fg_frame     = 0;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -738,14 +742,24 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] bool       FrameGeneration() const noexcept { return m_frame_generation; }
+	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
+	// Where RecordPresentCommands put the game image.
+	[[nodiscard]] vk::Rect2D GameRect() const noexcept { return m_game_rect; }
 
 private:
 	void Destroy();
+	// Frame generation's swapchain takes images to present in SHADER_READ_ONLY_OPTIMAL.
+	[[nodiscard]] vk::ImageLayout PresentLayout() const noexcept {
+		return m_frame_generation ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::ePresentSrcKHR;
+	}
 	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
 	vk::Format       m_format = vk::Format::eUndefined;
+	bool             m_frame_generation = false;
+	vk::Rect2D       m_game_rect {};
 	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
@@ -913,13 +927,18 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+	// FSR 3.1 frame generation (KYTY_FSR3_FG=1 in Pro mode with FSR): FidelityFX's swapchain, which
+	// presents a generated frame between each two real ones and paces them.
+	m_frame_generation = Fsr3::FrameGen::Enabled(); // v0.5 FG: the F8 switch decides
+	RequireVulkanSuccess(m_frame_generation ? Fsr3::FrameGen::CreateSwapchain(create_info, &m_handle)
+	                                        : graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
-		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+		    return m_frame_generation ? Fsr3::FrameGen::GetSwapchainImages(m_handle, count, images)
+		                              : graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
 
@@ -999,7 +1018,9 @@ void Swapchain::Destroy() {
 			graphics.device.destroyImageView(view, nullptr);
 		}
 	}
-	if (m_handle != nullptr) {
+	if (m_handle != nullptr && m_frame_generation) {
+		Fsr3::FrameGen::DestroySwapchain(m_handle);
+	} else if (m_handle != nullptr) {
 		graphics.device.destroySwapchainKHR(m_handle, nullptr);
 	}
 
@@ -1033,16 +1054,21 @@ void Swapchain::Recreate(bool surface_lost) {
 
 bool Swapchain::NeedsResize() const {
 	Common::LockGuard lock(m_window.mutex);
+	// v0.5 FG: F8 switched frame generation: the swapchain is made again (FidelityFX's or the plain one).
 	return m_window_extent.width != m_window.graphic_ctx.screen_width ||
-	       m_window_extent.height != m_window.graphic_ctx.screen_height;
+	       m_window_extent.height != m_window.graphic_ctx.screen_height ||
+	       m_frame_generation != Fsr3::FrameGen::Enabled();
 }
 
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result =
+	    m_frame_generation
+	        ? Fsr3::FrameGen::AcquireNextImage(m_handle, m_image_acquired[m_frame_index], &m_image_index)
+	        : m_window.graphic_ctx.device.acquireNextImageKHR(m_handle, std::numeric_limits<uint64_t>::max(),
+	                                                          m_image_acquired[m_frame_index], nullptr,
+	                                                          &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1266,6 +1292,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                                                 source->image.extent.height)
 	                                   : vk::Rect2D {{0, 0}, m_extent};
 	const auto& rect = t_present_rect;
+	m_game_rect      = rect;
 	if (source != nullptr && (rect.extent.width != m_extent.width ||
 	                          rect.extent.height != m_extent.height)) {
 		// Black bars: clear the whole image, then blit into the rectangle.
@@ -1316,7 +1343,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                                                 : vk::AccessFlagBits::eMemoryRead;
 	to_present.oldLayout           = vk::ImageLayout::eTransferDstOptimal;
 	to_present.newLayout           = draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal
-	                                                 : vk::ImageLayout::ePresentSrcKHR;
+	                                                 : PresentLayout();
 	to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	to_present.image               = m_images[m_image_index];
@@ -1348,7 +1375,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
-		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
+		to_present.newLayout     = PresentLayout();
 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                           vk::PipelineStageFlagBits::eAllCommands,
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
@@ -1376,7 +1403,10 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	{
+	if (m_frame_generation) {
+		// Not under queue_mutex: the swapchain's submissions to the queue take it themselves.
+		result = Fsr3::FrameGen::Present(m_window.graphic_ctx.queue, present);
+	} else {
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
@@ -1451,6 +1481,16 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->guest_flip = Libs::Graphics::Sync::GuestFlipCount();
+	// Frame generation in normal mode: this frame's stand-in inputs, recorded with its copy. FidelityFX
+	// records through its own driver pointers, so the barrier merge is told around it.
+	if (Fsr3::FrameGen::Enabled() && Fsr3::FrameGen::OpticalFlowOnly()) {
+		buffer.EndRendering();
+		const auto command = buffer.Handle();
+		NoteUnhookedCommands(command);
+		Fsr3::FrameGen::PrepareBlank(command);
+		NoteUnhookedCommands(command);
+	}
+	frame->fg_frame   = Fsr3::FrameGen::LatestFrame();
 	if (PresentRt::Get().enabled) {
 		auto&      cache = m_impl->renderer.GetTextureCache();
 		const auto id    = PresentRt::Chosen();
@@ -1476,6 +1516,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
+	frame->fg_frame         = 0;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
@@ -1596,6 +1637,14 @@ void Presenter::Impl::Present(bool repeat) {
 		if (dumped) {
 			present_scheduler.Wait(dump_tick);
 			frame_dump->Write(window.graphic_ctx.presented_frames.load(std::memory_order_relaxed));
+		}
+		// Frame generation: which prepared frame this present shows (a repeat gets no motion), and
+		// where the game image lies. No HUD-less image: the HUD is interpolated with the scene.
+		const Fsr3::FrameGen::DumpGenerated dump_generated; // none; lives until swapchain.Present returns
+		if (swapchain.FrameGeneration()) {
+			const auto* shown = layers[0].frame;
+			Fsr3::FrameGen::Configure(swapchain.Handle(), shown != nullptr ? shown->fg_frame : 0,
+			                          swapchain.GameRect(), nullptr, dump_generated);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {

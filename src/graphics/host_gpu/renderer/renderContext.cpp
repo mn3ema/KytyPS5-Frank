@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/timeline.h"
+#include "common/floorStats.h"
 #include "common/fpsLog.h"
 
 #include "common/profiler.h"
@@ -10,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/guestWait.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
@@ -413,6 +415,25 @@ bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	return ok;
 }
 
+int RenderContext::TryLiftCleanReadPage(uint64_t fault_vaddr) noexcept {
+	// Game threads only: the GPU thread (and a command processor in or out of an off-lock window)
+	// can fault while it holds the buffer cache's write-state mutex.
+	if (!BufferCache::FastFinishCleanReadEnabled() || GuestGpu::IsGpuThread() || RendererReleased() ||
+	    HoldsRenderer() || !IsMapped(fault_vaddr, 1) || !m_page_manager.IsReadWatched(fault_vaddr)) {
+		return 0;
+	}
+	// As HandleFault: protection changes the GPU thread handed to the helper come first.
+	DrainProtectionHelper(ProtectDrainReason::Fault);
+	const int result = m_buffer_cache.TryFastFinishCleanRead(fault_vaddr);
+	if (result == 1 && m_page_manager.IsReadWatched(fault_vaddr)) {
+		// Another watcher keeps the page protected: the access would fault again, so it is
+		// emulated as before (never a loop of lifts).
+		BufferCache::NoteCleanReadStillWatched();
+		return 0;
+	}
+	return result;
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -520,6 +541,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	const auto unmap = [this, vaddr, size] {
+		const CpuCost::Phase cpu_phase_("Unmap::GpuThread");
+		if (Common::FloorStats::Enabled()) {
+			Common::FloorStats::Add(Common::FloorStats::Get().gpu_unmaps, 1);
+		}
 		m_page_manager.ForgetStale(vaddr, size);
 		const std::pair<uint64_t, uint64_t> range {vaddr, size};
 		DrainForUnmap({&range, 1});
@@ -579,6 +604,10 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 		return;
 	}
 	const auto unmap = [this, &mapped] {
+		const CpuCost::Phase cpu_phase_("Unmap::GpuThread");
+		if (Common::FloorStats::Enabled()) {
+			Common::FloorStats::Add(Common::FloorStats::Get().gpu_unmaps, mapped.size());
+		}
 		DrainForUnmap(mapped);
 		for (const auto& [vaddr, size]: mapped) {
 			m_page_manager.ForgetStale(vaddr, size);
@@ -734,6 +763,7 @@ static void DumpGuestMemory(GraphicContext& graphics, BufferCache& cache) {
 }
 
 void RenderContext::RunGarbageCollector() {
+	const CpuCost::Phase cpu_phase_("GarbageCollector");
 	DumpGuestMemory(GetGraphics(), m_buffer_cache);
 	LogWatchedRereads(m_buffer_cache, GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	if (m_fault_process_pending) {
@@ -759,14 +789,77 @@ void RenderContext::RunGarbageCollector() {
 		             "[mem-census] t=%.0f device %" PRIu64 "/%" PRIu64 " MB short %" PRIu64 " MB | textures %" PRIu64
 		             " MB (pinned %" PRIu64 ", %zu images, pressure at %" PRIu64 ", evictable %zu; gc freed %" PRIu64
 		             " / %" PRIu64 " MB, bindless %" PRIu64 ", written back %" PRIu64 ", trim runs %" PRIu64 " (backoffs %" PRIu64 ", GPU-written left %" PRIu64 ")"
-		             ") | buffers %" PRIu64 " MB (%zu) |%s\n",
+		             ") | buffers %" PRIu64 " MB (%zu) |%s | evictable %" PRIu64 " MB\n",
 		             std::chrono::duration<double>(now - start).count(), graphics.GetDeviceMemoryUsage() >> 20u,
 		             graphics.GetTotalMemoryBudget() >> 20u, graphics.MemoryShortfall() >> 20u,
 		             m_texture_cache.TotalUsedMemory() >> 20u, m_texture_cache.PinnedMemory() >> 20u,
 		             m_texture_cache.ImageCount(), m_texture_cache.PressureThreshold() >> 20u,
 		             m_texture_cache.EvictableCount(), gc.freed, gc.freed_mb, gc.bindless, gc.written_back, gc.trim_runs, gc.trim_backoffs, gc.trim_gpu_skipped,
 		             m_buffer_cache.TotalUsedMemory() >> 20u, m_buffer_cache.BufferCount(),
-		             graphics.DescribeDeviceMemory().c_str());
+		             graphics.DescribeDeviceMemory().c_str(), m_texture_cache.EvictableBytes() >> 20u);
+		// v438zn: every third census (30 s), how much of the texture memory is in levels no view
+		// asks for (TextureCache::LevelCensus). KYTY_TEX_LEVELS=0 turns it off.
+		static const bool levels_on = [] {
+			const char* value = std::getenv("KYTY_TEX_LEVELS");
+			return value == nullptr || value[0] != '0';
+		}();
+		static uint32_t census_count = 0;
+		if (levels_on && census_count++ % 3 == 0) {
+			const auto c  = m_texture_cache.GetLevelCensus();
+			const auto mb = [](uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
+			std::fprintf(stderr,
+			             "[tex-levels] t=%.0f textures with a level chain: %llu images, %llu MB (pinned %llu MB) | levels "
+			             "finer than any view has asked for: %llu MB in %llu images (pinned %llu MB), of it %llu MB the "
+			             "game does not have mapped now | finer than the view asked for last: %llu MB in %llu images "
+			             "(pinned %llu MB) | never viewed: %llu MB in %llu images\n",
+			             std::chrono::duration<double>(now - start).count(), static_cast<unsigned long long>(c.images),
+			             mb(c.bytes), mb(c.pinned_bytes), mb(c.unasked_bytes),
+			             static_cast<unsigned long long>(c.unasked_images), mb(c.unasked_pinned_bytes),
+			             mb(c.unasked_unmapped_bytes), mb(c.below_latest_bytes),
+			             static_cast<unsigned long long>(c.below_latest_images), mb(c.below_latest_pinned_bytes),
+			             mb(c.unviewed_bytes), static_cast<unsigned long long>(c.unviewed_images));
+			// v438zo: whether that memory is held once, and how the allocator's blocks are filled.
+			const auto s = m_texture_cache.GetShareCensus();
+			const auto n = [](uint64_t count) { return static_cast<unsigned long long>(count); };
+			std::fprintf(stderr,
+			             "[tex-share] t=%.0f %llu images: %llu MB by guest size, %llu MB from the allocator | their ranges "
+			             "cover %llu MB of guest memory: %llu MB is held more than once (%llu images, %llu MB, lie inside "
+			             "another's range; %llu of them, %llu MB, have exactly another's range) | not mapped by the game "
+			             "now: %llu MB in %llu images | pinned: %llu images, %llu MB over %llu MB of guest memory | "
+			             "GPU-written: %llu MB\n",
+			             std::chrono::duration<double>(now - start).count(), n(s.images), mb(s.bytes), mb(s.host_bytes),
+			             mb(s.covered_bytes), mb(s.bytes > s.covered_bytes ? s.bytes - s.covered_bytes : 0),
+			             n(s.inside_images), mb(s.inside_bytes), n(s.same_range_images), mb(s.same_range_bytes),
+			             mb(s.unmapped_bytes), n(s.unmapped_images), n(s.pinned_images), mb(s.pinned_bytes),
+			             mb(s.pinned_covered_bytes), mb(s.gpu_written_bytes));
+			std::fprintf(stderr, "[vma-frag] t=%.0f%s\n", std::chrono::duration<double>(now - start).count(),
+			             graphics.DescribeFragmentation().c_str());
+			if (TexSparseMode() != 0) {
+				const auto sc = m_texture_cache.GetSparseCensus();
+				std::fprintf(stderr,
+				             "[tex-sparse] t=%.0f mode %u%s: %llu sparse images, %llu MB of memory bound in %llu binds | "
+				             "%llu of them have levels without memory: %llu MB by guest size | bound but finer than "
+				             "the last view can reach: %llu MB in %llu images\n",
+				             std::chrono::duration<double>(now - start).count(), TexSparseMode(),
+				             graphics.sparse_images ? "" : " (the device features are off: no image is sparse)",
+				             n(sc.images), mb(sc.bound_bytes), n(sc.binds), n(sc.partly_images), mb(sc.unbound_bytes),
+				             mb(sc.idle_bytes), n(sc.idle_images));
+			}
+			// v438zp: the "not mapped" bytes of [tex-share], level by level against what the views
+			// can reach.
+			const auto r = m_texture_cache.GetReachCensus();
+			std::fprintf(stderr,
+			             "[tex-reach] t=%.0f %llu images with a level chain, %llu MB; %llu of them have a LOD clamp of a "
+			             "level or more | levels no view can reach: %llu MB in %llu images (pinned %llu MB), of it %llu MB "
+			             "not mapped by the game | levels a view can reach that the game has not mapped: %llu MB in %llu "
+			             "images | no level mapped at all: %llu MB in %llu images | finer than the last view can reach: "
+			             "%llu MB | called not mapped but readable in the backing store: %llu MB\n",
+			             std::chrono::duration<double>(now - start).count(), n(r.images), mb(r.bytes), n(r.clamped_images),
+			             mb(r.out_of_reach_bytes), n(r.out_of_reach_images), mb(r.out_of_reach_pinned_bytes),
+			             mb(r.out_of_reach_unmapped_bytes), mb(r.reachable_unmapped_bytes),
+			             n(r.reachable_unmapped_images), mb(r.no_level_mapped_bytes), n(r.no_level_mapped_images),
+			             mb(r.below_latest_reach_bytes), mb(r.unmapped_but_readable_bytes));
+		}
 	}
 }
 
@@ -798,6 +891,7 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
+	LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Eop);
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);

@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -452,11 +453,29 @@ public:
 			Fail(0, "resources already tracked");
 		}
 		FoldBoundedLoopSelectors();
+		m_native_source_memo.clear();
+		m_phi_candidates.clear();
+		m_reaching_writes.clear();
 		PlanScalarReads();
+		m_native_source_memo.clear();
+		m_phi_candidates.clear();
+		m_reaching_writes.clear();
 		EliminateDeadCode(m_program.blocks);
+		m_native_source_memo.clear();
+		m_phi_candidates.clear();
+		m_reaching_writes.clear();
 		PlanIndirectDescriptors();
+		m_native_source_memo.clear();
+		m_phi_candidates.clear();
+		m_reaching_writes.clear();
 		PlanBindlessSamplers();
+		m_native_source_memo.clear();
+		m_phi_candidates.clear();
+		m_reaching_writes.clear();
 		PlanDefaultSamplers();
+		m_native_source_memo.clear();
+		m_phi_candidates.clear();
+		m_reaching_writes.clear();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -474,6 +493,9 @@ public:
 			}
 		}
 		for (const auto& plan: m_indirect_descriptors) {
+			if (plan.keep_handle) {
+				continue;
+			}
 			if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource) {
 				plan.handle->SetArg(0, plan.key);
 				for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, Value(0u));
@@ -497,7 +519,8 @@ public:
 		// Project descriptor-only SSA onto its key. Existing Phis preserve dominance;
 		// native descriptor resolution excludes their stale incoming values at each use.
 		for (const auto& plan: m_indirect_descriptors) {
-			if (plan.handle->GetOpcode() != ValueOpcode::GetImageResource || plan.reads[0] == nullptr)
+			if (plan.keep_handle || plan.handle->GetOpcode() != ValueOpcode::GetImageResource ||
+			    plan.reads[0] == nullptr)
 				continue;
 			// A read the shader also uses as data keeps its value for its other users; only the
 			// handle takes the key.
@@ -559,6 +582,8 @@ private:
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
 		std::array<bool, 8>        planning_only {};
+		// v439b: a value-keyed image keeps its handle's arguments (the T# as the shader built it).
+		bool                       keep_handle = false;
 	};
 
 	struct BindlessSamplerPlan {
@@ -591,31 +616,123 @@ private:
 		std::abort();
 	}
 
+	// v438zz: NativeDescriptorSource walks the whole phi web and the CFG back to the writes on
+	// every call; the same (phi, register, use pc) comes back for every descriptor word of every
+	// read that shares it (e6d76d24: most of ~600 s). Memoized; the memo is cleared whenever the
+	// tracker rewrites the IR between its steps (Run).
+	struct NativeKeyHash {
+		size_t operator()(const std::tuple<const Inst*, uint32_t, uint32_t>& key) const noexcept {
+			return std::hash<const void*> {}(std::get<0>(key)) ^
+			       (static_cast<size_t>(std::get<1>(key)) * 0x9E3779B97F4A7C15ull) ^
+			       (static_cast<size_t>(std::get<2>(key)) << 20u);
+		}
+	};
+	mutable std::unordered_map<std::tuple<const Inst*, uint32_t, uint32_t>, Value, NativeKeyHash>
+	    m_native_source_memo;
+
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
 		value = value.Resolve();
 		const auto* phi = value.TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
 			return value;
-		std::vector<const Inst*> candidates;
-		std::vector<const Inst*> visited;
-		std::vector<const Inst*> pending {phi};
-		while (!pending.empty()) {
-			const auto* inst = pending.back();
-			pending.pop_back();
-			if (std::ranges::find(visited, inst) != visited.end()) continue;
-			visited.push_back(inst);
-			if (inst->GetOpcode() == ValueOpcode::Phi) {
-				for (size_t i = 0; i < inst->NumArgs(); ++i) {
-					const auto* arg = inst->Arg(i).Resolve().TryInstruction();
-					if (arg != nullptr) pending.push_back(arg);
+		const std::tuple<const Inst*, uint32_t, uint32_t> memo_key {phi, reg, use_pc};
+		if (const auto memo = m_native_source_memo.find(memo_key); memo != m_native_source_memo.end())
+			return memo->second;
+		const auto result = NativeDescriptorSourceWalk(value, phi, reg, use_pc);
+		m_native_source_memo.emplace(memo_key, result);
+		return result;
+	}
+
+	static bool IsNativeSourceCandidate(const Inst& inst) {
+		const auto op = inst.GetOpcode();
+		return op == ValueOpcode::ReadConst || op == ValueOpcode::LoadAddressU32 ||
+		       op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::GetUserData;
+	}
+
+	// v438zz: the candidate reads a phi web reaches (the non-phi operands of the phis reachable
+	// through phi operands), for every phi of the web at once: an iterative Tarjan over the phi
+	// graph, each strongly connected component taking the union of its members' and successors'
+	// candidates. Phi webs of large inlined shaders share most of their phis; walking each web
+	// again per phi was most of e6d76d24's tracking time. Cleared with m_native_source_memo.
+	mutable std::unordered_map<const Inst*, std::shared_ptr<const std::vector<const Inst*>>> m_phi_candidates;
+
+	const std::vector<const Inst*>& PhiCandidates(const Inst* root) const {
+		if (const auto known = m_phi_candidates.find(root); known != m_phi_candidates.end())
+			return *known->second;
+		struct NodeState {
+			uint32_t index = 0, low = 0;
+			bool     on_stack = false;
+		};
+		std::unordered_map<const Inst*, NodeState> state;
+		std::vector<const Inst*>                   scc_stack;
+		struct Frame {
+			const Inst* inst;
+			size_t      next;
+		};
+		std::vector<Frame> frames;
+		uint32_t           counter = 0;
+		const auto push = [&](const Inst* inst) {
+			state[inst] = {counter, counter, true};
+			counter++;
+			scc_stack.push_back(inst);
+			frames.push_back({inst, 0});
+		};
+		push(root);
+		while (!frames.empty()) {
+			auto&       frame = frames.back();
+			const auto* inst  = frame.inst;
+			if (frame.next < inst->NumArgs()) {
+				const auto* arg = inst->Arg(frame.next++).Resolve().TryInstruction();
+				if (arg == nullptr || arg->GetOpcode() != ValueOpcode::Phi) continue;
+				if (m_phi_candidates.contains(arg)) continue; // finished in an earlier call
+				const auto it = state.find(arg);
+				if (it == state.end()) {
+					push(arg);
+				} else if (it->second.on_stack) {
+					state[inst].low = std::min(state[inst].low, it->second.index);
 				}
-			} else if (inst->GetOpcode() == ValueOpcode::ReadConst ||
-			           inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-			           inst->GetOpcode() == ValueOpcode::ReadConstBuffer ||
-			           inst->GetOpcode() == ValueOpcode::GetUserData) {
-				candidates.push_back(inst);
+				continue;
 			}
+			// All operands visited: close the component if this is its root.
+			frames.pop_back();
+			const auto low = state[inst].low;
+			if (!frames.empty()) {
+				auto& parent_low = state[frames.back().inst].low;
+				parent_low       = std::min(parent_low, low);
+			}
+			if (low != state[inst].index) continue;
+			std::vector<const Inst*> members;
+			for (;;) {
+				const auto* member = scc_stack.back();
+				scc_stack.pop_back();
+				state[member].on_stack = false;
+				members.push_back(member);
+				if (member == inst) break;
+			}
+			std::vector<const Inst*>        candidates;
+			std::unordered_set<const Inst*> seen;
+			for (const auto* member: members) {
+				for (size_t i = 0; i < member->NumArgs(); ++i) {
+					const auto* arg = member->Arg(i).Resolve().TryInstruction();
+					if (arg == nullptr) continue;
+					if (arg->GetOpcode() == ValueOpcode::Phi) {
+						const auto done = m_phi_candidates.find(arg);
+						if (done == m_phi_candidates.end()) continue; // same component
+						for (const auto* candidate: *done->second)
+							if (seen.insert(candidate).second) candidates.push_back(candidate);
+					} else if (IsNativeSourceCandidate(*arg) && seen.insert(arg).second) {
+						candidates.push_back(arg);
+					}
+				}
+			}
+			auto shared = std::make_shared<const std::vector<const Inst*>>(std::move(candidates));
+			for (const auto* member: members) m_phi_candidates[member] = shared;
 		}
+		return *m_phi_candidates.at(root);
+	}
+
+	Value NativeDescriptorSourceWalk(Value value, const Inst* phi, uint32_t reg, uint32_t use_pc) const {
+		const auto& candidates = PhiCandidates(phi);
 		if (candidates.empty()) return value;
 		const auto source_at = [&](uint32_t pc) {
 			Value source;
@@ -643,13 +760,8 @@ private:
 			}
 			return source;
 		};
-		const auto use = std::ranges::find_if(m_native_cfg.blocks, [&](const auto& block) {
-			return block.start_pc <= use_pc && use_pc < block.end_pc;
-		});
-		if (use == m_native_cfg.blocks.end()) return value;
-		struct Position { uint32_t block; uint32_t before; };
-		std::vector<Position> positions {{use->id, use_pc}};
-		std::vector<bool> reached(m_native_cfg.blocks.size());
+		const auto* writes = ReachingWrites(reg, use_pc);
+		if (writes == nullptr) return value;
 		Value selected;
 		uint32_t selected_pc = UINT32_MAX;
 		const auto select = [&](uint32_t pc) {
@@ -664,6 +776,59 @@ private:
 			selected = source;
 			selected_pc = pc;
 			return true;
+		};
+		for (const auto pc: *writes) {
+			if (!select(pc)) return value;
+		}
+		return selected.IsEmpty() ? value : selected;
+	}
+
+	// v438zz: the scalar writes of `reg` that reach `use_pc` (UINT32_MAX: the entry, user data),
+	// in the order the walk meets them; nullptr when no native block holds `use_pc`. The walk
+	// (formerly inside NativeDescriptorSource, once per call) depends only on the register and
+	// the use, so it is memoized. A selection over them fails on the first unusable write in any
+	// order, and succeeds with equivalent values, so the early exit was not needed.
+	mutable std::unordered_map<uint64_t, std::optional<std::vector<uint32_t>>> m_reaching_writes;
+	mutable std::vector<uint32_t> m_native_block_order; // native block ids by start pc
+
+	const std::vector<uint32_t>* ReachingWrites(uint32_t reg, uint32_t use_pc) const {
+		const uint64_t key = (static_cast<uint64_t>(reg) << 32u) | use_pc;
+		if (const auto known = m_reaching_writes.find(key); known != m_reaching_writes.end())
+			return known->second ? &*known->second : nullptr;
+		if (m_native_block_order.size() != m_native_cfg.blocks.size()) {
+			m_native_block_order.resize(m_native_cfg.blocks.size());
+			std::iota(m_native_block_order.begin(), m_native_block_order.end(), 0u);
+			std::ranges::sort(m_native_block_order, {}, [&](uint32_t index) {
+				return m_native_cfg.blocks[index].start_pc;
+			});
+		}
+		// The native block holding use_pc (blocks do not overlap): the last one starting at or
+		// before it, if it also ends after it; the first match of the old linear search otherwise.
+		const CFG::BasicBlock* use = nullptr;
+		auto upper = std::ranges::upper_bound(m_native_block_order, use_pc, {}, [&](uint32_t index) {
+			return m_native_cfg.blocks[index].start_pc;
+		});
+		if (upper != m_native_block_order.begin()) {
+			const auto& candidate = m_native_cfg.blocks[*std::prev(upper)];
+			if (candidate.start_pc <= use_pc && use_pc < candidate.end_pc) use = &candidate;
+		}
+		if (use == nullptr) {
+			const auto found = std::ranges::find_if(m_native_cfg.blocks, [&](const auto& block) {
+				return block.start_pc <= use_pc && use_pc < block.end_pc;
+			});
+			if (found != m_native_cfg.blocks.end()) use = &*found;
+		}
+		if (use == nullptr) {
+			m_reaching_writes.emplace(key, std::nullopt);
+			return nullptr;
+		}
+		struct Position { uint32_t block; uint32_t before; };
+		std::vector<Position> positions {{use->id, use_pc}};
+		std::vector<bool> reached(m_native_cfg.blocks.size());
+		std::vector<uint32_t> writes;
+		std::unordered_set<uint32_t> listed;
+		const auto add = [&](uint32_t pc) {
+			if (listed.insert(pc).second) writes.push_back(pc);
 		};
 		while (!positions.empty()) {
 			const auto position = positions.back();
@@ -681,16 +846,17 @@ private:
 				--write;
 				if (write->pc < block.start_pc) break;
 				if (RegIndex(write->reg) != reg) continue;
-				if (!select(write->pc)) return value;
+				add(write->pc);
 				found = true;
 				break;
 			}
 			if (found) continue;
-			if (block.id == m_native_cfg.entry_block && !select(UINT32_MAX)) return value;
+			if (block.id == m_native_cfg.entry_block) add(UINT32_MAX);
 			for (const auto pred: block.predecessors)
 				positions.push_back({pred, m_native_cfg.blocks[pred].end_pc});
 		}
-		return selected.IsEmpty() ? value : selected;
+		const auto& stored = m_reaching_writes.emplace(key, std::move(writes)).first->second;
+		return &*stored;
 	}
 
 	// A value shader memory writes cannot change: user data, flat SRT slots, and the scalar reads
@@ -820,10 +986,7 @@ private:
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                uint32_t base_reg, DescriptorSource& descriptor, uint32_t pc) {
-		const auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
-			return entry.handle == &handle && entry.pc == pc;
-		});
-		if (resolved != m_resolved_handles.end()) {
+		if (const auto* resolved = FindResolved(&handle, pc); resolved != nullptr) {
 			descriptor = resolved->source;
 			return;
 		}
@@ -846,6 +1009,7 @@ private:
 			// Border color and its table index are unused unless a clamp axis selects border mode.
 			descriptor.dwords[3] = Value(0u);
 		}
+		m_resolved_index.emplace(std::pair {&handle, pc}, m_resolved_handles.size());
 		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
 	}
 
@@ -1011,14 +1175,32 @@ private:
 				}
 			}
 		}
+		// v438zz: a read replaced by its flat slot is replaced in the descriptor words and block
+		// conditions lazily (when a word is next used, and once after the loop) instead of
+		// rewriting every resolved handle and every block per read (quadratic on 22k blocks).
+		std::unordered_map<const Inst*, Value> flat_of;
+		std::vector<std::pair<decltype(&m_program.blocks[0]->Instructions()),
+		                      decltype(m_program.blocks[0]->Instructions().begin())>> dead_reads;
+		const auto fix = [&](Value value) {
+			for (uint32_t guard = 0; guard < 64u; guard++) {
+				const auto* inst = value.Resolve().TryInstruction();
+				const auto  it   = inst != nullptr ? flat_of.find(inst) : flat_of.end();
+				if (it == flat_of.end()) return value;
+				value = it->second;
+			}
+			return value;
+		};
+		const auto fix_source = [&](ResolvedHandle& entry) {
+			for (uint32_t word = 0; word < entry.source.dword_count; ++word)
+				entry.source.dwords[word] = fix(entry.source.dwords[word]);
+		};
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
 			auto& memory = m_program.memory_info[flags.index];
 			const auto* handle = read->Arg(0).Resolve().TryInstruction();
-			auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
-				return entry.handle == handle && entry.pc == flags.pc;
-			});
-			EXIT_IF(resolved == m_resolved_handles.end());
+			auto* resolved = FindResolved(handle, flags.pc);
+			EXIT_IF(resolved == nullptr);
+			fix_source(*resolved);
 			// A fixed offset does not make the read's base CPU-evaluable: a bindless selector can
 			// carry GPU traversal results into it. Such a read stays in the shader instead of
 			// taking a flat slot that RefreshFlatBuffer could never fill.
@@ -1050,15 +1232,8 @@ private:
 			    {resource, Value(slot)}, read->Flags<uint64_t>()));
 			const auto uses = read->Uses();
 			for (const auto& use: uses) use.user->SetArg(use.operand, flat);
-			for (auto& entry: m_resolved_handles) {
-				for (uint32_t word = 0; word < entry.source.dword_count; ++word)
-					if (entry.source.dwords[word].Resolve() == Value(read))
-						entry.source.dwords[word] = flat;
-			}
-			for (auto& info: m_program.block_info) {
-				if (info.condition.Resolve() == Value(read)) info.condition = flat;
-				if (info.indirect_target.Resolve() == Value(read)) info.indirect_target = flat;
-			}
+			flat_of[read] = flat;
+			fix_source(*resolved);
 			if (keep) {
 				if (resolved->planning_handle.IsEmpty()) {
 					bool unchanged = true;
@@ -1076,10 +1251,23 @@ private:
 				read->SetParent(nullptr);
 				m_program.value_storage.splice(m_program.value_storage.end(), list, where);
 			} else {
-				list.erase(where);
+				dead_reads.emplace_back(&list, where); // erased after the words are fixed
 			}
 		}
+		if (!flat_of.empty()) {
+			for (auto& entry: m_resolved_handles) fix_source(entry);
+			for (auto& info: m_program.block_info) {
+				info.condition       = fix(info.condition);
+				info.indirect_target = fix(info.indirect_target);
+			}
+		}
+		for (auto& [list, where]: dead_reads) list->erase(where);
 		m_program.srt_plan_complete = true;
+	}
+
+	bool DescriptorIsRuntimeValid(const DescriptorSource& descriptor) const {
+		uint32_t bad_dword = 0;
+		return ValidateSource(descriptor, bad_dword);
 	}
 
 	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword) const {
@@ -1160,17 +1348,17 @@ private:
 	// cycle.
 	static bool FeedsOnlyDeadPhis(const Inst& user) {
 		std::vector<const Inst*> pending {&user};
-		std::vector<const Inst*> visited;
+		std::unordered_set<const Inst*> visited;
 		while (!pending.empty()) {
 			const auto* current = pending.back();
 			pending.pop_back();
-			if (std::ranges::find(visited, current) != visited.end()) {
+			if (visited.contains(current)) {
 				continue;
 			}
 			if (current->GetOpcode() != ValueOpcode::Phi) {
 				return false;
 			}
-			visited.push_back(current);
+			visited.insert(current);
 			for (const auto& use: current->Uses()) {
 				pending.push_back(use.user);
 			}
@@ -1182,14 +1370,13 @@ private:
 	// handles take a fixed sampler, the value is stranded. A phi web that ends nowhere counts too.
 	static bool FeedsOnlySamplers(const Inst& value) {
 		std::vector<const Inst*> pending {&value};
-		std::vector<const Inst*> visited;
+		std::unordered_set<const Inst*> visited;
 		while (!pending.empty()) {
 			const auto* current = pending.back();
 			pending.pop_back();
-			if (std::ranges::find(visited, current) != visited.end()) {
+			if (!visited.insert(current).second) {
 				continue;
 			}
-			visited.push_back(current);
 			for (const auto& use: current->Uses()) {
 				const auto op = use.user->GetOpcode();
 				if (op == ValueOpcode::GetSamplerResource) {
@@ -2270,10 +2457,17 @@ private:
 		}
 
 		if (!MakeRuntimeTableSource(*plan.reads[0], table_source)) {
+			// v439: the descriptor's reads, for TryMakeAddressImage (the table's address is
+			// computed by the shader, so no draw can name the table).
+			m_unresolved_table_handle = &handle;
+			m_unresolved_table_reads  = plan.reads;
 			return RejectIndirect(handle, __LINE__);
 		}
 		return true;
 	}
+
+	const Inst*                m_unresolved_table_handle = nullptr;
+	std::array<const Inst*, 8> m_unresolved_table_reads {};
 
 	bool MatchUniformizedBufferKey(Value key, const Inst& image,
 	                               DescriptorSource::IndirectDescriptor& indirect,
@@ -2541,6 +2735,248 @@ private:
 		plan.source = InternSource(image_source);
 		plan.key = key;
 		plan.roots = image_source.dwords;
+		return true;
+	}
+
+	// v439: a sampled image whose eight T# words are scalar loads of one GPU-computed address
+	// (base + o, base + o + 4, ..., base + o + 28): the ray-tracing shaders' material textures,
+	// whose T#s are found by following pointers the GPU reads (instance -> geometry -> material),
+	// so no table a draw could name holds them. The shader looks the texture up by the T#'s
+	// address (BindlessAddressBlockBits); the handle keeps the address words and the offset
+	// (arguments 0-2). KYTY_BINDLESS_ADDRESS=0 turns it off (such shaders give up, as before).
+	static bool BindlessAddressEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_ADDRESS");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	bool TryMakeAddressImage(Inst& handle, const DescriptorSource& descriptor,
+	                         IndirectDescriptorPlan& plan) {
+		if (!BindlessAddressEnabled() || !m_program.bindless_images ||
+		    handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u ||
+		    descriptor.dword_count != 8u || handle.Uses().empty() ||
+		    DescriptorIsRuntimeValid(descriptor)) {
+			return false; // a descriptor the host can evaluate takes the usual path
+		}
+		if (!std::ranges::all_of(handle.Uses(), [](const Use& use) {
+			    return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
+			           ImageResourceClass::Sampled;
+		    })) {
+			if (std::getenv("KYTY_BINDLESS_ADDRESS_DIAG") != nullptr) {
+				std::fprintf(stderr, "[bindless-address-diag] %016llx: not sampled only (%s)\n",
+				             static_cast<unsigned long long>(m_program.shader_hash),
+				             std::string(ValueOpcodeName(handle.Uses().front().user->GetOpcode())).c_str());
+			}
+			return false;
+		}
+		uint64_t first = 0;
+		static std::atomic<uint32_t> diag {0};
+		const auto why = [&](uint32_t dword, const char* reason, const Inst* inst) {
+			if (std::getenv("KYTY_BINDLESS_ADDRESS_DIAG") != nullptr && m_unresolved_table_handle == &handle &&
+			    diag.fetch_add(1) < 400u) {
+				std::fprintf(stderr, "[bindless-address-diag] %016llx dword %u: %s (%s)\n",
+				             static_cast<unsigned long long>(m_program.shader_hash), dword, reason,
+				             inst != nullptr ? std::string(ValueOpcodeName(inst->GetOpcode())).c_str() : "-");
+			}
+			return false;
+		};
+		// The reads MatchDescriptorTable resolved (through descriptor Phi webs) when it found
+		// them but no runtime table; else the descriptor words themselves. Either scalar loads
+		// through a 64-bit address the shader holds (GetAddressResource, a fixed offset), or
+		// scalar buffer loads through a V# the shader holds (its 48-bit base, at key * stride +
+		// a fixed offset: the T#s of a table whose V# the shader read from memory).
+		const bool resolved_reads = m_unresolved_table_handle == &handle;
+		const Inst* table      = nullptr;
+		Value       index_key;
+		uint32_t    stride     = 0;
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			const auto* read = resolved_reads ? m_unresolved_table_reads[dword]
+			                                  : descriptor.dwords[dword].Resolve().TryInstruction();
+			if (read != nullptr && read->GetOpcode() == ValueOpcode::Phi && dword == 0u &&
+			    std::getenv("KYTY_BINDLESS_ADDRESS_DIAG") != nullptr) {
+				static std::atomic<uint32_t> phi_diag {0};
+				if (phi_diag.fetch_add(1) < 8u) {
+					std::string text;
+					for (size_t i = 0; i < read->NumArgs(); i++) {
+						const auto* in = read->Arg(i).Resolve().TryInstruction();
+						text += fmt::format(" [{}", in != nullptr ? std::string(ValueOpcodeName(in->GetOpcode())) : std::string("imm"));
+						if (in != nullptr && in->GetOpcode() == ValueOpcode::Phi) {
+							for (size_t j = 0; j < in->NumArgs(); j++) {
+								const auto* in2 = in->Arg(j).Resolve().TryInstruction();
+								text += fmt::format(" {}", in2 != nullptr ? std::string(ValueOpcodeName(in2->GetOpcode())) : std::string("imm"));
+							}
+						}
+						text += "]";
+					}
+					std::fprintf(stderr, "[bindless-address-phi] %016llx pc=0x%x args=%zu:%s\n",
+					             static_cast<unsigned long long>(m_program.shader_hash),
+					             handle.Uses().front().user->Flags<MemoryFlags>().pc, read->NumArgs(), text.c_str());
+				}
+			}
+			if (read == nullptr || read->NumArgs() < 2u ||
+			    (read->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+			     read->GetOpcode() != ValueOpcode::ReadConstBuffer)) {
+				return why(dword, "not a scalar load", read);
+			}
+			const bool buffer = read->GetOpcode() == ValueOpcode::ReadConstBuffer;
+			const auto index  = read->Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size() ||
+			    m_program.memory_info[index].kind !=
+			        (buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress)) {
+				return why(dword, "unexpected scalar memory kind", read);
+			}
+			uint64_t offset = m_program.memory_info[index].offset;
+			Value    current_key;
+			uint32_t current_stride = 0;
+			uint32_t immediate      = 0;
+			if (ImmediateU32(read->Arg(1), immediate)) {
+				offset += immediate;
+			} else {
+				uint32_t matched = 0;
+				if (!buffer || !MatchTableOffset(read->Arg(1), current_key, matched, current_stride)) {
+					return why(dword, "offset neither immediate nor key * stride", read->Arg(1).Resolve().TryInstruction());
+				}
+				offset += matched;
+			}
+			const auto* base = read->Arg(0).Resolve().TryInstruction();
+			if (base == nullptr ||
+			    base->GetOpcode() != (buffer ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource) ||
+			    base->NumArgs() != (buffer ? 4u : 2u)) {
+				return why(dword, "no address or buffer handle", base);
+			}
+			if (dword == 0u) {
+				table     = base;
+				first     = offset;
+				index_key = current_key;
+				stride    = current_stride;
+			} else if (offset != first + dword * 4u || base->GetOpcode() != table->GetOpcode() ||
+			           current_stride != stride || index_key.IsEmpty() != current_key.IsEmpty() ||
+			           (!index_key.IsEmpty() && !EquivalentValue(m_program, index_key, current_key)) ||
+			           (base != table &&
+			            (!EquivalentValue(m_program, base->Arg(0), table->Arg(0)) ||
+			             !EquivalentValue(m_program, base->Arg(1), table->Arg(1))))) {
+				return why(dword, "different table, key or offset", base);
+			}
+		}
+		if (table == nullptr || first > 0xfffffu || (first & 3u) != 0u) {
+			return why(0, "offset out of range", nullptr);
+		}
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.bindless     = true;
+		indirect.address      = true;
+		indirect.table_offset = static_cast<uint32_t>(first);
+		indirect.table_stride = stride;
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		image_source.indirect_descriptor = indirect;
+		// The plan may hold what MatchDescriptorTable found before it failed: no reads of a table
+		// are projected for an address-keyed image (its loads die once the handle stops using them).
+		plan.reads.fill(nullptr);
+		plan.memory.fill(0u);
+		plan.planning_only.fill(false);
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		// Run() gives the handle the key, then roots 4-7 as arguments 1-4: the address (low word,
+		// high word; the emitter keeps its low 16 bits, as a V#'s base has 48), the fixed offset,
+		// and the table key and stride (0 and 0 without a key).
+		plan.key = table->Arg(0);
+		plan.roots.fill(Value(0u));
+		plan.roots[4] = table->Arg(1);
+		plan.roots[5] = Value(static_cast<uint32_t>(first));
+		plan.roots[6] = index_key.IsEmpty() ? Value(0u) : index_key;
+		plan.roots[7] = Value(stride);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+			std::fprintf(stderr, "[bindless-address] %016llx pc=0x%x T# at a GPU address + 0x%x\n",
+			             static_cast<unsigned long long>(m_program.shader_hash),
+			             handle.Uses().front().user->Flags<MemoryFlags>().pc, static_cast<uint32_t>(first));
+		}
+		return true;
+	}
+
+	// v439b: the last resort for a sampled image whose T# neither a table nor an address
+	// explains (a descriptor Phi web that also carries other data on paths that do not sample):
+	// the shader looks the texture up by the T#'s eight words as it built them. The handle keeps
+	// its arguments. KYTY_BINDLESS_VALUE=0 turns it off (such shaders give up, as before).
+	static bool BindlessValueEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_VALUE");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	bool TryMakeValueImage(Inst& handle, IndirectDescriptorPlan& plan) {
+		if (!BindlessValueEnabled() || !BindlessAddressEnabled() || !m_program.bindless_images ||
+		    handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u ||
+		    handle.Uses().empty()) {
+			return false;
+		}
+		const auto why = [&](const char* reason) {
+			if (std::getenv("KYTY_BINDLESS_ADDRESS_DIAG") != nullptr) {
+				std::fprintf(stderr, "[bindless-value-diag] %016llx pc=0x%x: %s\n",
+				             static_cast<unsigned long long>(m_program.shader_hash),
+				             handle.Uses().front().user->Flags<MemoryFlags>().pc, reason);
+			}
+			return false;
+		};
+		// Or only 2D stores (no atomics) through the storage array, as TryMakeIndirectImage's
+		// storage-only handles (the ray tracing's output image picked the same way).
+		const bool storage_only =
+		    ShaderRecompiler::IR::BindlessStorageImagesEnabled() &&
+		    std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			    if (use.user->GetOpcode() != ValueOpcode::ImageWrite) return false;
+			    const auto index = use.user->Flags<MemoryFlags>().index;
+			    return index < m_program.memory_info.size() &&
+			           m_program.memory_info[index].image_dimension == Decoder::ImageDimension::Dim2D &&
+			           !m_program.memory_info[index].image_r128;
+		    });
+		if (!storage_only && !std::ranges::all_of(handle.Uses(), [](const Use& use) {
+			    return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
+			           ImageResourceClass::Sampled;
+		    })) {
+			return why(std::string(std::string("not sampled only: ") +
+			                       std::string(ValueOpcodeName(std::ranges::find_if(handle.Uses(), [](const Use& use) {
+				                       return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class !=
+				                              ImageResourceClass::Sampled;
+			                       })->user->GetOpcode()))).c_str());
+		}
+		// Only a T# the shader assembled from loads and Phis: a constant word or user data is a
+		// descriptor the existing plans can name (or a shader this path should not take).
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			const auto value = handle.Arg(dword).Resolve();
+			if (value.IsImmediate() && dword == 0u) {
+				return why("constant dword 0");
+			}
+			if (value.GetType() != Type::U32 && !value.IsImmediate()) {
+				return why("a word is not U32");
+			}
+		}
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.bindless = true;
+		indirect.value    = true;
+		indirect.storage  = storage_only;
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		image_source.indirect_descriptor = indirect;
+		plan.reads.fill(nullptr);
+		plan.memory.fill(0u);
+		plan.planning_only.fill(false);
+		plan.handle      = &handle;
+		plan.source      = InternSource(image_source);
+		plan.key         = handle.Arg(0);
+		plan.roots.fill(Value(0u));
+		plan.keep_handle = true;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+			std::fprintf(stderr, "[bindless-value] %016llx pc=0x%x T# looked up by its words\n",
+			             static_cast<unsigned long long>(m_program.shader_hash),
+			             handle.Uses().front().user->Flags<MemoryFlags>().pc);
+		}
 		return true;
 	}
 
@@ -2819,6 +3255,56 @@ private:
 		return found;
 	}
 
+	// v446q: KYTY_BINDLESS_SAMPLERS_KEYED=1, or translation variant bit 4 (in-run A/B): samplers
+	// whose heap key is loaded from memory are bindless even when the host could read the key.
+	bool KeyedSamplersBindless() const {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_SAMPLERS_KEYED");
+			return value != nullptr && value[0] == '1';
+		}();
+		return enabled || (m_program.info.translation_variant & 4u) != 0u;
+	}
+
+	// The S#'s first dword is a scalar read at (key << 4) + offset, and the key depends on a
+	// scalar memory read (a material table), not on user data alone.
+	bool SamplerKeyFromMemory(const Inst& handle) const {
+		const auto* read = ResolveInvariantPhi(m_program, handle.Arg(0)).TryInstruction();
+		if (read == nullptr || read->NumArgs() < 2u) {
+			return false;
+		}
+		uint32_t index = 0;
+		if (ScalarReadMemory(*read, index) == nullptr) {
+			return false;
+		}
+		Value    key;
+		uint32_t offset = 0;
+		uint32_t stride = 0;
+		if (!MatchTableOffset(read->Arg(1), key, offset, stride) || stride != 16u) {
+			return false;
+		}
+		std::vector<const Inst*>        pending;
+		std::unordered_set<const Inst*> seen;
+		if (const auto* first = key.Resolve().TryInstruction(); first != nullptr) {
+			pending.push_back(first);
+			seen.insert(first);
+		}
+		while (!pending.empty() && seen.size() < 256u) {
+			const auto* current = pending.back();
+			pending.pop_back();
+			uint32_t memory_index = 0;
+			if (ScalarReadMemory(*current, memory_index) != nullptr) {
+				return true;
+			}
+			for (size_t arg = 0; arg < current->NumArgs(); arg++) {
+				const auto* next = current->Arg(arg).Resolve().TryInstruction();
+				if (next != nullptr && seen.insert(next).second) {
+					pending.push_back(next);
+				}
+			}
+		}
+		return false;
+	}
+
 	const BindlessSamplerPlan* FindBindlessSampler(const Inst& handle) const {
 		const auto found =
 		    std::ranges::find(m_bindless_samplers, &handle, &BindlessSamplerPlan::handle);
@@ -2921,10 +3407,19 @@ private:
 				           (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
 				           memory.sampler * 4u, descriptor, flags.pc);
 				uint32_t bad_dword = 0;
-				if (ValidateSource(descriptor, bad_dword)) {
+				// v446q: a sampler the host could evaluate stays a host binding, unless its heap
+				// key is loaded from memory (KeyedSamplersBindless): then the shader looks it up
+				// itself, as an image picked from a table does (TryMakeIndirectImage), and the
+				// host does not read the key (GPU-written material tables made the GPU thread
+				// wait for the GPU in every such draw's refresh).
+				const bool host_valid = ValidateSource(descriptor, bad_dword);
+				if (host_valid && !KeyedSamplersBindless()) {
 					continue;
 				}
 				BindlessSamplerPlan plan;
+				if (host_valid && !SamplerKeyFromMemory(*sampler)) {
+					continue;
+				}
 				if (TryMakeBindlessSampler(*sampler, plan)) {
 					m_bindless_samplers.push_back(plan);
 					// KYTY_LOG_BINDLESS_SAMPLERS=1: what each bindless sampler key is made of.
@@ -3018,7 +3513,7 @@ private:
 				// The scalar reads behind the descriptor, through phis and selects.
 				std::vector<const Inst*> reads;
 				std::vector<const Inst*> pending;
-				std::vector<const Inst*> visited;
+				std::unordered_set<const Inst*> visited;
 				for (uint32_t dword = 0; dword < 4u; dword++) {
 					if (const auto* arg = sampler->Arg(dword).Resolve().TryInstruction()) {
 						pending.push_back(arg);
@@ -3027,10 +3522,9 @@ private:
 				while (!pending.empty()) {
 					const auto* current = pending.back();
 					pending.pop_back();
-					if (std::ranges::find(visited, current) != visited.end()) {
+					if (!visited.insert(current).second) {
 						continue;
 					}
-					visited.push_back(current);
 					uint32_t index = 0;
 					if (ScalarReadMemory(*current, index) != nullptr) {
 						reads.push_back(current);
@@ -3068,6 +3562,7 @@ private:
 				// The walk resolves the handle again, from the fixed words.
 				std::erase_if(m_resolved_handles,
 				              [&](const ResolvedHandle& entry) { return entry.handle == sampler; });
+				ReindexResolved();
 				LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x bindless sampler: "
 				     "using a default sampler (%zu heap reads planning-only)\n",
 				     m_program.shader_hash, flags.pc, stranded);
@@ -3094,7 +3589,9 @@ private:
 				           false, false, memory.resource * 4u, descriptor, flags.pc);
 				IndirectDescriptorPlan plan;
 				if (TryMakeIndirectImage(*handle, descriptor, plan) || TryMakeFiniteImage(*handle, plan) ||
-				    TryMakeIndirectBuffer(*handle, descriptor, plan)) {
+				    TryMakeIndirectBuffer(*handle, descriptor, plan) ||
+				    TryMakeAddressImage(*handle, descriptor, plan) ||
+				    (!DescriptorIsRuntimeValid(descriptor) && TryMakeValueImage(*handle, plan))) {
 					for (const auto& previous: m_indirect_descriptors) {
 						if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 						    !EquivalentValue(m_program, previous.key, plan.key))
@@ -3541,10 +4038,10 @@ private:
 			               memory.resource * 4u, handle, source)) {
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
+				    (!memory.SupportsIndirectBufferLoad(op) && !memory.SupportsIndirectSubwordLoad(op))) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     "requires a scalar, raw byte/short/DWORD x1/x2/x3/x4, or formatted X load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
@@ -3672,6 +4169,24 @@ private:
 	const CFG::Graph&                          m_native_cfg;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
+	// v438zz: (handle, pc) -> index into m_resolved_handles. The linear searches made tracking
+	// quadratic in the scalar reads (e6d76d24, a 114k-word ray-tracing shader: ~600 s).
+	struct ResolvedKeyHash {
+		size_t operator()(const std::pair<const Inst*, uint32_t>& key) const noexcept {
+			return std::hash<const void*> {}(key.first) ^ (static_cast<size_t>(key.second) * 0x9E3779B97F4A7C15ull);
+		}
+	};
+	std::unordered_map<std::pair<const Inst*, uint32_t>, size_t, ResolvedKeyHash> m_resolved_index;
+	ResolvedHandle* FindResolved(const Inst* handle, uint32_t pc) {
+		const auto it = m_resolved_index.find({handle, pc});
+		return it == m_resolved_index.end() ? nullptr : &m_resolved_handles[it->second];
+	}
+	void ReindexResolved() {
+		m_resolved_index.clear();
+		for (size_t i = 0; i < m_resolved_handles.size(); i++) {
+			m_resolved_index.emplace(std::pair {m_resolved_handles[i].handle, m_resolved_handles[i].pc}, i);
+		}
+	}
 	std::optional<std::unordered_set<const Inst*>> m_handle_feeders;
 	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;

@@ -266,7 +266,7 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers,
 		                                            mem.resource);
-		const auto prefix = ctx.state.memory_byte_offsets[resource];
+		const auto prefix = MemoryByteOffset(ctx.state, resource);
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -1001,12 +1001,51 @@ uint32_t IndirectBufferInBounds(EmitterState& state, const IndirectBufferAccess&
 	return in_bounds;
 }
 
+// An 8- or 16-bit raw load through a GPU-selected descriptor: the DWORD that holds the address
+// (and the next one when the value crosses into it), shifted and masked. The IR widens the result
+// (sign extension included) after the load, as for host bindings.
+uint32_t LoadIndirectSubword(ValueEmitContext& ctx, const IndirectBufferAccess& buffer, uint32_t bits,
+                             uint32_t valid_format, bool coherent) {
+	auto&      state = ctx.state;
+	const auto bytes = bits / 8u;
+	const auto in_bounds =
+	    AndCondition(state, valid_format, IndirectBufferInBounds(state, buffer, 0u, bytes, false));
+	const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), buffer.address,
+	                            ConstantDeviceAddress(state, ~uint64_t {3}));
+	const auto low_bits = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                             Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
+	                             ConstantU32(state, 3));
+	const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), low_bits, ConstantU32(state, 3));
+	const auto crosses = Binary(state, spv::OpUGreaterThan, TypeBool(state), low_bits, ConstantU32(state, 4u - bytes));
+	const auto low = EmitValueOrZeroIfCondition(state, in_bounds,
+	                                            [&]() { return LoadBdaDword(ctx, aligned, coherent); });
+	const auto high = EmitValueOrZeroIfCondition(state, AndCondition(state, in_bounds, crosses), [&]() {
+		return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
+		                                ConstantDeviceAddress(state, 4u)),
+		                    coherent);
+	});
+	const auto shifted_low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), low, shift);
+	// The high DWORD's bits above the low ones; a shift by 32 is undefined, so only when crossing.
+	const auto shifted_high = Select(
+	    state, TypeU32(state), crosses,
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), high,
+	           Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32), shift)),
+	    ConstantU32(state, 0));
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	              Binary(state, spv::OpBitwiseOr, TypeU32(state), shifted_low, shifted_high),
+	              ConstantU32(state, (1u << bits) - 1u));
+}
+
 uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto buffer = PrepareIndirectBuffer(ctx, inst);
 	const bool coherent = ctx.Memory(inst).coherent;
 	const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
 	                                  ConstantU32(state, 0));
+	if (inst.GetOpcode() == IR::ValueOpcode::LoadBufferU8 || inst.GetOpcode() == IR::ValueOpcode::LoadBufferU16) {
+		return LoadIndirectSubword(ctx, buffer, inst.GetOpcode() == IR::ValueOpcode::LoadBufferU8 ? 8u : 16u,
+		                           valid_format, coherent);
+	}
 	const auto base = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), buffer.address,
 	                         ConstantDeviceAddress(state, ~uint64_t {3}));
 	std::array<uint32_t, 4> values {};
@@ -1452,7 +1491,7 @@ static uint32_t BoundFormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), result,
 	                          state.bound_formatted_function[coherent],
-	                          ConstantU32(state, array_index), start, resource.length, word);
+	                          BufferBindingIndex(state, array_index), start, resource.length, word);
 	if (components == 4u) {
 		return result;
 	}
@@ -1647,7 +1686,9 @@ void EmitShaderTrapValues(EmitterState& state, uint32_t pc, uint32_t code, uint3
 }
 
 void DefineGetBdaPointer(EmitterState& state) {
-	if (!state.program.info.uses_dma) {
+	// v442: every module of a callable split with the fixed layout has it (the layout always has
+	// its two buffers), whether or not another module already uses addresses.
+	if (!state.program.info.uses_dma && !state.program.bindings.rt_fixed) {
 		return;
 	}
 	const auto type            = TypeScalarU64(state);
@@ -1670,13 +1711,54 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                           address);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantDeviceAddress(state, BufferCachePages::kPageBits));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	auto page = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	// v443i, a callable split's modules: an address past the table's pages (a pointer made of
+	// whatever a hit shader was handed) reads no entry and is no page fault: it is not there.
+	// Without this the index kept its low 32 bits and the read relied on the device's bounds check.
+	// v443p, KYTY_BDA_PAGE_BOUND=1 (a test; every shader that reads through the table changes): the
+	// same for every shader, not only a split's modules. Without it a shader's page index is the
+	// address's page cut to 32 bits: an address that is no guest address (a pointer a shader was
+	// handed by another shader's wrong output) indexes up to 32 GiB past the table, and its "not
+	// there" bit is written up to 512 MB past the fault buffer, both left to the device's bounds
+	// check; if the atomic write is not checked, it sets bits in whatever memory follows, the
+	// table included (g443m's entries, 0x50000009b and 0x30000009a, look like such bits).
+	static const bool bound_all = [] {
+		const char* value = std::getenv("KYTY_BDA_PAGE_BOUND");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool rt       = state.program.rt_role != IR::RtRole::None;
+	const bool bounded  = rt || bound_all;
+	uint32_t   in_range = 0;
+	if (bounded) {
+		in_range = Binary(state, spv::OpULessThan, TypeBool(state), page64,
+		                  ConstantDeviceAddress(state, BufferCachePages::kNumPages));
+		page     = Select(state, TypeU32(state), in_range, page, ConstantU32(state, 0));
+	}
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
-	const auto base = state.builder.AllocateId();
+	auto base = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	// v443o: without KYTY_RT_TRAP_REPORT the trap is here, with no branch of its own: an entry it
+	// stops reads as no entry, and takes the "not there" path below like any missing page.
+	const bool report = rt && IR::RtAddressTrapReport() &&
+	                    state.program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	if (bounded) {
+		auto usable = in_range;
+		if (IR::RtAddressTrap() && !report) {
+			const auto u32 = TypeU32(state), boolean = TypeBool(state);
+			const auto entry_low = Unary(state, spv::OpUConvert, u32, base);
+			usable = Binary(state, spv::OpLogicalAnd, boolean, usable,
+			                Binary(state, spv::OpUGreaterThanEqual, boolean, entry_low,
+			                       ConstantU32(state, IR::RtTrapPageBytes)));
+			usable = Binary(state, spv::OpLogicalAnd, boolean, usable,
+			                Binary(state, spv::OpIEqual, boolean,
+			                       Binary(state, spv::OpBitwiseAnd, u32, entry_low, ConstantU32(state, 3u)),
+			                       ConstantU32(state, 0u)));
+		}
+		base = Select(state, type, usable, base, ConstantDeviceAddress(state, 0));
+	}
 	const auto missing =
 	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
 	const auto fault_label     = state.builder.AllocateId();
@@ -1686,19 +1768,91 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, available_label);
 
 	EmitLabel(state, fault_label);
-	RecordBdaFault(state, page);
+	if (bounded) {
+		// (no branch: outside the table the page is 0 and the bit none)
+		const auto u32  = TypeU32(state);
+		const auto word = Binary(state, spv::OpShiftRightLogical, u32, page, ConstantU32(state, 5));
+		const auto bit  = Select(state, u32, in_range,
+		                         Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1),
+		                                Binary(state, spv::OpBitwiseAnd, u32, page, ConstantU32(state, 31))),
+		                         ConstantU32(state, 0));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicOr, u32, value, FaultElementPointer(state, word),
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), bit);
+	} else {
+		RecordBdaFault(state, page);
+	}
+	const auto fault_exit = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);
 	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
 	                              ConstantDeviceAddress(state, BufferCachePages::kPageSize - 1));
-	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
+	auto available = Binary(state, spv::OpIAdd, type, base, offset);
+	if (report) {
+		// v443j, the address trap (IR/RtCallable.h): every device loss of the callable splits was a
+		// read at N * 4 GiB plus less than a page, where nothing the host knows of ever was. A
+		// translation that lands there is not read (it is a page that is not there), and the
+		// binding table's counters keep the last one for the host to print.
+		// v443l: judged by the entry, not by entry + offset (an entry of 0x9a with an offset near the
+		// page's end passed), and an entry that is no dword address is never a buffer's. The page is
+		// also asked for, as one that is not there is: the host then registers a buffer for it and
+		// writes the entry, if the address is guest memory.
+		const auto u32 = TypeU32(state), boolean = TypeBool(state);
+		const auto low = Unary(state, spv::OpUConvert, u32, available);
+		const auto entry_low = Unary(state, spv::OpUConvert, u32, base);
+		const auto trapped =
+		    Binary(state, spv::OpLogicalOr, boolean,
+		           Binary(state, spv::OpULessThan, boolean, entry_low, ConstantU32(state, IR::RtTrapPageBytes)),
+		           Binary(state, spv::OpINotEqual, boolean,
+		                  Binary(state, spv::OpBitwiseAnd, u32, entry_low, ConstantU32(state, 3u)),
+		                  ConstantU32(state, 0u)));
+		EmitIfCondition(state, trapped, [&]() {
+			RecordBdaFault(state, page);
+			const auto dword = state.program.bindings.dispatch_thread_dword;
+			const auto table = Binary(state, spv::OpBitwiseOr, type,
+			                          Unary(state, spv::OpUConvert, type, EmitShaderDataDwordLoad(state, dword + 3u)),
+			                          Binary(state, spv::OpShiftLeftLogical, type,
+			                                 Unary(state, spv::OpUConvert, type, EmitShaderDataDwordLoad(state, dword + 4u)),
+			                                 ConstantDeviceAddress(state, 32)));
+			// The table's own address is the host's (a buffer of its own); one that is no address is
+			// left alone.
+			const auto known = Binary(state, spv::OpUGreaterThanEqual, boolean, Unary(state, spv::OpUConvert, u32, table),
+			                          ConstantU32(state, IR::RtTrapPageBytes));
+			EmitIfCondition(state, known, [&]() {
+				const auto atomic = [&](spv::Op op, uint32_t word_offset, uint32_t value) {
+					const auto at = Binary(state, spv::OpIAdd, type, table,
+					                       ConstantDeviceAddress(state, IR::RtTargetSlots * IR::RtTargetWords * 4u + word_offset));
+					const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), at);
+					const auto result  = state.builder.AllocateId();
+					state.builder.AddFunction(op, u32, result, pointer, ConstantU32(state, spv::ScopeDevice),
+					                          ConstantU32(state, 0u), value);
+				};
+				const auto high_of = [&](uint32_t value) {
+					return Unary(state, spv::OpUConvert, u32,
+					             Binary(state, spv::OpShiftRightLogical, type, value, ConstantDeviceAddress(state, 32)));
+				};
+				atomic(spv::OpAtomicExchange, 80u, low);
+				atomic(spv::OpAtomicExchange, 84u, high_of(available));
+				atomic(spv::OpAtomicExchange, 88u, Unary(state, spv::OpUConvert, u32, address));
+				atomic(spv::OpAtomicExchange, 92u, high_of(address));
+				atomic(spv::OpAtomicExchange, 96u,
+				       ConstantU32(state, state.program.rt_role == IR::RtRole::Callable
+				                              ? state.program.rt_code_hash
+				                              : static_cast<uint32_t>(state.program.shader_hash)));
+				atomic(spv::OpAtomicExchange, 100u, ConstantU32(state, 0u)); // site: the address table
+				atomic(spv::OpAtomicIAdd, 76u, ConstantU32(state, 1u));
+			});
+		});
+		available = Select(state, type, trapped, ConstantDeviceAddress(state, 0), available);
+	}
+	const auto available_exit = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, type, result, ConstantDeviceAddress(state, 0),
-	                          fault_label, available, available_label);
+	                          fault_exit, available, available_exit);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
@@ -1707,7 +1861,7 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
-		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+		    mem.kind == IR::ResourceKind::Lds ? LdsMemoryScope(ctx.state) : spv::ScopeDevice;
 		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
 		EmitAtomicMemoryBarrier(ctx.state, mem.kind);
 		return old;
@@ -1762,7 +1916,7 @@ void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, 1));
 			state.builder.AddFunction(
 			    SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), state.builder.AllocateId(),
-			    pointer, ConstantU32(state, spv::ScopeWorkgroup),
+			    pointer, ConstantU32(state, LdsMemoryScope(state)),
 			    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | semantics), value);
 		});
 	});
@@ -1847,7 +2001,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          value, EmitMemoryElementPointer(state, access, index),
 		                          ConstantU32(state, mem.kind == IR::ResourceKind::Gds
 		                                                 ? spv::ScopeDevice
-		                                                 : spv::ScopeWorkgroup),
+		                                                 : LdsMemoryScope(state)),
 		                          ConstantU32(state, spv::MemorySemanticsMaskNone), count);
 		return value;
 	});

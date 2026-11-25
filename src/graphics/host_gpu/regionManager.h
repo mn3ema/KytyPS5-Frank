@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/timeline.h"
 
 #include <array>
 #include <atomic>
@@ -22,6 +23,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h> // __readgsdword
 #undef min
 #undef max
 #undef MemoryBarrier
@@ -66,7 +68,14 @@ public:
 private:
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if defined(_M_X64)
+		// v438zk: the id GetCurrentThreadId returns, read where it reads it (the thread block's
+		// ClientId.UniqueThread, gs:[0x48]) without the call into kernel32: every lock and unlock
+		// of every tracker walk asks (after Senaxx/KytyPS5, regionManager.h; GPL-2.0-only).
+		return __readgsdword(0x48);
+#else
 		return GetCurrentThreadId();
+#endif
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
 		return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
@@ -249,6 +258,25 @@ public:
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
+		ChangeStateBits<source, enable>(vaddr, size);
+		ApplyStateProtection<source, enable>();
+	}
+
+	// v445j: ChangeState in two halves, so a caller that changes several spans of one region
+	// under its lock can set all the bits first and bring the page protection up to date once
+	// (UpdateProtection protects by the difference between the bits and the last protection, so
+	// one pass after N bit changes gives the same pages the same protection as N passes).
+	template <DirtySource source, bool enable>
+	void ApplyStateProtection() {
+		if constexpr (source == DirtySource::Cpu) {
+			UpdateProtection<!enable, false>();
+		} else {
+			UpdateProtection<enable, true>();
+		}
+	}
+
+	template <DirtySource source, bool enable>
+	void ChangeStateBits(uint64_t vaddr, uint64_t size) {
 		if constexpr (source == DirtySource::Gpu && enable) {
 			DemoteHot(vaddr, size);
 		}
@@ -283,11 +311,6 @@ public:
 				g_gpu_clean_epoch.fetch_add(1, std::memory_order_release);
 				m_version.fetch_add(1, std::memory_order_release);
 			}
-		}
-		if constexpr (source == DirtySource::Cpu) {
-			UpdateProtection<!enable, false>();
-		} else {
-			UpdateProtection<enable, true>();
 		}
 	}
 
@@ -423,6 +446,8 @@ private:
 			return;
 		}
 		previous = protection;
+		// v445l: KYTY_CPU_COST phase of the page manager's part (host protection calls).
+		const CpuCost::Phase protect_phase_("RM::PageWatchers");
 		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 

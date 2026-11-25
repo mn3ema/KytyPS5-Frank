@@ -1,5 +1,8 @@
 #include "graphics/presentation/systemOverlay.h"
 
+#include "common/gameStarted.h"
+#include "graphics/host_gpu/renderer/fsr3FrameGen.h"
+
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
@@ -197,6 +200,9 @@ struct TrophyNotification {
 std::mutex                     g_trophy_notification_mutex;
 std::deque<TrophyNotification> g_trophy_notifications;
 std::atomic<bool>              g_trophy_notification_active {false};
+// v0.5 FG: the frame generation hint (ShowFrameGenerationHint), until this steady-clock time (ms).
+std::atomic<int64_t>           g_fg_hint_until_ms {0};
+std::atomic<bool>              g_fg_hint_on {false};
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -485,8 +491,66 @@ void ShutdownSystemOverlayInput() {
 // The startup shader precompile panel (plan 4.12): shown while it runs, then with the count.
 
 // After the replay it stays for the whole session with the ledger's count (Mac, 10-25 14:07).
+static int ReadyPanelSeconds() {
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_READY_PANEL_SECONDS");
+		return value != nullptr ? std::atoi(value) : 30;
+	}();
+	return limit;
+}
+
+// Whether `since` (set on the first call) is less than the panel limit ago.
+[[maybe_unused]] static bool WithinPanelLimit(std::atomic<int64_t>& since_ms) {
+	const int limit = ReadyPanelSeconds();
+	if (limit < 0) {
+		return true;
+	}
+	const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	int64_t since = since_ms.load(std::memory_order_relaxed);
+	if (since == 0) {
+		since_ms.compare_exchange_strong(since, now);
+		since = since_ms.load(std::memory_order_relaxed);
+	}
+	return now - since < static_cast<int64_t>(limit) * 1000;
+}
+
+static int64_t SteadyNowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+void ShowFrameGenerationHint(bool on, int seconds) {
+	g_fg_hint_on.store(on, std::memory_order_relaxed);
+	g_fg_hint_until_ms.store(SteadyNowMs() + static_cast<int64_t>(seconds) * 1000, std::memory_order_release);
+}
+
+// The frame generation hint is up: after a press of F8, or for 10 s once the startup preparation is
+// done (the title screen), when frame generation can run.
+static bool FrameGenHintVisible() {
+	if (!Fsr3::FrameGen::Active()) {
+		return false;
+	}
+	// On the title screen (the startup preparation done, no save loaded or new game started yet) it
+	// stays; after that only for a few seconds after each F8.
+	if (GetShaderPrecompileProgress().startup_wait_done.load(std::memory_order_acquire) &&
+	    !Common::GameStarted::Started()) {
+		g_fg_hint_on.store(Fsr3::FrameGen::Enabled(), std::memory_order_relaxed);
+		return true;
+	}
+	return SteadyNowMs() < g_fg_hint_until_ms.load(std::memory_order_acquire);
+}
+
 static bool PrecompilePanelVisible() {
 	const auto& progress = GetShaderPrecompileProgress();
+	// v438q (Mac 11-16: the box stayed in gameplay after a skip): after a skip the background
+	// progress shows for KYTY_READY_PANEL_SECONDS too, then hides for the session.
+	if (progress.skipped.load(std::memory_order_acquire)) {
+		// v0.5 FG (Mac 11-24): until the player loads a save or starts a new game.
+		return !Common::GameStarted::Started();
+	}
 	if (progress.active.load(std::memory_order_acquire)) {
 		return true;
 	}
@@ -502,23 +566,9 @@ static bool PrecompilePanelVisible() {
 	// v438g (Mac 11-15: "only in the title, not the gameplay"): the "Shaders ready" summary stays
 	// for KYTY_READY_PANEL_SECONDS (default 30) after the startup wait, then hides for the session
 	// (-1: always shown, 0: never).
-	static const int limit = [] {
-		const char* value = std::getenv("KYTY_READY_PANEL_SECONDS");
-		return value != nullptr ? std::atoi(value) : 30;
-	}();
-	if (limit < 0) {
-		return true;
-	}
-	static std::atomic<int64_t> ready_since {0};
-	const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-	                        std::chrono::steady_clock::now().time_since_epoch())
-	                        .count();
-	int64_t since = ready_since.load(std::memory_order_relaxed);
-	if (since == 0) {
-		ready_since.compare_exchange_strong(since, now);
-		since = ready_since.load(std::memory_order_relaxed);
-	}
-	return now - since < static_cast<int64_t>(limit) * 1000;
+	// v0.5 FG (Mac 11-24: "stay all the way until the player loads a save or starts a new game"):
+	// the summary stays on the title screen until then (Common::GameStarted).
+	return !Common::GameStarted::Started();
 }
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
@@ -527,12 +577,14 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto system = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool precompile    = PrecompilePanelVisible();
+	const bool fg_hint       = FrameGenHintVisible();
 	const auto& progress     = GetShaderPrecompileProgress();
 	const bool  compiling    = precompile && (progress.active.load(std::memory_order_relaxed) ||
 	                                          progress.pipelines_active.load(std::memory_order_relaxed) ||
 	                                          progress.gpl_warm_active.load(std::memory_order_relaxed));
-	return {core.active || dialog.active || system.active || trophy_active || precompile,
+	return {core.active || dialog.active || system.active || trophy_active || precompile || fg_hint,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
+	            (fg_hint ? 0x04000000u + (g_fg_hint_on.load(std::memory_order_relaxed) ? 0x08000000u : 0u) : 0u) +
 	            static_cast<uint32_t>(progress.skip_state.load(std::memory_order_relaxed)) * 0x01000000u +
 	            (progress.skip_offered.load(std::memory_order_relaxed) ? 0x02000000u : 0u) +
 	            (precompile ? 1u + progress.done.load(std::memory_order_relaxed) +
@@ -1213,6 +1265,31 @@ struct SystemOverlay::Impl {
 	}
 
 	// "Compiling shaders" with a bar and N / M at the bottom left, then "Shaders ready".
+	// v0.5 FG: bottom left, right of the shader panel when it is up (Mac 11-24: on the right it covered
+	// the game's options), "Frame generation: OFF  -  F8 turns it on".
+	void DrawFrameGenHint(vk::Extent2D frame_extent, bool beside_precompile) {
+		const bool  on    = g_fg_hint_on.load(std::memory_order_relaxed);
+		const float scale = std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                                        static_cast<float>(frame_extent.height) / 1080.0f),
+		                               0.65f, 1.5f);
+		const float margin = 28.0f * scale;
+		// The shader panel's width (DrawPrecompilePanel) and a gap.
+		const float panel  = std::min(360.0f * scale, static_cast<float>(frame_extent.width) - 2.0f * margin);
+		const float x      = beside_precompile ? margin + panel + 12.0f * scale : margin;
+		ImGui::SetNextWindowPos({x, static_cast<float>(frame_extent.height) - margin}, ImGuiCond_Always,
+		                        {0.0f, 1.0f});
+		ImGui::SetNextWindowBgAlpha(0.72f);
+		constexpr ImGuiWindowFlags flags =
+		    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+		    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings |
+		    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_AlwaysAutoResize;
+		ImGui::Begin("##FrameGenHint", nullptr, flags);
+		ImGui::SetWindowFontScale(1.15f * scale);
+		ImGui::TextUnformatted(on ? "Frame generation: ON" : "Frame generation: OFF");
+		ImGui::TextUnformatted(on ? "F8 turns it off" : "F8 turns it on");
+		ImGui::End();
+	}
+
 	void DrawPrecompilePanel(vk::Extent2D frame_extent) {
 		const auto&    progress = GetShaderPrecompileProgress();
 		const bool     running  = progress.active.load(std::memory_order_acquire);
@@ -1245,7 +1322,7 @@ struct SystemOverlay::Impl {
 			                   overlay);
 		} else if (running) {
 			ImGui::TextUnformatted(progress.skipped.load(std::memory_order_relaxed)
-			                           ? "Shaders: preparing in the background (you can play)"
+			                           ? "Preparing shaders in the background"
 			                           : "Compiling shaders");
 			char overlay[48];
 			std::snprintf(overlay, sizeof(overlay), "%u / %u", done, total);
@@ -1265,7 +1342,7 @@ struct SystemOverlay::Impl {
 			const uint32_t all  = std::max(progress.gpl_warm_total.load(std::memory_order_relaxed), 1u);
 			const uint32_t made = std::min(progress.gpl_warm_done.load(std::memory_order_relaxed), all);
 			ImGui::TextUnformatted(progress.skipped.load(std::memory_order_relaxed)
-			                           ? "Pipelines: preparing in the background (you can play)"
+			                           ? "Preparing pipelines in the background"
 			                           : "Preparing pipelines");
 			char overlay[48];
 			std::snprintf(overlay, sizeof(overlay), "%u / %u", made, all);
@@ -1321,8 +1398,9 @@ struct SystemOverlay::Impl {
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
 		const auto now = Clock::now();
 		const bool precompile_panel = PrecompilePanelVisible();
+		const bool fg_hint          = FrameGenHintVisible();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !precompile_panel) {
+		    !precompile_panel && !fg_hint) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1367,6 +1445,9 @@ struct SystemOverlay::Impl {
 		DrawTrophyNotification(frame_extent, now);
 		if (precompile_panel) {
 			DrawPrecompilePanel(frame_extent);
+		}
+		if (fg_hint) {
+			DrawFrameGenHint(frame_extent, precompile_panel);
 		}
 		ImGui::Render();
 		extent = frame_extent;

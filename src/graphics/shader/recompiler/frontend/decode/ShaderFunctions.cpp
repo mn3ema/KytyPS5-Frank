@@ -4,6 +4,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -20,7 +21,18 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 constexpr uint32_t MaxFunctionWords  = 4096;
-constexpr uint32_t MaxExpandedWords  = 131072;
+// v439: 262,144 (was 131,072). The ray-tracing shaders behind the glass reflections expand past
+// 131,072 words with every hit shader they can call (e6d76d24: up to ~129k, 29be8047: more than
+// 131k); since v438zz translates such programs in seconds, the bound only keeps runaway
+// expansions out. KYTY_MAX_EXPANDED_WORDS=<n> overrides it.
+uint32_t MaxExpandedWordsLimit() {
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_MAX_EXPANDED_WORDS");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 262144ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(n, 4096ul, 1ul << 22u));
+	}();
+	return limit;
+}
 constexpr uint64_t MaxCallTableBytes = 16u * 1024u * 1024u;
 constexpr size_t   MaxCallTargets    = 256;
 
@@ -74,7 +86,13 @@ bool ReadFunction(uint64_t address, uint32_t return_reg, const ShaderCodeReader&
 		if (IsCall(inst.raw[0]) || inst.opcode == Opcode::S_ENDPGM ||
 		    inst.opcode == Opcode::UNSUPPORTED || Writes(inst, return_reg, wave_size) ||
 		    Writes(inst, return_reg + 1u, wave_size)) {
-			reason = "shader function needs nested calls or unsupported instructions";
+			reason = fmt::format("shader function needs nested calls or unsupported instructions "
+			                     "(0x{:x} + 0x{:x}: {:08x} {})",
+			                     address, next * 4u, inst.raw[0],
+			                     IsCall(inst.raw[0]) ? "call"
+			                     : inst.opcode == Opcode::S_ENDPGM ? "s_endpgm"
+			                     : inst.opcode == Opcode::UNSUPPORTED ? "unsupported"
+			                                                          : "writes the return pair");
 			return false;
 		}
 		function.instructions.push_back(inst);
@@ -180,7 +198,133 @@ bool EmitOriginalPc(std::vector<uint32_t>& code, const Instruction& inst, uint64
 
 using Branches = std::vector<std::pair<uint32_t, uint32_t>>;
 
+// v439: long edges of large expansions in one pass. Island sites every IslandSpacing words (at
+// instruction boundaries); every long edge takes one slot in each island between its source and
+// target, and hops from slot to slot; each island starts with a branch over its slots. Before
+// v439 islands were inserted one at a time, each insertion moving the whole program and
+// rescanning every edge: seconds on the GPU thread for the glass's ray-tracing shaders (hundreds
+// of callees, each returning across all the others). False when an edge would still be out of
+// range (the caller then uses the incremental method).
+bool RelocateBranchesBatched(std::vector<uint32_t>& code, Branches& branches) {
+	constexpr int64_t  Range         = std::numeric_limits<int16_t>::max();
+	constexpr uint32_t IslandSpacing = 12288;
+	constexpr int64_t  LongEdge      = 16384;
+	std::vector<size_t> long_edges;
+	for (size_t i = 0; i < branches.size(); i++) {
+		const auto delta = int64_t(branches[i].second) - int64_t(branches[i].first) - 1;
+		if (delta > LongEdge || delta < -LongEdge) long_edges.push_back(i);
+	}
+	if (long_edges.empty()) {
+		for (const auto [at, target]: branches) {
+			const auto delta = int64_t(target) - int64_t(at) - 1;
+			if (delta > Range || delta < -Range - 1) return false;
+			code[at] = (code[at] & 0xffff0000u) | (static_cast<uint32_t>(delta) & 0xffffu);
+		}
+		return true;
+	}
+	// Island sites: the first instruction boundary at or after each multiple of the spacing.
+	std::vector<uint32_t> sites;
+	{
+		uint32_t next_site = IslandSpacing;
+		for (uint32_t word = 0; word < code.size();) {
+			if (word >= next_site) {
+				sites.push_back(word);
+				next_site = word + IslandSpacing;
+			}
+			Instruction inst;
+			DecodeInstruction(code, word, inst);
+			if (inst.word_count == 0 || inst.word_count > code.size() - word) return false;
+			word += inst.word_count;
+		}
+	}
+	// The sites each long edge passes (strictly between source and target), and the slots.
+	std::vector<std::vector<size_t>> slots_at(sites.size()); // per site: long-edge indices
+	for (const auto e: long_edges) {
+		const auto [at, target] = branches[e];
+		const auto lo = std::min(at, target), hi = std::max(at, target);
+		auto first = std::upper_bound(sites.begin(), sites.end(), lo);
+		for (auto it = first; it != sites.end() && *it < hi; ++it) {
+			// A site exactly at the target needs no slot (the target is its first word).
+			slots_at[static_cast<size_t>(it - sites.begin())].push_back(e);
+		}
+	}
+	// New positions: an island of 1 + k words before each site's instruction.
+	std::vector<uint32_t> shift(sites.size() + 1u, 0u); // words inserted before site i
+	for (size_t i = 0; i < sites.size(); i++) {
+		const auto k = slots_at[i].size();
+		shift[i + 1u] = shift[i] + (k == 0 ? 0u : static_cast<uint32_t>(k + 1u));
+	}
+	const auto moved = [&](uint32_t old) {
+		const auto passed = static_cast<size_t>(std::upper_bound(sites.begin(), sites.end(), old) - sites.begin());
+		return old + shift[passed];
+	};
+	// A branch target at a site lands on the island's bypass, which continues to the site.
+	std::vector<uint32_t> result;
+	result.reserve(code.size() + shift.back());
+	std::vector<std::vector<uint32_t>> slot_pos(sites.size()); // new position of each slot
+	size_t                             site = 0;
+	for (uint32_t word = 0; word < code.size(); word++) {
+		if (site < sites.size() && word == sites[site]) {
+			const auto k = slots_at[site].size();
+			if (k != 0) {
+				result.push_back(0xbf820000u | static_cast<uint32_t>(k)); // S_BRANCH over the slots
+				for (size_t j = 0; j < k; j++) {
+					slot_pos[site].push_back(static_cast<uint32_t>(result.size()));
+					result.push_back(0xbf820000u);
+				}
+			}
+			++site;
+		}
+		result.push_back(code[word]);
+	}
+	const auto patch = [&](uint32_t at, uint32_t target) {
+		const auto delta = int64_t(target) - int64_t(at) - 1;
+		if (delta > Range || delta < -Range - 1) return false;
+		result[at] = (result[at] & 0xffff0000u) | (static_cast<uint32_t>(delta) & 0xffffu);
+		return true;
+	};
+	// Short edges keep their target (moved); a target at a site goes to the site's first word
+	// after its island, as before (the island's bypass would also get there).
+	std::vector<uint8_t> is_long(branches.size(), 0u);
+	for (const auto e: long_edges) is_long[e] = 1u;
+	for (size_t i = 0; i < branches.size(); i++) {
+		if (is_long[i] != 0u) continue;
+		if (!patch(moved(branches[i].first), moved(branches[i].second))) return false;
+	}
+	// Long edges: source -> slot in each passed island (in the direction of travel) -> target.
+	for (const auto e: long_edges) {
+		const auto [at, target] = branches[e];
+		std::vector<uint32_t> hops;
+		const bool forward = target > at;
+		for (size_t i = 0; i < sites.size(); i++) {
+			const auto& list = slots_at[i];
+			const auto  it   = std::find(list.begin(), list.end(), e);
+			if (it != list.end()) hops.push_back(slot_pos[i][static_cast<size_t>(it - list.begin())]);
+		}
+		if (!forward) std::reverse(hops.begin(), hops.end());
+		uint32_t from = moved(at);
+		for (const auto hop: hops) {
+			if (!patch(from, hop)) return false;
+			from = hop;
+		}
+		if (!patch(from, moved(target))) return false;
+	}
+	code = std::move(result);
+	return true;
+}
+
 bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::string& reason) {
+	{
+		auto copy = code;
+		if (RelocateBranchesBatched(copy, branches)) {
+			if (copy.size() > MaxExpandedWordsLimit()) {
+				reason = "expanded shader branch islands exceed the bounded code size";
+				return false;
+			}
+			code = std::move(copy);
+			return true;
+		}
+	}
 	// Keep relocation symbolic until every function has been inserted. A long
 	// edge uses guarded S_BRANCH islands; ordinary fallthrough skips the island.
 	// Unlike GETPC/ADD/SETPC stubs, these do not clobber guest SGPRs or SCC.
@@ -192,7 +336,7 @@ bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::stri
 			++index;
 			continue;
 		}
-		if (code.size() + 2 > MaxExpandedWords || branches.size() > MaxExpandedWords) {
+		if (code.size() + 2 > MaxExpandedWordsLimit() || branches.size() > MaxExpandedWordsLimit()) {
 			reason = "expanded shader branch islands exceed the bounded code size";
 			return false;
 		}
@@ -459,12 +603,53 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 		    return IsDirectBranch(inst.opcode) && inst.branch_target <= inst.pc;
 	    });
 	if (has_backedge) {
-		for (const auto reg: dependencies) {
-			if (std::any_of(program.instructions.begin(), program.instructions.end(),
-			                [&](const auto& inst) { return Writes(inst, reg, wave_size); })) {
-				reason = "shader loop may overwrite a call-target dependency";
-				return false;
+		// v439: a write of a register a call target was resolved from matters only if a call
+		// site can run after it (a loop around both). The registers were not written before the
+		// calls in program order (ResolveCalls), so the question is whether a path leads from
+		// such a write back to a call: a walk over the main program's instructions (fallthrough
+		// and direct branches; calls return to the next instruction). Before v439 any write in a
+		// shader with a loop refused the expansion (384f4708, fc0537b7: the glass's ray tracing).
+		const auto& insts = program.instructions;
+		std::unordered_map<uint32_t, size_t> index_of_pc;
+		for (size_t i = 0; i < insts.size(); i++) index_of_pc.emplace(insts[i].pc, i);
+		std::vector<uint8_t> is_call(insts.size(), 0u);
+		for (size_t i = 0; i < insts.size(); i++) is_call[i] = calls.contains(insts[i].pc) ? 1u : 0u;
+		const auto successors = [&](size_t i, auto&& visit) {
+			const auto& inst = insts[i];
+			if (inst.opcode == Opcode::S_ENDPGM) return;
+			if (IsDirectBranch(inst.opcode)) {
+				if (const auto t = index_of_pc.find(inst.branch_target); t != index_of_pc.end()) visit(t->second);
+				if (inst.opcode == Opcode::S_BRANCH) return;
 			}
+			if (i + 1 < insts.size()) visit(i + 1);
+		};
+		std::vector<uint8_t> seen(insts.size(), 0u);
+		std::vector<size_t>  pending;
+		for (size_t i = 0; i < insts.size(); i++) {
+			bool writes_dependency = false;
+			for (const auto reg: dependencies) writes_dependency |= Writes(insts[i], reg, wave_size);
+			if (writes_dependency && seen[i] == 0u) {
+				seen[i] = 1u;
+				pending.push_back(i);
+			}
+		}
+		// A write reaching a call (including a call that itself writes the register: its next
+		// run reads the new value) refuses the expansion.
+		bool reaches_call = false;
+		std::vector<uint8_t> walked(insts.size(), 0u);
+		while (!pending.empty() && !reaches_call) {
+			const auto at = pending.back();
+			pending.pop_back();
+			successors(at, [&](size_t next) {
+				if (walked[next] != 0u) return;
+				walked[next] = 1u;
+				if (is_call[next] != 0u) reaches_call = true;
+				pending.push_back(next);
+			});
+		}
+		if (reaches_call) {
+			reason = "shader loop may overwrite a call-target dependency";
+			return false;
 		}
 	}
 	// A callee must not invalidate the user-data assumptions used to resolve later calls.
@@ -526,29 +711,34 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 				return true;
 			};
 			if (call.dynamic) {
-				// SWAPPC preserves SCC. Keep separate decision trees and callee
-				// bodies for its two incoming values, without borrowing a guest SGPR.
+				// SWAPPC preserves SCC. Keep separate decision trees for its two incoming
+				// values, without borrowing a guest SGPR. v439: each tree's match restores SCC
+				// and branches to the callee's one body, emitted after the trees (before v439
+				// every body was emitted once per tree: twice the code, and the glass's
+				// ray-tracing shaders went past the size bound).
 				// Group by the high address word so each low-word comparison has
 				// one failure edge, rather than two branches sharing a later arm.
 				const auto select_scc = static_cast<uint32_t>(result.size());
 				result.push_back(0xbf850000u);
+				std::vector<std::pair<uint32_t, size_t>> stubs; // (S_BRANCH position, target index)
 				for (uint32_t scc = 0; scc < 2; ++scc) {
 					if (scc != 0) relocations.emplace_back(select_scc, result.size());
-					std::map<uint32_t, std::vector<const CallTarget*>> groups;
-					for (const auto& target: call.targets)
-						groups[static_cast<uint32_t>(target.address >> 32u)].push_back(&target);
+					std::map<uint32_t, std::vector<size_t>> groups;
+					for (size_t k = 0; k < call.targets.size(); k++)
+						groups[static_cast<uint32_t>(call.targets[k].address >> 32u)].push_back(k);
 					for (const auto& [high, targets]: groups) {
 						result.push_back(0xbf06ff00u | (call.source_reg + 1u));
 						result.push_back(high);
 						const auto high_miss = static_cast<uint32_t>(result.size());
 						result.push_back(0xbf840000u);
-						for (const auto* target: targets) {
+						for (const auto k: targets) {
 							result.push_back(0xbf06ff00u | call.source_reg);
-							result.push_back(static_cast<uint32_t>(target->address));
+							result.push_back(static_cast<uint32_t>(call.targets[k].address));
 							const auto low_miss = static_cast<uint32_t>(result.size());
 							result.push_back(0xbf840000u);
 							result.push_back(scc != 0 ? 0xbf068080u : 0xbf068180u);
-							if (!emit_target(*target)) return false;
+							stubs.emplace_back(static_cast<uint32_t>(result.size()), k);
+							result.push_back(0xbf820000u); // S_BRANCH to the callee's body
 							relocations.emplace_back(low_miss, result.size());
 						}
 						result.push_back(0xbf920000u | ShaderCallMissTrapCode);
@@ -558,6 +748,12 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 					result.push_back(0xbf920000u | ShaderCallMissTrapCode);
 					result.push_back(0xbf810000u);
 				}
+				std::vector<uint32_t> bodies(call.targets.size());
+				for (size_t k = 0; k < call.targets.size(); k++) {
+					bodies[k] = static_cast<uint32_t>(result.size());
+					if (!emit_target(call.targets[k])) return false;
+				}
+				for (const auto& [at, k]: stubs) relocations.emplace_back(at, bodies[k]);
 			} else {
 				for (const auto& target: call.targets)
 					if (!emit_target(target)) return false;
@@ -565,8 +761,13 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			for (const auto at: returns)
 				relocations.emplace_back(at, result.size());
 		}
-		if (result.size() > MaxExpandedWords) {
-			reason = "expanded shader exceeds the bounded code size";
+		if (result.size() > MaxExpandedWordsLimit()) {
+			// v439: with the size it had reached (callees so far) and the call targets in all.
+			size_t targets = 0;
+			for (const auto& [at, c]: calls) targets += c.targets.size();
+			reason = "expanded shader exceeds the bounded code size (" + std::to_string(result.size()) +
+			         " words at pc 0x" + fmt::format("{:x}", inst.pc) + ", " + std::to_string(targets) +
+			         " call targets in all)";
 			return false;
 		}
 	}
@@ -641,6 +842,78 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 		consulted_user_data->assign(dependencies.begin(), dependencies.end());
 	}
 	return ok;
+}
+
+bool SplitShaderCalls(std::span<const uint32_t> code, uint64_t base,
+                      std::span<const uint32_t> user_data, const ShaderCodeReader& read,
+                      uint32_t wave_size, ShaderCallSplit& split, std::string& reason) {
+	split = {};
+	reason.clear();
+	if (wave_size != 32u) {
+		reason = "callable split requires wave32";
+		return false;
+	}
+	ShaderAnalysis analysis;
+	AnalyzeShader(code, analysis);
+	if (!analysis.has_calls) {
+		reason = "no calls";
+		return false;
+	}
+	if (analysis.has_setpc) {
+		reason = "shader calls combined with indirect branches are unsupported";
+		return false;
+	}
+	std::vector<CallSite> sites;
+	std::set<uint32_t>    dependencies;
+	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
+		return false;
+	}
+	if (sites.size() != 1u) {
+		reason = fmt::format("callable split needs one call site, the shader has {}", sites.size());
+		return false;
+	}
+	const auto& site = sites.front();
+	split.call_pc    = site.pc;
+	split.source_reg = site.source_reg;
+	split.return_reg = site.return_reg;
+	split.main_code.assign(code.begin(), code.end());
+	if (site.pc % 4u != 0u || site.pc / 4u >= split.main_code.size() || !IsCall(split.main_code[site.pc / 4u])) {
+		reason = "call site is not a call";
+		return false;
+	}
+	split.main_code[site.pc / 4u] = 0xbf800000u; // s_nop 0
+	// v442c: a target that cannot be read as a callable function (often an address whose code the
+	// game has not streamed in, or another material's data) is left out instead of failing the whole
+	// split: calls to it call nothing (KYTY_RT_SKIP_BAD_TARGETS=0: the split fails, as before).
+	static const bool skip_bad = [] {
+		const char* value = std::getenv("KYTY_RT_SKIP_BAD_TARGETS");
+		return value == nullptr || value[0] != '0';
+	}();
+	split.skipped_targets = 0;
+	split.skipped_reason.clear();
+	for (const auto address: site.addresses) {
+		Function function;
+		if (!ReadFunction(address, site.return_reg, read, function, reason, wave_size)) {
+			if (!skip_bad) {
+				return false;
+			}
+			if (split.skipped_targets++ == 0) {
+				split.skipped_reason = reason;
+			}
+			reason.clear();
+			continue;
+		}
+		for (const auto& inst: function.instructions) {
+			if (inst.opcode == Opcode::S_SETPC_B64) {
+				function.code[inst.pc / 4u] = 0xbf810000u; // s_endpgm
+			}
+		}
+		split.targets.push_back({address, std::move(function.code)});
+	}
+	if (split.targets.empty() && split.skipped_targets != 0) {
+		reason = split.skipped_reason;
+	}
+	return !split.targets.empty();
 }
 
 struct ShaderFunctionExpander::Impl {

@@ -211,7 +211,11 @@ void Translator::S_INST_PREFETCH() {
 }
 
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
-	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
+	// A callable (v440 split) is its own code span: its pcs start at 0 at its guest address, so its
+	// S_GETPC base is that address (its PC-relative constants then give immediate descriptors).
+	const auto base    = program.rt_role == IR::RtRole::Callable && program.rt_code_address != 0
+	                         ? IR::U64(IR::Value(program.rt_code_address))
+	                         : IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
 	const auto address = IR::U64(
 	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {

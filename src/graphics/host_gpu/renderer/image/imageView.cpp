@@ -311,6 +311,28 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 } // namespace ImageViewOps
 
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+	latest_view_level = static_cast<uint8_t>(std::min<uint32_t>(view_info.base_level, 0xfeu));
+	lowest_view_level = std::min(lowest_view_level, latest_view_level);
+	latest_reach_level =
+	    static_cast<uint8_t>(std::min<uint32_t>(view_info.base_level + (view_info.min_lod >> 8u), 0xfeu));
+	lowest_reach_level = std::min(lowest_reach_level, latest_reach_level);
+	if (sparse.sparse && latest_reach_level < std::min(sparse.bound_first, sparse.tail_first)) {
+		// v438zr: a view that can reach a level without memory. TextureCache::FindTexture gives
+		// the levels memory before it asks for the view, so this is a request that came another
+		// way. KYTY_TEX_SPARSE_VERIFY=1 stops here; otherwise the levels get memory now and the
+		// image is uploaded again at its next refresh.
+		if (TexSparseVerify()) {
+			EXIT("KYTY_TEX_SPARSE_VERIFY: a view from level %u (clamp %u/256) of a sparse image whose memory "
+			     "starts at level %u (guest 0x%016" PRIx64 ", %ux%u)\n",
+			     view_info.base_level, view_info.min_lod, std::min(sparse.bound_first, sparse.tail_first),
+			     info.data.address, info.extent.width, info.extent.height);
+		}
+		static std::atomic<uint32_t> late {0};
+		if (const auto n = late.fetch_add(1, std::memory_order_relaxed) + 1; (n & (n - 1)) == 0) {
+			std::fprintf(stderr, "[tex-sparse] %u views reached a level without memory outside FindTexture\n", n);
+		}
+		(void)EnsureSparseLevels(latest_reach_level);
+	}
 	const auto& image      = backing;
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);

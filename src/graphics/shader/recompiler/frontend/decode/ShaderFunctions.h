@@ -27,6 +27,29 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
                            uint32_t wave_size = 64,
                            std::vector<uint32_t>* consulted_user_data = nullptr);
 
+// v440 (ray-tracing shaders on callable shaders): a shader with one call site whose targets come
+// from a table, split instead of inlined. main_code is the shader with the call replaced by s_nop
+// (the translator emits the callable call at call_pc); each target's code has its returns
+// (s_setpc_b64 of the return pair) replaced by s_endpgm. A target's callable index is its position.
+struct ShaderCallSplit {
+	struct Target {
+		uint64_t              address = 0;
+		std::vector<uint32_t> code;
+	};
+	uint32_t              call_pc    = 0; // byte offset of the call in main_code
+	uint32_t              source_reg = 0; // SGPR pair with the target address
+	uint32_t              return_reg = 0; // SGPR pair the call writes the return address to
+	std::vector<uint32_t> main_code;
+	std::vector<Target>   targets;
+	// v442c: targets left out because their code could not be read as a callable function (calls
+	// to them call nothing); the first one's reason.
+	uint32_t              skipped_targets = 0;
+	std::string           skipped_reason;
+};
+bool SplitShaderCalls(std::span<const uint32_t> code, uint64_t base,
+                      std::span<const uint32_t> user_data, const ShaderCodeReader& read,
+                      uint32_t wave_size, ShaderCallSplit& split, std::string& reason);
+
 // InlineShaderFunctions for a caller that expands the same shaders over and over (the pipeline
 // cache, once per dispatch). The decoded shader is kept while its code is unchanged, and an
 // expansion while the call targets resolve to the same addresses and the callee code reads the

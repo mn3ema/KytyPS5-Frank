@@ -13,8 +13,11 @@
 #include "graphics/host_gpu/renderer/presentRt.h"
 #include "graphics/host_gpu/renderer/rtDrawLog.h"
 #include "graphics/host_gpu/renderer/imgTrace.h"
+#include "graphics/host_gpu/renderer/gpuPad.h"
+#include "graphics/host_gpu/renderer/queueShare.h"
 #include "graphics/host_gpu/renderer/syncToggle.h"
 #include "graphics/host_gpu/renderer/rtSnap.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
@@ -222,6 +225,73 @@ void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
 	                     context_id);
 }
 
+} // namespace Libs::Graphics::Sync
+namespace Libs::Graphics {
+uint64_t AllocCountTotal();      // allocStats.cpp
+uint64_t AllocCountLocalTotal(); // allocStats.cpp
+} // namespace Libs::Graphics
+namespace Libs::Graphics::Sync {
+
+// v445o (2): [cut-hits], one line per toggle window that ended (and one for the time before the
+// first), when one of v445o's cuts is toggled: how often each cut's path and the path it replaces
+// ran in that window. An on window must show its cut's counts, an off window none of them.
+static void ReportCutHits() {
+	if (!SyncToggle::CutsConfigured()) {
+		return;
+	}
+	static bool     last_on = false;
+	static uint64_t before[13] {};
+	static uint64_t flips = 0;
+	flips++;
+	const bool on = SyncToggle::State().load(std::memory_order_relaxed);
+	if (on == last_on) {
+		return;
+	}
+	auto&          h      = SyncToggle::Hits();
+	const auto&    floor  = Common::FloorStats::Get();
+	const uint64_t now[13] = {h.window_scans.load(std::memory_order_relaxed),
+	                          h.window_by_page.load(std::memory_order_relaxed),
+	                          h.set_reused.load(std::memory_order_relaxed),
+	                          h.set_busy.load(std::memory_order_relaxed),
+	                          h.set_fresh.load(std::memory_order_relaxed),
+	                          h.sync_local.load(std::memory_order_relaxed),
+	                          floor.sync_calls.load(std::memory_order_relaxed),
+	                          AllocCountLocalTotal(),
+	                          AllocCountTotal(),
+	                          h.loop_untimed.load(std::memory_order_relaxed),
+	                          h.loop_timed.load(std::memory_order_relaxed),
+	                          h.program_untimed.load(std::memory_order_relaxed),
+	                          h.pair_memo.load(std::memory_order_relaxed)};
+	static uint64_t pair_set_before = 0;
+	// v445q ("rbsubmit"): copy-queue readbacks the worker submitted and the GPU thread did.
+	static uint64_t rb_before[3] {};
+	const uint64_t  rb[3] = {h.rb_thread.load(std::memory_order_relaxed), h.rb_inline.load(std::memory_order_relaxed),
+	                         h.rb_handoff_ns.load(std::memory_order_relaxed)};
+	const uint64_t  pair_set        = h.pair_set.load(std::memory_order_relaxed);
+	uint64_t        d[13];
+	for (int i = 0; i < 13; i++) {
+		d[i]      = now[i] - before[i];
+		before[i] = now[i];
+	}
+	const auto n = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+	std::fprintf(stderr,
+	             "[cut-hits] window %s, %llu flips | windowscan %llu (by page %llu) | setreuse reused %llu "
+	             "busy %llu fresh %llu | syncstats local %llu of %llu | alloccount local %llu of %llu | "
+	             "timers loop untimed %llu timed %llu, dispatch untimed %llu, pair memo %llu set %llu, "
+	             "phase-off now %d | rbsubmit thread %llu inline %llu, hand-over to submitted avg %.1f us\n",
+	             last_on ? "on" : "off", n(flips), n(d[0]), n(d[1]), n(d[2]), n(d[3]), n(d[4]), n(d[5]), n(d[6]),
+	             n(d[7]), n(d[8]), n(d[9]), n(d[10]), n(d[11]), n(d[12]), n(pair_set - pair_set_before),
+	             CpuCost::Detail::g_phase_off.load(std::memory_order_relaxed) ? 1 : 0, n(rb[0] - rb_before[0]),
+	             n(rb[1] - rb_before[1]),
+	             rb[0] != rb_before[0]
+	                 ? static_cast<double>(rb[2] - rb_before[2]) * 1e-3 / static_cast<double>(rb[0] - rb_before[0])
+	                 : 0.0);
+	for (int i = 0; i < 3; i++) rb_before[i] = rb[i];
+	pair_set_before = pair_set;
+	flips           = 0;
+	last_on         = on;
+}
+
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
 	DrainProtectionHelper(ProtectDrainReason::GuestSignal);
@@ -230,6 +300,13 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 	PresentRt::Flip();
 	RtDrawLog::Flip();
 	SyncToggle::AtFlip(GuestFlipCount());
+	// v445o: the cuts that keep a per-flip state (KYTY_TIMERS_CUT, KYTY_SYNC_STATS_LOCAL).
+	CpuCost::Detail::g_phase_off.store(SyncToggle::TimersCut() && !CpuCost::Enabled(),
+	                                   std::memory_order_relaxed);
+	FoldSyncCounters(); // this thread's per-sync [floor] counts
+	ReportCutHits();
+	QueueShare::FrameEnd();  // KYTY_QUEUE_STATS, [queue-share]: the frame's counts end here
+	GpuPad::AtFlip(buffer);  // KYTY_SYNC_TOGGLE_MODE=gpupad, in the on windows: one extra dispatch
 	RtSnap::AtFlip(buffer.GetContext());
 	if (SyncToggle::IdleAtFlip()) {
 		// Everything recorded so far, this frame included, has finished on the host GPU before

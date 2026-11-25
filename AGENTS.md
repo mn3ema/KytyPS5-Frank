@@ -2,8 +2,8 @@
 
 Guidance for AI coding agents, and people, picking up this tree. State as of 2026-09-25.
 
-**This repository is public** (`mn3ema/KytyPS5-Frank`, since v0.1). Check with Mac before opening PRs
-upstream from it or posting about it elsewhere.
+**This work is not public yet.** Do not push it, open PRs from it, or name the title in public
+commits, issues or chats without checking with Mac first.
 
 ## What this tree is
 

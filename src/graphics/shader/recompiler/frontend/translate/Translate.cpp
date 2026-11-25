@@ -1104,6 +1104,27 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			result.blocks[source_index]->AddBranch(result.blocks[target->second]);
 		}
 	}
+	// Each construct's merge block learns its header (SsaRewrite's ssa_construct_header). Where
+	// several constructs end at one block, the outermost: its region holds the others.
+	{
+		std::vector<size_t> header_of(result.blocks.size(), SIZE_MAX);
+		for (const auto& source_block: cfg.blocks) {
+			const auto merge = source_block.terminator.merge_block;
+			if (merge == UINT32_MAX || merge == source_block.id) {
+				continue;
+			}
+			const auto target = block_indices.find(merge);
+			if (target == block_indices.end()) {
+				continue;
+			}
+			header_of[target->second] = std::min(header_of[target->second], block_indices.at(source_block.id));
+		}
+		for (size_t index = 0; index < header_of.size(); index++) {
+			if (header_of[index] != SIZE_MAX && header_of[index] < index) {
+				result.blocks[index]->ssa_construct_header = result.blocks[header_of[index]];
+			}
+		}
+	}
 	{
 		result.blocks.front()->AddBranch(result.blocks.at(block_indices.at(cfg.blocks.front().id)));
 		IR::IREmitter entry_ir(result.blocks.front());
@@ -1416,6 +1437,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}
+	// v440: a callee starts with the caller's registers from the payload.
+	if (options.rt_call != nullptr) {
+		result.rt_role          = options.rt_call->role;
+		result.rt_payload_words = options.rt_call->PayloadWords();
+		result.rt_code_address  = options.rt_call->code_address;
+		result.rt_code_hash     = options.rt_call->code_hash;
+		vector_limit            = std::max(vector_limit, options.rt_call->vgpr_count);
+		if (options.rt_call->role == IR::RtRole::Callable) {
+			Translator entry_translator(result, result.blocks.front(), vector_limit, false);
+			entry_translator.LoadPayloadRegisters(*options.rt_call);
+		}
+	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
 	// Diagnostics: KYTY_FORCE_PC=<shader hash>@<pc>=<dword>[,<dword>...][;<pc>=...] (all hex;
@@ -1511,6 +1544,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			if (probe.hash != 0 && probe.hash == result.shader_hash && instruction.pc == 0u) {
 				// Sentinel grey 0.25: pixels whose path skips the probed instruction.
 				translator.ForceVectorRegisters(ProbeVgpr, {0x3e800000u, 0x3e800000u, 0x3e800000u});
+			}
+			if (options.rt_call != nullptr) {
+				if (options.rt_call->role == IR::RtRole::Raygen && instruction.pc == options.rt_call->call_pc) {
+					translator.EmitCallableCall(*options.rt_call);
+					continue;
+				}
+				if (options.rt_call->role == IR::RtRole::Callable &&
+				    instruction.opcode == Decoder::Opcode::S_ENDPGM) {
+					translator.StorePayloadRegisters(*options.rt_call);
+				}
 			}
 			translator.TranslateInstruction(instruction);
 			if (probe.hash != 0 && probe.hash == result.shader_hash && probe.pc == instruction.pc &&

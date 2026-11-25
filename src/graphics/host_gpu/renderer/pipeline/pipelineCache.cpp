@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -109,34 +110,353 @@ void LogSkip(const char* why, const char* stage, uint64_t hash, int line) {
 
 namespace Libs::Graphics {
 
+namespace {
+// v440 M3: set by the PipelineCache from the device (GraphicContext::ray_tracing_pipeline_enabled).
+std::atomic<bool> g_rt_callables_device {false};
+// v440 M3: a callable split's lookup in this generation instead of the newest (its pipeline is
+// ready, the newest's is not yet); 0: the newest.
+thread_local uint32_t t_rt_forced_generation = 0;
+// v443: the ray-tracing pipeline builds queued or running, per shader (GetComputePipeline). A
+// split's target set grows only while it has none (rt_key_from_split): its new targets then join
+// in one generation when the build ends, instead of one generation every KYTY_RT_GROW_MS, each
+// translated and compiled whole on the GPU thread while the builds queue up (g442c: 12 generations
+// in 12 minutes for each of the four shaders). KYTY_RT_GROW_WAIT=0: as before.
+std::mutex                             g_rt_builds_mutex;
+std::unordered_map<uint64_t, uint32_t> g_rt_builds;
+void RtBuildsAdd(uint64_t shader_hash, int delta) {
+	std::lock_guard lock(g_rt_builds_mutex);
+	auto&           count = g_rt_builds[shader_hash];
+	count                 = delta < 0 && count == 0 ? 0u : count + static_cast<uint32_t>(delta);
+}
+bool RtBuildsPending(uint64_t shader_hash) {
+	static const bool wait = [] {
+		const char* value = std::getenv("KYTY_RT_GROW_WAIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!wait) {
+		return false;
+	}
+	std::lock_guard lock(g_rt_builds_mutex);
+	const auto      found = g_rt_builds.find(shader_hash);
+	return found != g_rt_builds.end() && found->second != 0;
+}
+// v443: a callable's module by its SPIR-V (AddPermutation). A shared callable (IR/RtCallable.h) is
+// the same words in every generation and in every split that calls its target, so it is validated
+// and made once per session.
+struct RtModuleEntry {
+	vk::ShaderModule module = nullptr;
+	uint64_t         check  = 0;
+	size_t           words  = 0;
+};
+std::mutex                                  g_rt_modules_mutex;
+std::unordered_map<uint64_t, RtModuleEntry> g_rt_modules;
+// v443: KYTY_RT_FALLBACK=0: while the newest generation's pipeline is being built the dispatch is
+// skipped (what happened before v443 in effect: the lookup of the last ready generation found the
+// newest one again), instead of running the last ready generation.
+static bool RtFallbackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_FALLBACK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+// v442b: KYTY_RT_REPLACE_CHANGED=0: a known call target keeps the code it was first seen with.
+static bool RtReplaceChangedTargets() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_REPLACE_CHANGED");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+} // namespace
+
+// v441c: the call targets a callable split has had, kept per shader across sessions
+// (_ShaderCache/<title>/rt_targets_<hash>.bin), so a session starts with the whole set in its
+// first generation and the driver's cache has the pipeline from the last session. A target is
+// taken again only when the guest code at its address still matches (returns aside: the split
+// replaces them with s_endpgm). KYTY_RT_TARGET_FILE=0 turns it off.
+namespace {
+std::filesystem::path ShaderDiskCacheDirectory();
+bool                  ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values);
+
+// v445z (KYTY_SRT_REPEAT_STATS=1, diagnostics only): before a memo of SRT refreshes is built, how
+// often a program's refresh repeats the inputs of its previous one (same user data and, for
+// compute, workgroup counts), how much walk time those repeats cost, and how much guest memory a
+// walk reads (read_memory calls and bytes, pages mapped for direct reads). [srt-repeat] every 5 s.
+static bool SrtRepeatStats() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_REPEAT_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+struct SrtRepeatState {
+	uint64_t refresh = 0, prepared = 0, scanned = 0, walks = 0, repeats = 0, walk_ns = 0, repeat_ns = 0;
+	uint64_t reads = 0, read_bytes = 0, pages = 0, deferred = 0, gpu_fills = 0;
+	std::chrono::steady_clock::time_point                last = std::chrono::steady_clock::now();
+	std::unordered_map<const void*, uint64_t>            last_key;
+};
+static thread_local SrtRepeatState g_srt_repeat;
+static thread_local uint64_t       t_srt_repeat_reads = 0, t_srt_repeat_bytes = 0, t_srt_repeat_pages = 0;
+static bool SrtRepeatRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	t_srt_repeat_reads++;
+	t_srt_repeat_bytes += values.size_bytes();
+	return ReadShaderGuestMemoryRaw(userdata, address, values);
+}
+static void SrtRepeatReport() {
+	auto&      st  = g_srt_repeat;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - st.last < std::chrono::seconds(5)) {
+		return;
+	}
+	const double s = std::chrono::duration<double>(now - st.last).count();
+	std::fprintf(stderr,
+	             "[srt-repeat] %.1fs: %.0f refreshes/s (prepared %.0f, scanned %.0f, walked %.0f) | walks repeating "
+	             "the program's previous inputs %.0f/s (%.0f%%) | walk time %.1f ms/s, of it repeats %.1f ms/s | per "
+	             "walk: %.1f reads, %.0f bytes, %.2f direct pages | walks deferred %.0f/s, with GPU fills %.0f/s\n",
+	             s, static_cast<double>(st.refresh) / s, static_cast<double>(st.prepared) / s,
+	             static_cast<double>(st.scanned) / s, static_cast<double>(st.walks) / s,
+	             static_cast<double>(st.repeats) / s,
+	             st.walks != 0 ? 100.0 * static_cast<double>(st.repeats) / static_cast<double>(st.walks) : 0.0,
+	             static_cast<double>(st.walk_ns) / 1e6 / s, static_cast<double>(st.repeat_ns) / 1e6 / s,
+	             st.walks != 0 ? static_cast<double>(st.reads) / static_cast<double>(st.walks) : 0.0,
+	             st.walks != 0 ? static_cast<double>(st.read_bytes) / static_cast<double>(st.walks) : 0.0,
+	             st.walks != 0 ? static_cast<double>(st.pages) / static_cast<double>(st.walks) : 0.0,
+	             static_cast<double>(st.deferred) / s, static_cast<double>(st.gpu_fills) / s);
+	auto keep = std::move(st.last_key);
+	if (keep.size() > 65536) {
+		keep.clear();
+	}
+	st          = {};
+	st.last_key = std::move(keep);
+	st.last     = now;
+}
+} // namespace
+
+static bool RtTargetFileEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_TARGET_FILE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+static std::filesystem::path RtTargetFile(uint64_t shader_hash) {
+	const auto folder = ShaderDiskCacheDirectory();
+	if (folder.empty()) {
+		return {};
+	}
+	return folder / fmt::format("rt_targets_{:016x}.bin", shader_hash);
+}
+
+static void RtWriteTargets(uint64_t shader_hash, const std::map<uint64_t, std::vector<uint32_t>>& targets) {
+	const auto path = RtTargetFile(shader_hash);
+	if (path.empty() || !RtTargetFileEnabled()) {
+		return;
+	}
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	const auto temporary = path.string() + ".tmp";
+	FILE*      file      = std::fopen(temporary.c_str(), "wb");
+	if (file == nullptr) {
+		return;
+	}
+	const uint32_t header[2] = {0x31545452u /* "RTT1" */, static_cast<uint32_t>(targets.size())};
+	bool ok = std::fwrite(header, sizeof(header), 1, file) == 1;
+	for (const auto& [address, code]: targets) {
+		const uint32_t words = static_cast<uint32_t>(code.size());
+		ok = ok && std::fwrite(&address, sizeof(address), 1, file) == 1 && std::fwrite(&words, sizeof(words), 1, file) == 1 &&
+		     (words == 0 || std::fwrite(code.data(), sizeof(uint32_t), words, file) == words);
+	}
+	ok = std::fclose(file) == 0 && ok;
+	if (ok) {
+		std::filesystem::rename(temporary, path, error);
+	}
+}
+
+// v443: the image kinds the callable splits' descriptor set has had (IR::RtImageKinds), kept across
+// sessions (_ShaderCache/<title>/rt_layout.bin): the set layout is part of each pipeline library's
+// identity, so a session must start with the layout the last one ended with for the driver's cache
+// to have its libraries. Read once, before the first split is translated; written when it grows.
+static std::filesystem::path RtLayoutFile() {
+	const auto folder = ShaderDiskCacheDirectory();
+	return folder.empty() ? std::filesystem::path() : folder / "rt_layout.bin";
+}
+
+static std::atomic<uint64_t> g_rt_layout_saved {0};
+
+static void RtLayoutSeed() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const auto path = RtLayoutFile();
+		if (path.empty() || !RtTargetFileEnabled()) {
+			return;
+		}
+		uint64_t words[2] = {};
+		if (FILE* file = std::fopen(path.string().c_str(), "rb"); file != nullptr) {
+			if (std::fread(words, sizeof(words), 1, file) == 1 && words[0] == 0x314c5452u /* "RTL1" */) {
+				g_rt_layout_saved.store(words[1], std::memory_order_relaxed);
+				(void)ShaderRecompiler::IR::RtImageKinds(words[1]);
+				std::fprintf(stderr, "[rt-callables] descriptor set layout from the last sessions: image kinds %016llx\n",
+				             static_cast<unsigned long long>(words[1]));
+			}
+			std::fclose(file);
+		}
+	});
+}
+
+static void RtLayoutNote(uint64_t image_kinds) {
+	if ((image_kinds & ~g_rt_layout_saved.load(std::memory_order_relaxed)) == 0) {
+		return;
+	}
+	const auto all  = g_rt_layout_saved.fetch_or(image_kinds, std::memory_order_relaxed) | image_kinds;
+	const auto path = RtLayoutFile();
+	std::fprintf(stderr, "[rt-callables] descriptor set layout: image kinds %016llx (new ones; the libraries made before "
+	             "are not taken again)\n", static_cast<unsigned long long>(all));
+	if (path.empty() || !RtTargetFileEnabled()) {
+		return;
+	}
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	const auto temporary = path.string() + ".tmp";
+	if (FILE* file = std::fopen(temporary.c_str(), "wb"); file != nullptr) {
+		const uint64_t words[2] = {0x314c5452u, all};
+		const bool     ok       = std::fwrite(words, sizeof(words), 1, file) == 1;
+		if (std::fclose(file) == 0 && ok) {
+			std::filesystem::rename(temporary, path, error);
+		}
+	}
+}
+
+// `later`: the targets whose guest code does not match now (v443: the game may not have loaded it
+// yet; rt_key_from_split looks again).
+static void RtReadTargets(uint64_t shader_hash, std::map<uint64_t, std::vector<uint32_t>>& out,
+                          std::map<uint64_t, std::vector<uint32_t>>* later = nullptr) {
+	const auto path = RtTargetFile(shader_hash);
+	if (path.empty() || !RtTargetFileEnabled()) {
+		return;
+	}
+	FILE* file = std::fopen(path.string().c_str(), "rb");
+	if (file == nullptr) {
+		return;
+	}
+	uint32_t header[2] = {};
+	size_t   kept = 0, dropped = 0;
+	if (std::fread(header, sizeof(header), 1, file) == 1 && header[0] == 0x31545452u && header[1] < 4096u) {
+		for (uint32_t i = 0; i < header[1]; i++) {
+			uint64_t address = 0;
+			uint32_t words   = 0;
+			if (std::fread(&address, sizeof(address), 1, file) != 1 || std::fread(&words, sizeof(words), 1, file) != 1 ||
+			    words == 0 || words > (1u << 20u)) {
+				break;
+			}
+			std::vector<uint32_t> code(words);
+			if (std::fread(code.data(), sizeof(uint32_t), words, file) != words) {
+				break;
+			}
+			std::vector<uint32_t> guest(words);
+			bool same = ReadShaderGuestMemoryRaw(nullptr, address, guest);
+			for (uint32_t w = 0; same && w < words; w++) {
+				same = guest[w] == code[w] || code[w] == 0xbf810000u; // s_endpgm in place of a return
+			}
+			if (same) {
+				out.emplace(address, std::move(code));
+				kept++;
+			} else {
+				if (later != nullptr) {
+					later->emplace(address, std::move(code));
+				}
+				dropped++;
+			}
+		}
+	}
+	std::fclose(file);
+	std::fprintf(stderr, "[rt-callables] %016llx: %zu call targets from the last sessions (%zu do not match the guest's memory now%s)\n",
+	             static_cast<unsigned long long>(shader_hash), kept, dropped,
+	             later != nullptr && dropped != 0 ? "; looked at again later" : "");
+}
+
+bool RtCallablesFor(uint64_t shader_hash) {
+	if (!g_rt_callables_device.load(std::memory_order_relaxed) || shader_hash == 0) {
+		return false;
+	}
+	static const std::unordered_set<uint64_t> hashes = [] {
+		std::unordered_set<uint64_t> result;
+		if (const char* value = std::getenv("KYTY_RT_CALLABLES"); value != nullptr) {
+			std::string_view rest(value);
+			while (!rest.empty()) {
+				const auto end   = rest.find_first_of(",; ");
+				const auto token = std::string(rest.substr(0, end));
+				rest             = end == std::string_view::npos ? std::string_view() : rest.substr(end + 1);
+				if (!token.empty()) {
+					result.insert(std::strtoull(token.c_str(), nullptr, 16));
+				}
+			}
+		}
+		return result;
+	}();
+	return hashes.contains(shader_hash);
+}
+
 // Shader translations longer than half a second are named ([slow-translate]): a title-screen stall
 // (10-26) had one translator thread busy for minutes while the GPU thread waited.
+// v438q: a translation that runs longer than KYTY_TRANSLATE_ABANDON_S (default 60; 0: never), or
+// that is still running when `abandon_now` becomes true (the precompile stopping), gets `abandon`
+// called once from the monitor thread. The startup replay uses it to stop waiting for the thread:
+// one listed variant of e6d76d24f59f8015 (128,922 words) was still translating after an hour at
+// low priority (11-16 play on v438p), which held the replay's count one short of its total, kept
+// the pipeline warm-up from starting and would have held the shutdown. The translation itself is
+// not interrupted: the recompiler has no cancellation point (TODO: find the pass that does not
+// finish on that shader).
+static double TranslateAbandonSeconds() {
+	static const double s = [] {
+		const char* value = std::getenv("KYTY_TRANSLATE_ABANDON_S");
+		return value != nullptr ? std::strtod(value, nullptr) : 60.0;
+	}();
+	return s;
+}
+
 static ShaderRecompiler::TranslateResult TimedTranslate(std::span<const uint32_t> code,
-                                                       const ShaderRecompiler::CompileOptions& options) {
+                                                       const ShaderRecompiler::CompileOptions& options,
+                                                       std::function<void()>          abandon     = {},
+                                                       const std::atomic<bool>*       abandon_now = nullptr) {
 	const ForegroundWaitScope foreground_(Libs::Graphics::GuestGpu::IsGpuThread());
 	struct Running {
 		uint64_t                              hash;
 		uint32_t                              stage;
 		size_t                                words;
 		std::chrono::steady_clock::time_point start;
+		std::function<void()>                 abandon;
+		const std::atomic<bool>*              abandon_now = nullptr;
+		double                                reported    = 0.0;
 	};
-	static std::mutex                       running_mutex;
-	static std::map<uint64_t, Running>      running; // key: a per-call ticket
+	// Never destroyed: the monitor thread and, since v438q, abandoned replay workers (detached, still
+	// inside a translation) use them until the process is gone, also while its statics are torn down.
+	static std::mutex&                      running_mutex = *new std::mutex;
+	static std::map<uint64_t, Running>&     running       = *new std::map<uint64_t, Running>; // key: a per-call ticket
 	static std::atomic<uint64_t>            tickets {0};
 	static std::once_flag                   monitor_once;
 	std::call_once(monitor_once, [] {
 		// Names translations still running after 10 s, every 10 s (the completion line may never
-		// come when the run is killed).
+		// come when the run is killed). v438q: checks every second for the abandon limit.
 		std::thread([] {
 			for (;;) {
-				std::this_thread::sleep_for(std::chrono::seconds(10));
-				const auto      now = std::chrono::steady_clock::now();
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+				const auto      now   = std::chrono::steady_clock::now();
+				const double    limit = TranslateAbandonSeconds();
 				std::lock_guard lock(running_mutex);
-				for (const auto& [ticket, r]: running) {
+				for (auto& [ticket, r]: running) {
 					const double s = std::chrono::duration<double>(now - r.start).count();
-					if (s >= 10.0) {
+					if (s >= 10.0 && s - r.reported >= 10.0) {
+						r.reported = s;
 						std::fprintf(stderr, "[slow-translate] %016llx stage=%u words=%zu still running after %.0f s\n",
 						             static_cast<unsigned long long>(r.hash), r.stage, r.words, s);
+					}
+					if (r.abandon && ((limit > 0.0 && s >= limit) ||
+					                  (r.abandon_now != nullptr && r.abandon_now->load(std::memory_order_acquire)))) {
+						auto abandon = std::move(r.abandon);
+						r.abandon    = {};
+						abandon();
 					}
 				}
 			}
@@ -146,7 +466,8 @@ static ShaderRecompiler::TranslateResult TimedTranslate(std::span<const uint32_t
 	const auto start  = std::chrono::steady_clock::now();
 	{
 		std::lock_guard lock(running_mutex);
-		running[ticket] = {options.shader_hash, static_cast<uint32_t>(options.stage), code.size(), start};
+		running[ticket] = {options.shader_hash, static_cast<uint32_t>(options.stage), code.size(), start,
+		                   std::move(abandon), abandon_now};
 	}
 	struct Done {
 		uint64_t ticket;
@@ -174,12 +495,13 @@ static ShaderRecompiler::TranslateResult TimedTranslate(std::span<const uint32_t
 // `fatal` is set then: no refusal is written (the shader hash may be fine with the game's code).
 static ShaderRecompiler::TranslateResult ReplayTranslate(std::span<const uint32_t> code,
                                                         const ShaderRecompiler::CompileOptions& options,
-                                                        bool* fatal = nullptr) {
+                                                        bool* fatal = nullptr, std::function<void()> abandon = {},
+                                                        const std::atomic<bool>* abandon_now = nullptr) {
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 	if (Common::RecoverableExitsSupported()) {
 		try {
 			Common::RecoverableExitScope recoverable;
-			return TimedTranslate(code, options);
+			return TimedTranslate(code, options, std::move(abandon), abandon_now);
 		} catch (const Common::RecoverableExit& failure) {
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1) < 16) {
@@ -195,7 +517,7 @@ static ShaderRecompiler::TranslateResult ReplayTranslate(std::span<const uint32_
 		}
 	}
 #endif
-	return TimedTranslate(code, options);
+	return TimedTranslate(code, options, std::move(abandon), abandon_now);
 }
 
 // A shader-level refusal in the disk cache: written when a compute shader is skipped for the
@@ -203,9 +525,56 @@ static ShaderRecompiler::TranslateResult ReplayTranslate(std::span<const uint32_
 // startup precompile skips such shaders: their ledger sources (e6d76d24f59f8015 has four variants of
 // 100k-130k words) take minutes each to translate only to be refused, and a run killed before
 // they finish never records the refusal, so every boot stalled at the title behind them (10-26).
+// v438o: no longer written, and read only by Get for a shader without a program (see there). It
+// was written for any failed variant and under no session: after a first start with the shipped
+// list 171 compute shaders had one (the list holds e.g. c4df2a00067e0666 before its function
+// expansion, which cannot translate), the warm-up then skipped every listed source of those
+// shaders, and Get refused every variant of them that was not in the cache yet, also after a
+// recompiler change had emptied the cache of them. ShaderRefusalKeyV2 replaces it.
 static std::vector<uint8_t> ShaderRefusalKey(uint64_t shader_hash) {
 	static constexpr char tag[] = "kyty-shader-refused-v1";
 	std::vector<uint8_t> key(tag, tag + sizeof(tag) - 1);
+	for (int i = 0; i < 8; i++) {
+		key.push_back(static_cast<uint8_t>(shader_hash >> (8 * i)));
+	}
+	return key;
+}
+
+// v438o. The shader-level refusal as it is written now: under the session key (so a build that
+// translates the shader, or any recompiler change, starts without it), and only where repeating
+// the failure is expensive: a failed translation that took KYTY_REFUSAL_KEY_MS (default 3000) or
+// longer, or a shader refused with KYTY_GAVE_UP_SHADER_AFTER inputs. A failure found at once
+// stays with its source: the shader's other variants are translated. (e6d76d24f59f8015 took 12.5 s
+// on an idle GPU thread; a 30,000-word shader that translates takes 0.5 s in the warm-up.)
+static std::vector<uint8_t> ShaderRefusalKeyV2(std::span<const uint8_t> session_key, uint64_t shader_hash) {
+	static constexpr char tag[] = "kyty-shader-refused-v2";
+	std::vector<uint8_t> key(tag, tag + sizeof(tag) - 1);
+	key.insert(key.end(), session_key.begin(), session_key.end());
+	for (int i = 0; i < 8; i++) {
+		key.push_back(static_cast<uint8_t>(shader_hash >> (8 * i)));
+	}
+	return key;
+}
+
+static double RefusalKeyMs() {
+	static const double ms = [] {
+		const char* value = std::getenv("KYTY_REFUSAL_KEY_MS");
+		return value != nullptr ? std::strtod(value, nullptr) : 3000.0;
+	}();
+	return ms;
+}
+
+// v438o. A whole-shader skip in the disk cache: written when a compute shader is skipped for the
+// session ("refused with N inputs") and no input of it found a program in that session. Unlike
+// the refusal above it says that nothing of the shader ran, so a later session skips the shader at
+// its first lookup; a refusal is also written when one listed variant of a shader fails to translate
+// while its other variants work (18cee445972cd5de, 7e7bc09f4cadad5d, 45d596b956684928: gate g4, run
+// A's warm-up), and those shaders must keep running. Under the session key (the recompiler's
+// version and switches), so a build that translates the shader looks again.
+static std::vector<uint8_t> ShaderSkipKey(std::span<const uint8_t> session_key, uint64_t shader_hash) {
+	static constexpr char tag[] = "kyty-shader-skip-v1";
+	std::vector<uint8_t> key(tag, tag + sizeof(tag) - 1);
+	key.insert(key.end(), session_key.begin(), session_key.end());
 	for (int i = 0; i < 8; i++) {
 		key.push_back(static_cast<uint8_t>(shader_hash >> (8 * i)));
 	}
@@ -281,6 +650,11 @@ std::string DeviceConfigTag(const GraphicContext& g) {
 	                         g.shader_image_int64_atomics_enabled, g.attachment_feedback_loop_enabled,
 	                         g.provoking_vertex_last_enabled, g.sample_rate_shading_enabled,
 	                         g.shader_device_clock_enabled, g.depth_color_copy_enabled};
+	// v438w: a diagnostic device's entries are not the play device's (the tag of a normal start
+	// stays as it was, so its cache files keep their names).
+	if (g.diagnostic_device_bits != 0) {
+		return fmt::format("{:08x}d{:x}", static_cast<uint32_t>(XXH3_64bits(bits, sizeof(bits))), g.diagnostic_device_bits);
+	}
 	return fmt::format("{:08x}", static_cast<uint32_t>(XXH3_64bits(bits, sizeof(bits))));
 }
 
@@ -676,7 +1050,7 @@ namespace {
 // (wait for the GPU), first three per shader and read size.
 void LogGpuOwnedSrtRead(const char* tag, uint64_t address, size_t dwords) {
 	static const bool enabled = std::getenv("KYTY_LOG_GPU_OWNED_SRT") != nullptr;
-	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferWritten(address, dwords * 4u)) {
+	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferPending(address, dwords * 4u)) {
 		return;
 	}
 	static std::unordered_map<std::string, uint32_t> seen;
@@ -703,7 +1077,7 @@ void LogGpuOwnedSrtRead(const char* tag, uint64_t address, size_t dwords) {
 // for the GPU), per shader, and print the top shaders by wait time every 10 s of wall time.
 bool TimedReadBufferBacking(uint64_t address, uint32_t* data, size_t bytes) {
 	static const bool enabled = std::getenv("KYTY_SRT_WAIT_STATS") != nullptr;
-	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferWritten(address, bytes)) {
+	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferPending(address, bytes)) {
 		return Libs::LibKernel::Memory::TryReadBufferBacking(address, data, bytes);
 	}
 	const auto start = std::chrono::steady_clock::now();
@@ -750,9 +1124,12 @@ bool TimedReadBufferBacking(uint64_t address, uint32_t* data, size_t bytes) {
 bool SrtSpeculativeRead(uint64_t address, std::span<uint32_t> values) {
 	const int mode = SrtSpeculateMode();
 	if (mode == 0 || t_srt_shader_hash == 0 || !Libs::Graphics::GuestGpu::IsGpuThread() ||
-	    !Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+	    !Libs::LibKernel::Memory::IsGpuBufferPending(address, values.size_bytes())) {
 		return false;
 	}
+	// v446p: bytes downloading (not GPU-written any more) count too: the read waits for the
+	// download's publication (WaitDownloadsLanded). written=0 in the log below.
+	const bool written = Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes());
 	static std::unordered_map<uint64_t, SrtSpeculateStats> stats;
 	static uint64_t                                        total = 0;
 	auto&                                                  s     = stats[t_srt_shader_hash];
@@ -761,10 +1138,11 @@ bool SrtSpeculativeRead(uint64_t address, std::span<uint32_t> values) {
 	if (mode == 1 && s.reads <= 6) {
 		// Which bytes: the guest address, the size, and the first dwords before and after the
 		// exact read (printed below once the exact value is known).
-		std::fprintf(stderr, "[srt-speculate] read %016llx #%llu addr=0x%llx dwords=%zu\n",
+		std::fprintf(stderr, "[srt-speculate] read %016llx #%llu addr=0x%llx dwords=%zu written=%d phase=%s\n",
 		             static_cast<unsigned long long>(t_srt_shader_hash),
 		             static_cast<unsigned long long>(s.reads),
-		             static_cast<unsigned long long>(address), values.size());
+		             static_cast<unsigned long long>(address), values.size(), written ? 1 : 0,
+		             ShaderRecompiler::IR::MaterializePhase());
 	}
 	if (++total % 4096 == 0) {
 		std::fprintf(stderr, "[srt-speculate] mode=%d reads=%llu shaders=%zu\n", mode,
@@ -994,6 +1372,38 @@ const char* StageLabel(ShaderType stage) {
 		case ShaderType::Compute: return "CS";
 		default: return "??";
 	}
+}
+
+// v446h: the translation variant of a compute dispatch in an A/B run: KYTY_TRANSLATION_VARIANT
+// (1 static buffer formats, 2 wave-uniform branches everywhere) in the on windows of
+// KYTY_SYNC_TOGGLE_MODE=variant, for the shaders KYTY_TRANSLATION_VARIANT_HASHES lists (all when
+// unset); 0 otherwise.
+static uint32_t TranslationVariantFor(uint64_t shader_hash) {
+	static const uint32_t bits = [] {
+		const char* value = std::getenv("KYTY_TRANSLATION_VARIANT");
+		return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) & 3u;
+	}();
+	if (bits == 0u || !SyncToggle::VariantWindow()) {
+		return 0u;
+	}
+	static const std::string list = [] {
+		const char* value = std::getenv("KYTY_TRANSLATION_VARIANT_HASHES");
+		return value == nullptr ? std::string() : std::string(value);
+	}();
+	if (!list.empty() && list.find(fmt::format("{:016x}", shader_hash)) == std::string::npos) {
+		return 0u;
+	}
+	return bits;
+}
+
+// v446i: KYTY_TRANSLATION_VARIANT_STAGES, which stages take part: 1 compute (default), 2 the
+// vertex-side stages (vertex, mesh, ...), 4 pixel.
+static bool TranslationVariantStage(uint32_t stage_bit) {
+	static const uint32_t mask = [] {
+		const char* value = std::getenv("KYTY_TRANSLATION_VARIANT_STAGES");
+		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+	}();
+	return (mask & stage_bit) != 0u;
 }
 
 // --skip-shaders and KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of
@@ -1683,6 +2093,22 @@ bool                         g_warm_loaded = false;
 uint64_t                     g_warm_salt   = 0;
 std::unordered_set<uint64_t> g_warmed;
 std::FILE*                   g_warm_file = nullptr;
+// v438t: the record is only a claim about the driver cache's content (the two are separate files,
+// and Mac's install held 9,915 ids whose libraries the cache did not have: they were never made
+// again, and every draw of those shaders compiled its library, 11-16). A library the record names
+// that the driver cache does not have marks the record for a full check at the next start
+// (<title>.gplwarm.verify): every listed permutation is then made again, which costs a cache hit
+// each for the ones that are there (49,313 in 6.3 s, g4_B) and makes the ones that are not.
+std::filesystem::path        g_warm_path;
+bool                         g_warm_verifying = false; // this start checks the whole record
+std::atomic<uint32_t>        g_warm_stale {0};
+std::atomic<uint32_t>        g_warm_fresh {0};         // the warm-up's libraries the cache lacked
+// v438zk: the plain-buffer twins (PopsPlainBuffersEnabled) the warm-up and the prefetch made a
+// fragment library for, and how many of them the driver cache lacked. Counted apart from
+// g_warm_fresh: the shard rebuild rule (v438x) reads that one.
+std::atomic<uint32_t>        g_warm_twins {0};
+std::atomic<uint32_t>        g_warm_twin_fresh {0};
+std::atomic<uint32_t>        g_warm_twin_records {0}; // pixel records read only for their twin
 
 // KYTY_COMPUTE_WARM=0: compute pipelines are not warmed (with or without GPL).
 bool ComputeWarmEnabled() {
@@ -1705,11 +2131,18 @@ uint64_t GplWarmId(std::span<const uint8_t> key) {
 	return XXH3_64bits_withSeed(key.data(), key.size(), g_warm_salt);
 }
 
+// v438zk: the record's second id of a pixel permutation: its plain-buffer twin was looked at
+// (made, or the shader has none). In the same file as the permutation's own id.
+uint64_t GplWarmTwinId(std::span<const uint8_t> key) {
+	return GplWarmId(key) ^ 0x7477696e5f6c6962ull; // "twin_lib"
+}
+
 void GplWarmLoad() {
 	if (g_warm_loaded) {
 		return;
 	}
 	g_warm_loaded       = true;
+	GplMissLogWarmState(*g_warm_graphics);
 	const auto& props   = g_warm_graphics->GetPhysicalDeviceProperties();
 	// v437e: only what shapes the warmed libraries (the v437c record named feedback loops too, and
 	// a harness start did not find the first start's record).
@@ -1722,7 +2155,12 @@ void GplWarmLoad() {
 	}
 	std::error_code error;
 	std::filesystem::create_directories(ShaderListDirectory(), error);
-	const auto path = ShaderListDirectory() / (title + ".gplwarm");
+	// v438w: the record of a diagnostic device beside the play device's (as its cache files).
+	const auto path = ShaderListDirectory() /
+	                  (title + (g_warm_graphics->diagnostic_device_bits != 0
+	                                ? fmt::format("_d{:x}", g_warm_graphics->diagnostic_device_bits)
+	                                : std::string()) +
+	                   ".gplwarm");
 	if (std::FILE* in = std::fopen(Common::PathToString(path).c_str(), "rb"); in != nullptr) {
 		uint64_t id = 0;
 		while (std::fread(&id, sizeof(id), 1, in) == 1) {
@@ -1735,6 +2173,22 @@ void GplWarmLoad() {
 		g_warmed.clear();
 		if (std::FILE* trunc = std::fopen(Common::PathToString(path).c_str(), "wb"); trunc != nullptr) {
 			std::fclose(trunc);
+		}
+	}
+	g_warm_path = path;
+	// v438t: a start after the record was found stale (GplWarmStale) checks all of it.
+	{
+		auto verify_path  = path;
+		verify_path      += ".verify";
+		if (std::filesystem::exists(verify_path, error)) {
+			std::printf("[gpl-warm] record of %zu checked against the driver cache at this start (it named libraries the cache "
+			            "did not have)\n",
+			            g_warmed.size());
+			g_warmed.clear();
+			g_warm_verifying = true;
+			if (std::FILE* trunc = std::fopen(Common::PathToString(path).c_str(), "wb"); trunc != nullptr) {
+				std::fclose(trunc);
+			}
 		}
 	}
 	// Step D7: the record names libraries and compute pipelines a written cache holds; with a
@@ -1813,22 +2267,157 @@ bool GplWarmWanted(ShaderType stage, std::span<const uint8_t> key) {
 	std::lock_guard lock(g_warm_mutex);
 	GplWarmLoad();
 	const auto id = GplWarmId(key);
-	return !g_warmed.contains(id) && !g_poison.contains(id);
+	if (g_poison.contains(id)) {
+		return false;
+	}
+	// v438zk: a pixel permutation is also wanted while its plain-buffer twin has not been looked
+	// at (GplWarmTwinId): the records warmed before v438zk are read once more, for the twin only.
+	return !g_warmed.contains(id) ||
+	       (stage == ShaderType::Pixel && PopsPlainBuffersEnabled() && !g_warmed.contains(GplWarmTwinId(key)));
 }
 
+// v438zk: whether the permutation's own library is still to be made (false: only its twin is).
+bool GplWarmOwnWanted(std::span<const uint8_t> key) {
+	std::lock_guard lock(g_warm_mutex);
+	return !g_warmed.contains(GplWarmId(key));
+}
+
+// v438zk (S1): the fragment library of a pixel shader's plain-buffer twin (pipelineCache.h,
+// PopsPlainBuffersEnabled), made where the shader's own library is made. The twin is new SPIR-V
+// the warm-up never saw, so its library was compiled at the shader's first draw in play, and that
+// draw writes memory, so it waited: 175-352 ms each for four pixel shaders of 70-93k words in
+// Mac's play of 11-16 (all four frames of 250 ms or more). The SPIR-V is the one AddPermutation
+// makes (the same test, the same strip), so the draw's library is a driver-cache hit, or with
+// `keep` the kept library itself.
+void GplWarmTwinLibrary(ShaderType stage, std::span<const uint32_t> spirv,
+                        const ShaderRecompiler::IR::CompiledShaderInfo& program, bool keep) {
+	if (stage != ShaderType::Pixel || !PopsPlainBuffersEnabled() || !PopsPlainBuffersProgram(program)) {
+		return;
+	}
+	std::vector<uint32_t> plain;
+	uint32_t              arrays = 0;
+	uint32_t              loads  = 0;
+	if (!StripBufferCoherent(spirv, plain, arrays, loads)) {
+		return;
+	}
+	bool miss = false;
+	if (GplWarmLibrary(*g_warm_graphics, g_warm_cache, stage, plain, program, keep, &miss)) {
+		g_warm_twins.fetch_add(1, std::memory_order_relaxed);
+		if (miss) {
+			g_warm_twin_fresh.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+// `own`: the permutation's own library or pipeline is made (false: it was warmed before, and the
+// record is read for its twin only).
 bool GplWarmLibraryNow(ShaderType stage, std::span<const uint32_t> spirv,
-                       const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+                       const ShaderRecompiler::IR::CompiledShaderInfo& program, bool own = true) {
 	if (stage == ShaderType::Compute) {
 		return ComputeWarmPipeline(*g_warm_graphics, g_warm_main_cache, spirv, program);
 	}
-	return GplWarmLibrary(*g_warm_graphics, g_warm_cache, stage, spirv, program);
+	bool made = true;
+	if (own) {
+		bool miss = false;
+		made      = GplWarmLibrary(*g_warm_graphics, g_warm_cache, stage, spirv, program, false, &miss);
+		if (made && miss) {
+			g_warm_fresh.fetch_add(1, std::memory_order_relaxed);
+		}
+	} else {
+		g_warm_twin_records.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (made) {
+		GplWarmTwinLibrary(stage, spirv, program, false);
+	}
+	return made;
 }
 
-void GplWarmDone(std::span<const uint8_t> key) {
+// v438t: the record is stale: it is checked in full at the next start. `why` names the evidence.
+// Not when this start already checked it: what still misses then is not the record's doing (the
+// line says so, and no further start is spent on it).
+void GplWarmMarkStale(const char* why, uint64_t count) {
+	std::lock_guard lock(g_warm_mutex);
+	if (!g_warm_loaded || g_warm_path.empty()) {
+		return;
+	}
+	if (g_warm_verifying) {
+		std::fprintf(stderr, "[gpl-warm] %llu %s although this start checked the whole record: not a stale record\n",
+		             static_cast<unsigned long long>(count), why);
+		return;
+	}
+	auto verify_path  = g_warm_path;
+	verify_path      += ".verify";
+	if (std::FILE* out = std::fopen(Common::PathToString(verify_path).c_str(), "wb"); out != nullptr) {
+		std::fclose(out);
+	}
+	std::fprintf(stderr, "[gpl-warm] stale record: %llu %s; the next start checks every listed library against the driver cache\n",
+	             static_cast<unsigned long long>(count), why);
+	std::fflush(stderr);
+}
+
+// A library the prefetch made from a listed record was not in the driver cache: stale when the
+// record names its permutation (`key`: the record's whole key).
+void GplWarmPrefetchMiss(std::span<const uint8_t> key) {
+	{
+		std::lock_guard lock(g_warm_mutex);
+		if (!g_warm_loaded || !g_warmed.contains(GplWarmId(key))) {
+			return; // not warmed yet (the warm-up is still running, or has no record of it)
+		}
+	}
+	if (g_warm_stale.fetch_add(1, std::memory_order_relaxed) == 0) {
+		GplWarmMarkStale("library the record names was not in the driver cache (prefetch)", 1);
+	}
+}
+
+// v438t diagnosis: a graphics permutation the game loads from the disk cache after the warm-up
+// finished, which the warm-up was never given (the replay did not build its key, so its library
+// was not warmed and the prefetch does not know it). Expected: none while nothing is translated
+// or recorded (every loaded permutation is then a listed one).
+std::atomic<uint32_t> g_warm_unlisted {0};
+void GplWarmNoteDrawn(ShaderType stage, std::span<const uint8_t> key, uint64_t shader_hash, uint32_t cursor) {
+	if ((stage != ShaderType::Vertex && stage != ShaderType::Mesh && stage != ShaderType::Pixel) ||
+	    !GetShaderPrecompileProgress().gpl_warm_finished.load(std::memory_order_acquire)) {
+		return;
+	}
+	{
+		std::lock_guard lock(g_warm_mutex);
+		if (!g_warm_loaded) {
+			return;
+		}
+		const auto id = GplWarmId(key);
+		if (g_warmed.contains(id) || g_poison.contains(id)) {
+			return;
+		}
+	}
+	if (g_warm_unlisted.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::fprintf(stderr, "[gpl-warm] drawn permutation the warm-up was never given: stage %u shader %016llx cursor 0x%x\n",
+		             static_cast<unsigned>(stage), static_cast<unsigned long long>(shader_hash), cursor);
+	}
+}
+
+// The warm-up went through its whole queue (not stopped) and the caches were written: a record
+// that was being checked is whole again.
+void GplWarmVerified() {
+	std::lock_guard lock(g_warm_mutex);
+	if (!g_warm_verifying || g_warm_path.empty()) {
+		return;
+	}
+	auto verify_path  = g_warm_path;
+	verify_path      += ".verify";
+	std::error_code error;
+	std::filesystem::remove(verify_path, error);
+}
+
+// `twin`: the permutation's plain-buffer twin was looked at too (a pixel permutation with
+// PopsPlainBuffersEnabled; GplWarmTwinId).
+void GplWarmDone(std::span<const uint8_t> key, bool twin = false) {
 	std::lock_guard lock(g_warm_mutex);
 	const auto      id = GplWarmId(key);
 	if (g_warmed.insert(id).second) {
 		g_warm_pending.push_back(id); // into the record after the next cache write (GplWarmCommit)
+	}
+	if (const auto twin_id = GplWarmTwinId(key); twin && g_warmed.insert(twin_id).second) {
+		g_warm_pending.push_back(twin_id);
 	}
 }
 
@@ -1888,9 +2477,18 @@ uint32_t GplWarmThreads() {
 // the same ones the draw's pipeline would otherwise make while the GPU thread waits for it.
 struct PrefetchItem {
 	ShaderType stage = ShaderType::Unknown;
-	// XXH3-128 of the permutation's key: what the store names the record's file by.
+	// XXH3-128 of the record's key: what the store names the record's file by.
 	uint64_t low  = 0;
 	uint64_t high = 0;
+	// A graphics permutation, whose stage library is made. Otherwise the record is only read
+	// ahead and kept for the game's first use (a source entry, a compute permutation).
+	bool library = true;
+};
+// A record a worker read, kept until the game's lookup takes it (GplPrefetchTakeRecord).
+struct PrefetchKept {
+	std::vector<uint8_t>                  file; // as stored: header, key, payload
+	uint64_t                              high = 0;
+	std::chrono::steady_clock::time_point at {};
 };
 struct Prefetcher {
 	std::mutex                                              mutex;
@@ -1907,6 +2505,16 @@ struct Prefetcher {
 	std::atomic<uint64_t>                                   not_read {0};
 	std::atomic<uint64_t>                                   not_made {0};
 	std::atomic<uint64_t>                                   linked_here {0};
+	// Records read ahead, by the low half of their name; the oldest leave first.
+	std::mutex                                              kept_mutex;
+	std::unordered_map<uint64_t, PrefetchKept>              kept;
+	std::deque<std::pair<uint64_t, std::chrono::steady_clock::time_point>> kept_order;
+	uint64_t                                                kept_bytes = 0;
+	std::atomic<uint64_t>                                   kept_count {0};
+	std::atomic<uint64_t>                                   read_ahead {0};
+	std::atomic<uint64_t>                                   handed {0};
+	std::atomic<uint64_t>                                   handed_bytes {0};
+	std::atomic<uint64_t>                                   dropped {0};
 };
 Prefetcher& Prefetch() {
 	static Prefetcher prefetcher;
@@ -1914,22 +2522,50 @@ Prefetcher& Prefetch() {
 }
 
 // The startup replay: a listed permutation of `shader_hash` (not one the warm-up skips).
+// KYTY_PREFETCH_RECORDS=0: no record is read ahead for the game's lookups (the index and the
+// workers are then as in v438h: graphics permutations, for their libraries).
+bool GplPrefetchRecordsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PREFETCH_RECORDS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void GplPrefetchIndexAdd(ShaderType stage, uint64_t shader_hash, std::span<const uint8_t> permutation_key) {
-	if ((stage != ShaderType::Vertex && stage != ShaderType::Mesh && stage != ShaderType::Pixel) ||
-	    shader_hash == 0 || !GplPrefetchEnabled()) {
+	const bool graphics = stage == ShaderType::Vertex || stage == ShaderType::Mesh || stage == ShaderType::Pixel;
+	if ((!graphics && !(stage == ShaderType::Compute && GplPrefetchRecordsEnabled())) || shader_hash == 0 ||
+	    !GplPrefetchEnabled()) {
 		return;
 	}
-	{
+	bool library = graphics;
+	if (graphics) {
 		std::lock_guard lock(g_warm_mutex);
 		GplWarmLoad();
 		if (g_poison.contains(GplWarmId(permutation_key))) {
-			return; // its library was in flight when a start ended: never made again
+			// Its library was in flight when a start ended: never made again. The record is fine.
+			library = false;
+			if (!GplPrefetchRecordsEnabled()) {
+				return;
+			}
 		}
 	}
 	const auto      name = XXH3_128bits(permutation_key.data(), permutation_key.size());
 	auto&           p    = Prefetch();
 	std::lock_guard lock(p.mutex);
-	p.index[shader_hash].push_back({stage, name.low64, name.high64});
+	p.index[shader_hash].push_back({stage, name.low64, name.high64, library});
+}
+
+// The startup replay: the source entry (the resource plan) of a listed shader, any stage. The
+// game's first lookup of the shader loads it before the permutation.
+void GplPrefetchIndexAddSource(ShaderType stage, uint64_t shader_hash, std::span<const uint8_t> source_key) {
+	if (shader_hash == 0 || !GplPrefetchEnabled() || !GplPrefetchRecordsEnabled()) {
+		return;
+	}
+	const auto      name = XXH3_128bits(source_key.data(), source_key.size());
+	auto&           p    = Prefetch();
+	std::lock_guard lock(p.mutex);
+	p.index[shader_hash].push_back({stage, name.low64, name.high64, false});
 }
 
 void GplPrefetchSetStore(const std::filesystem::path& directory) {
@@ -1948,7 +2584,7 @@ void GplPrefetchSetStore(const std::filesystem::path& directory) {
 // session key, which starts with the magic and the format), the sizes, and the payload's hash.
 // Anything else is a record not read: the draw's pipeline then makes its library as before.
 bool GplPrefetchLoadRecord(const std::filesystem::path& directory, const PrefetchItem& item,
-                           std::vector<uint8_t>& payload) {
+                           std::vector<uint8_t>& bytes, std::span<const uint8_t>& payload) {
 	const auto path = directory / (fmt::format("{:016x}{:016x}", item.high, item.low) + ".bin");
 	std::FILE* file = nullptr;
 #ifdef _WIN32
@@ -1961,7 +2597,6 @@ bool GplPrefetchLoadRecord(const std::filesystem::path& directory, const Prefetc
 	if (file == nullptr) {
 		return false;
 	}
-	std::vector<uint8_t> bytes;
 	bool                 ok   = std::fseek(file, 0, SEEK_END) == 0;
 	const auto           size = ok ? std::ftell(file) : -1;
 	ok = ok && size > 0 && static_cast<uint64_t>(size) <= (uint64_t {256} << 20u) && std::fseek(file, 0, SEEK_SET) == 0;
@@ -1991,8 +2626,43 @@ bool GplPrefetchLoadRecord(const std::filesystem::path& directory, const Prefetc
 	    XXH3_64bits(key + key_size, static_cast<size_t>(payload_size)) != payload_hash) {
 		return false;
 	}
-	payload.assign(key + key_size, key + key_size + payload_size);
+	payload = std::span<const uint8_t>(key + key_size, static_cast<size_t>(payload_size));
 	return true;
+}
+
+// A record a worker read is kept for the game's lookup: KYTY_PREFETCH_KEEP_MB of them (default
+// 256; 0: none), and none longer than 30 s (its draw did not come; the file is in the system's
+// file cache by now, which is most of what the read cost).
+void GplPrefetchKeep(const PrefetchItem& item, std::vector<uint8_t>&& file) {
+	static const uint64_t cap = [] {
+		const char* value = std::getenv("KYTY_PREFETCH_KEEP_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) << 20u;
+	}();
+	if (!GplPrefetchRecordsEnabled() || file.size() > cap) {
+		return;
+	}
+	auto&           p   = Prefetch();
+	const auto      now = std::chrono::steady_clock::now();
+	std::lock_guard lock(p.kept_mutex);
+	while (!p.kept_order.empty() &&
+	       (p.kept_bytes + file.size() > cap || now - p.kept_order.front().second > std::chrono::seconds(30))) {
+		const auto [low, at] = p.kept_order.front();
+		p.kept_order.pop_front();
+		// Still the record this entry was queued for (not taken, not read again since).
+		if (const auto found = p.kept.find(low); found != p.kept.end() && found->second.at == at) {
+			p.kept_bytes -= found->second.file.size();
+			p.kept.erase(found);
+			p.dropped.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	auto& entry = p.kept[item.low];
+	p.kept_bytes -= entry.file.size();
+	p.kept_bytes += file.size();
+	entry.file = std::move(file);
+	entry.high = item.high;
+	entry.at   = now;
+	p.kept_order.emplace_back(item.low, now);
+	p.kept_count.store(p.kept.size(), std::memory_order_relaxed);
 }
 
 void GplPrefetchReport(bool final_line) {
@@ -2003,6 +2673,14 @@ void GplPrefetchReport(bool final_line) {
 	GplPrefetchCounters(made, used, late);
 	if (p.shaders.load() == 0 && p.linked_here.load() == 0) {
 		return;
+	}
+	if (p.read_ahead.load() != 0 || p.handed.load() != 0) {
+		std::printf("[prefetch-records]%s %llu records read ahead of the game's lookup, %llu taken by it without a "
+		            "file read (%llu MB), %llu left unused\n",
+		            final_line ? " end:" : "", static_cast<unsigned long long>(p.read_ahead.load()),
+		            static_cast<unsigned long long>(p.handed.load()),
+		            static_cast<unsigned long long>(p.handed_bytes.load() >> 20u),
+		            static_cast<unsigned long long>(p.dropped.load()));
 	}
 	std::printf("[gpl-prefetch]%s %llu shaders seen ahead of their draw: %llu records read (%llu not read, %llu "
 	            "not made), %llu libraries kept, %llu of them taken by a linked pipeline, %llu late (the draw "
@@ -2034,16 +2712,40 @@ void GplPrefetchWork() {
 			directory = p.directory;
 		}
 		for (const auto& item: items) {
-			std::vector<uint8_t>               payload;
+			std::vector<uint8_t>               file;
+			std::span<const uint8_t>           payload;
 			ShaderDiskCache::PermutationRecord record;
-			if (g_warm_graphics == nullptr || directory.empty() || !GplPrefetchLoadRecord(directory, item, payload) ||
+			if (!item.library) {
+				// Read ahead only: the game's lookup decodes it.
+				if (!directory.empty() && GplPrefetchLoadRecord(directory, item, file, payload)) {
+					p.read_ahead.fetch_add(1, std::memory_order_relaxed);
+					GplPrefetchKeep(item, std::move(file));
+				}
+				continue;
+			}
+			if (g_warm_graphics == nullptr || directory.empty() ||
+			    !GplPrefetchLoadRecord(directory, item, file, payload) ||
 			    !ShaderDiskCache::DecodePermutationRecord(payload, record)) {
 				p.not_read.fetch_add(1, std::memory_order_relaxed);
-			} else if (GplWarmLibrary(*g_warm_graphics, g_warm_cache, item.stage, record.spirv, record.program, true)) {
+				continue;
+			}
+			bool miss = false;
+			if (GplWarmLibrary(*g_warm_graphics, g_warm_cache, item.stage, record.spirv, record.program, true, &miss)) {
+				// v438zk: and its plain-buffer twin's, kept for the draw's link like the shader's own.
+				GplWarmTwinLibrary(item.stage, record.spirv, record.program, true);
 				p.records.fetch_add(1, std::memory_order_relaxed);
+				if (miss) {
+					// The record's key, as GplPrefetchLoadRecord checked it: after the file's header.
+					constexpr size_t header   = 2 * sizeof(uint32_t) + 3 * sizeof(uint64_t);
+					uint64_t         key_size = 0;
+					std::memcpy(&key_size, file.data() + 2 * sizeof(uint32_t), sizeof(uint64_t));
+					GplWarmPrefetchMiss(std::span<const uint8_t>(file.data() + header, static_cast<size_t>(key_size)));
+				}
 			} else {
 				p.not_made.fetch_add(1, std::memory_order_relaxed);
 			}
+			p.read_ahead.fetch_add(1, std::memory_order_relaxed);
+			GplPrefetchKeep(item, std::move(file));
 		}
 		// One line at most every 10 s while there is work (and one at the end, GplPrefetchStop).
 		bool report = false;
@@ -2068,6 +2770,43 @@ bool GplPrefetchEnabled() {
 		return value == nullptr || value[0] != '0';
 	}();
 	return enabled && GplWarmEnabled();
+}
+
+// The record a prefetch worker read under exactly this key, if it is still kept: the game's first
+// use of a listed program then reads no file on its thread (h1, 11-16: Program::DiskLoad 3-6 ms a
+// record on the GPU thread, 166 records in one frame after a load). Checked as Store::Load checks
+// a file: the whole key (the worker checked the payload's hash when it read the file).
+static bool GplPrefetchTakeRecord(std::span<const uint8_t> key, std::vector<uint8_t>& payload) {
+	auto& p = Prefetch();
+	if (p.kept_count.load(std::memory_order_relaxed) == 0) {
+		return false;
+	}
+	const auto           name = XXH3_128bits(key.data(), key.size());
+	std::vector<uint8_t> file;
+	{
+		std::lock_guard lock(p.kept_mutex);
+		const auto      found = p.kept.find(name.low64);
+		if (found == p.kept.end() || found->second.high != name.high64) {
+			return false;
+		}
+		file = std::move(found->second.file);
+		p.kept_bytes -= file.size();
+		p.kept.erase(found);
+		p.kept_count.store(p.kept.size(), std::memory_order_relaxed);
+	}
+	constexpr size_t header = 2 * sizeof(uint32_t) + 3 * sizeof(uint64_t);
+	uint64_t         key_size = 0;
+	if (file.size() < header + key.size()) {
+		return false;
+	}
+	std::memcpy(&key_size, file.data() + 2 * sizeof(uint32_t), sizeof(uint64_t));
+	if (key_size != key.size() || std::memcmp(file.data() + header, key.data(), key.size()) != 0) {
+		return false;
+	}
+	payload.assign(file.begin() + static_cast<std::ptrdiff_t>(header + key.size()), file.end());
+	p.handed.fetch_add(1, std::memory_order_relaxed);
+	p.handed_bytes.fetch_add(file.size(), std::memory_order_relaxed);
+	return true;
 }
 
 void GplPrefetchRequest(uint64_t shader_hash) {
@@ -2134,6 +2873,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		// v440 M3: the callables of a callable split (handle.rt_callables points here).
+		std::shared_ptr<const RtCallables> rt_callables;
 	};
 
 	struct SourceEntry {
@@ -2180,6 +2921,8 @@ struct PipelineCache::ProgramCache {
 	struct Compiled {
 		std::vector<uint32_t>                    spirv;
 		ShaderRecompiler::IR::CompiledShaderInfo program;
+		std::vector<std::vector<uint32_t>>       rt_callable_spirv; // v440 M3
+		std::vector<std::vector<uint32_t>>       rt_callable_records; // v443 (IR/RtCallable.h)
 	};
 
 	Compiled CompileTranslated(const ShaderRecompiler::CompileOptions&             options,
@@ -2189,8 +2932,10 @@ struct PipelineCache::ProgramCache {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		last_spirv_words = result.spirv.size();
-		return {.spirv   = std::move(result.spirv),
-		        .program = std::move(result.program).TakeCompiledInfo()};
+		return {.spirv             = std::move(result.spirv),
+		        .program           = std::move(result.program).TakeCompiledInfo(),
+		        .rt_callable_spirv   = std::move(result.rt_callable_spirv),
+		        .rt_callable_records = std::move(result.rt_callable_records)};
 	}
 
 	// v296: every set-0 binding the SPIR-V declares must be one the program's bindings put in the
@@ -2282,6 +3027,13 @@ struct PipelineCache::ProgramCache {
 			declared[ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind)] =
 			    NativeDescriptorCount(binding);
 		}
+		if (program.bindings.rt_fixed) {
+			// v442: a callable split's set layout is the fixed one (CreateRtPipelineInternal).
+			declared.clear();
+			for (const auto& binding: ShaderRecompiler::IR::RtFixedSetLayout(program.bindings)) {
+				declared[ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind)] = binding.count;
+			}
+		}
 		static std::atomic<uint32_t> reported {0};
 		for (const auto& [id, binding]: bindings) {
 			const auto set = sets.find(id);
@@ -2331,7 +3083,9 @@ struct PipelineCache::ProgramCache {
 	                             const std::vector<uint32_t>&             spirv,
 	                             ShaderRecompiler::IR::CompiledShaderInfo program,
 	                             InputInfo& input_info, uint32_t& push_data_cursor,
-	                             const ShaderRecompiler::IR::ResourceSpecialization* module_specialization = nullptr) {
+	                             const ShaderRecompiler::IR::ResourceSpecialization* module_specialization = nullptr,
+	                             const std::vector<std::vector<uint32_t>>*           rt_callable_spirv = nullptr,
+	                             const std::vector<std::vector<uint32_t>>*           rt_callable_records = nullptr) {
 		const CpuCost::Phase cpu_phase_("Program::AddPermutation");
 		Profiler::Phases phases;
 		phases.SetText("%s 0x%016" PRIx64, stage_name, options.shader_hash);
@@ -2352,6 +3106,148 @@ struct PipelineCache::ProgramCache {
 			RegisterBindlessSet3Twin(device, module, spirv);
 		}
 		Aftermath::NoteShader(options.shader_hash, spirv.data(), spirv.size());
+		// KYTY_POPS_NOINTERLOCK=1 (v438zh): a pixel shader with a fragment interlock also gets a
+		// twin module without it, from the same SPIR-V (StripPixelInterlock). Registered by its own
+		// SPIR-V hash like any module, so linked pipelines share its fragment library; its
+		// pipelines get no recipe (TryGetGraphicsPipeline). [pops-nointerlock]: each twin made.
+		vk::ShaderModule no_interlock_module = nullptr;
+		uint32_t         no_interlock_flags  = 0;
+		if (options.stage == ShaderType::Pixel && PopsNoInterlockEnabled()) {
+			std::vector<uint32_t> stripped;
+			uint32_t              removed = 0;
+			if (StripPixelInterlock(spirv, stripped, no_interlock_flags, removed)) {
+				// Checked like the module itself (only with --shader-validation); a twin that
+				// fails is not made and the shader keeps its interlock everywhere.
+				const bool valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, stripped);
+				if (valid) {
+					no_interlock_module = CompileSPV(stripped, device);
+					EXIT_IF(no_interlock_module == nullptr);
+					PipelineRecipe::RegisterModule(no_interlock_module, stripped, false);
+					RegisterBindlessSet3Twin(device, no_interlock_module, stripped);
+					Aftermath::NoteShader(options.shader_hash, stripped.data(), stripped.size());
+				}
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+					const auto has = [&](uint32_t flag) { return (no_interlock_flags & flag) != 0; };
+					std::fprintf(stderr,
+					             "[pops-nointerlock] ps=%016" PRIx64 ": twin module %s (%zu -> %zu words, %u "
+					             "begin/end removed%s; Coherent: %s)\n",
+					             options.shader_hash, valid ? "made" : "not made: its SPIR-V failed validation",
+					             spirv.size(), stripped.size(), removed,
+					             has(PopsTwinReadsPrimitiveId) ? ", reads the primitive id" : "",
+					             has(PopsTwinCoherentRemoved)  ? "all removed"
+					             : has(PopsTwinCoherentNeeded) ? "kept, the module polls memory or has atomics"
+					             : has(PopsTwinImagesNotCoherent) && has(PopsTwinBuffersNotCoherent)
+					                 ? "removed from images and buffers"
+					             : has(PopsTwinImagesNotCoherent)  ? "removed from images"
+					             : has(PopsTwinBuffersNotCoherent) ? "removed from buffers"
+					                                               : "kept");
+				}
+			}
+		}
+		// KYTY_POPS_BUFFER_COHERENT=0 (v438zi): a pixel shader with a fragment interlock that only
+		// reads its storage buffers also gets a twin whose buffer arrays are not Coherent
+		// (pipelineCache.h). [pops-buffers]: each twin made, and why one was not.
+		vk::ShaderModule plain_buffers_module = nullptr;
+		if (options.stage == ShaderType::Pixel && PopsPlainBuffersEnabled()) {
+			const bool writes = !PopsPlainBuffersProgram(program); // the test the warm-up uses (v438zk)
+			std::vector<uint32_t> plain;
+			uint32_t              arrays = 0;
+			uint32_t              loads  = 0;
+			const bool            made   = !writes && StripBufferCoherent(spirv, plain, arrays, loads) &&
+			                               ValidateShaderSpirv(options.dump_label, options.shader_hash, plain);
+			if (made) {
+				plain_buffers_module = CompileSPV(plain, device);
+				EXIT_IF(plain_buffers_module == nullptr);
+				PipelineRecipe::RegisterModule(plain_buffers_module, plain, false);
+				RegisterBindlessSet3Twin(device, plain_buffers_module, plain);
+				Aftermath::NoteShader(options.shader_hash, plain.data(), plain.size());
+			}
+			// Only shaders with an interlock are of interest: the others are not logged.
+			std::vector<uint32_t> unused;
+			uint32_t              unused_flags = 0, unused_removed = 0;
+			static std::atomic<uint32_t> logged {0};
+			if ((made || StripPixelInterlock(spirv, unused, unused_flags, unused_removed)) &&
+			    logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+				if (made) {
+					std::fprintf(stderr,
+					             "[pops-buffers] ps=%016" PRIx64 ": twin module made (Coherent removed from %u buffer "
+					             "array%s, %u loads through them)\n",
+					             options.shader_hash, arrays, arrays == 1 ? "" : "s", loads);
+				} else {
+					std::fprintf(stderr, "[pops-buffers] ps=%016" PRIx64 ": no twin (%s)\n", options.shader_hash,
+					             writes ? "the program writes a buffer or an address"
+					                    : "its SPIR-V stores to a buffer, polls memory, has no Coherent buffer "
+					                      "array or failed validation");
+				}
+			}
+		}
+		// v440 M3: the callables of a callable split, validated and checked like the module.
+		std::shared_ptr<const RtCallables> rt_callables;
+		if (rt_callable_spirv != nullptr && !rt_callable_spirv->empty()) {
+			EXIT_IF(options.rt_split == nullptr || options.rt_split->targets.size() != rt_callable_spirv->size());
+			auto modules = std::make_shared<RtCallables>();
+			for (const auto& target: options.rt_split->targets) {
+				modules->targets.push_back(target.address);
+				modules->code_hashes.push_back(ShaderRecompiler::IR::RtCodeHash(target.code));
+			}
+			modules->generation = options.rt_split->generation;
+			modules->safe_from  = options.rt_split->safe_from;
+			if (rt_callable_records != nullptr) {
+				EXIT_IF(rt_callable_records->size() != rt_callable_spirv->size());
+				modules->records = *rt_callable_records;
+			}
+			if (program.bindings.rt_shared) {
+				RtLayoutNote(program.bindings.rt_image_kinds);
+			}
+			size_t made = 0;
+			for (size_t index = 0; index < rt_callable_spirv->size(); index++) {
+				const auto& callable = (*rt_callable_spirv)[index];
+				// v443: a module with these words was made before (an older generation, or another
+				// split that calls the same target): validated, checked and made then.
+				const auto       digest          = XXH3_128bits(callable.data(), callable.size() * sizeof(uint32_t));
+				vk::ShaderModule callable_module = nullptr;
+				{
+					std::lock_guard lock(g_rt_modules_mutex);
+					if (const auto known = g_rt_modules.find(digest.low64);
+					    known != g_rt_modules.end() && known->second.check == digest.high64 &&
+					    known->second.words == callable.size()) {
+						callable_module = known->second.module;
+					}
+				}
+				if (callable_module != nullptr) {
+					modules->modules.push_back(callable_module);
+					continue;
+				}
+				const auto  label    = fmt::format("{}_rc{}", stage_name, index);
+				if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, callable)) {
+					DumpShaderSpirv(label.c_str(), options.shader_hash, callable);
+					EXIT("%s failed hash=0x%016" PRIx64 ": callable %zu SPIR-V validation failed\n",
+					     options.dump_label, options.shader_hash, index);
+				}
+				DumpShaderSpirv(label.c_str(), options.shader_hash, callable);
+				CheckSpirvBindings(options.shader_hash, label.c_str(), callable, program);
+				callable_module = CompileSPV(callable, device);
+				EXIT_IF(callable_module == nullptr);
+				PipelineRecipe::RegisterModule(callable_module, callable, false); // its hash keys its library
+				// v443m: a callable is named by its guest code address under 0xca11 ([aftermath-map]
+				// ... -> guest ca11<address>), so a crash dump (KYTY_AFTERMATH_DLL) says which callable
+				// faulted, not only which split. A module shared by several splits has one name.
+				Aftermath::NoteShader((uint64_t {0xca11} << 48u) | (modules->targets[index] & 0xffffffffffffull),
+				                      callable.data(), callable.size());
+				{
+					std::lock_guard lock(g_rt_modules_mutex);
+					g_rt_modules.insert_or_assign(digest.low64,
+					                              RtModuleEntry {callable_module, digest.high64, callable.size()});
+				}
+				made++;
+				modules->modules.push_back(callable_module);
+			}
+			std::fprintf(stderr, "[rt-callables] %016llx: ray generation %zu words, %zu callables (%zu new modules, %zu made before)\n",
+			             static_cast<unsigned long long>(options.shader_hash), spirv.size(), modules->modules.size(), made,
+			             modules->modules.size() - made);
+			rt_callables = std::move(modules);
+		}
 		phases.End();
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -2362,10 +3258,15 @@ struct PipelineCache::ProgramCache {
 		    // matched permutation's, so a later real buffer of that stride cannot pick it wrongly).
 		    .specialization = module_specialization != nullptr ? *module_specialization : source.specialization,
 		    .program        = std::move(program),
-		    .handle         = {.id          = ++next_shader_id,
-		                       .module      = module,
-		                       .spirv_words = static_cast<uint32_t>(spirv.size()),
-		                       .hash        = options.shader_hash},
+		    .handle         = {.id                  = ++next_shader_id,
+		                       .module              = module,
+		                       .spirv_words         = static_cast<uint32_t>(spirv.size()),
+		                       .hash                = options.shader_hash,
+		                       .no_interlock_module  = no_interlock_module,
+		                       .no_interlock_flags   = no_interlock_flags,
+		                       .plain_buffers_module = plain_buffers_module,
+		                       .rt_callables         = rt_callables.get()},
+		    .rt_callables   = rt_callables,
 		});
 		const auto& permutation = source.permutations.back();
 		// KYTY_SHADER_DATA_STATS=1 (zero-compile plan): each new module's shader-data size, where it
@@ -2709,6 +3610,37 @@ struct PipelineCache::ProgramCache {
 		disk->Save(key, payload);
 	}
 
+	template <typename Refused>
+	static void NoteExpansion(uint64_t hash, uint64_t base, std::chrono::steady_clock::time_point start,
+	                          size_t code_words, Refused&& refused) {
+		const auto ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+		auto& floor = Common::FloorStats::Get();
+		Common::FloorStats::Add(floor.expand_ns, ns);
+		static const double bar_ms = [] {
+			const char* value = std::getenv("KYTY_EXPAND_SLOW_MS");
+			return value != nullptr ? std::strtod(value, nullptr) : 5.0;
+		}();
+		const double ms = static_cast<double>(ns) * 1e-6;
+		if (bar_ms <= 0.0 || ms < bar_ms) {
+			return;
+		}
+		Common::FloorStats::Add(floor.expand_slow, 1);
+		static std::atomic<uint32_t> count {0};
+		static std::atomic<uint64_t> total_ns {0};
+		const auto n     = count.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto total = total_ns.fetch_add(ns, std::memory_order_relaxed) + ns;
+		if (n > 64 && (n & (n - 1u)) != 0) {
+			return; // the first 64, then every power of two; [long-frame] counts them all
+		}
+		std::fprintf(stderr,
+		             "[expand-slow] cs %016llx at 0x%llx: functions expanded in %.1f ms (%zu words), %s | %u so far, "
+		             "%.0f ms\n",
+		             static_cast<unsigned long long>(hash), static_cast<unsigned long long>(base), ms, code_words,
+		             refused() ? "refused: this input gives up, no dispatch" : "not refused", n,
+		             static_cast<double>(total) * 1e-6);
+	}
+
 	void CountDiskLookup() {
 		if (++disk_lookups % 4096u == 0) {
 			disk->LogTotals("so far");
@@ -2737,6 +3669,146 @@ struct PipelineCache::ProgramCache {
 			return ShaderProgram {};
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		// v440 M3 (KYTY_RT_CALLABLES): a ray-tracing shader on the ray-tracing pipeline leaves the
+		// shader disk cache and the ledger alone: its modules are made in each session, and what
+		// earlier sessions recorded of its compute form (refusals, skips) does not apply to it.
+		const bool rt_callables = stage == ShaderType::Compute && RtCallablesFor(params.hash);
+		// v446h: an A/B translation variant stays out of both too (its ShaderInfo flag is not on disk).
+		const bool variant = input_info.translation_variant != 0u;
+		ShaderDiskCache::Store* const disk   = rt_callables || variant ? nullptr : this->disk.get();
+		ShaderLedger::Ledger* const   ledger = rt_callables || variant ? nullptr : this->ledger.get();
+		// Its program key is its split (the main code's call, each target's address and code), not
+		// the inlined code: the inlining may refuse a large target set, and it is not what runs.
+		ShaderRecompiler::Decoder::ShaderCallSplit rt_split_code;
+		bool                                       rt_split_done = false;
+		uint32_t                                   rt_split_generation = 0;
+		uint32_t                                   rt_split_safe_from  = 0;
+		std::string                                rt_split_reason;
+		const auto rt_key_from_split = [&]() {
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				rt_split_done = ShaderRecompiler::Decoder::SplitShaderCalls(
+				    params.code, params.Base(), user_data,
+				    [](uint64_t address, std::span<uint32_t> words) {
+					    return ReadShaderGuestMemoryRaw(nullptr, address, words);
+				    },
+				    input_info.wave_size, rt_split_code, rt_split_reason);
+				auto& key = lookup_key.function_code;
+				key.clear();
+				key.push_back(0x5254434bu); // "KCTR": a callable split's key
+				key.push_back(rt_split_done ? 1u : 0u);
+				if (!rt_split_done) {
+					return;
+				}
+				if (rt_split_code.skipped_targets != 0) {
+					static std::atomic<uint32_t> skipped_logged {0};
+					if (skipped_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+						std::fprintf(stderr, "[rt-callables] %016llx: %u call targets left out (first: %s), %zu kept\n",
+						             static_cast<unsigned long long>(params.hash), rt_split_code.skipped_targets,
+						             rt_split_code.skipped_reason.c_str(), rt_split_code.targets.size());
+					}
+				}
+				// The program covers every call target the shader has had (one generation per
+				// growth): a dispatch with fewer targets uses it as it is (its table has the rest),
+				// and new targets join at most every KYTY_RT_GROW_MS (default 30 s), so a streaming
+				// material table does not make a program, and a pipeline, per frame.
+				static const auto grow_interval = std::chrono::milliseconds([] {
+					const char* value = std::getenv("KYTY_RT_GROW_MS");
+					return value != nullptr ? std::strtoul(value, nullptr, 10) : 30000ul; // v440r: was 10 s
+				}());
+				auto&      u   = rt_unions[params.hash ^ params.Base() ^ (uint64_t {input_info.wave_size} << 56u)];
+				const auto now = std::chrono::steady_clock::now();
+				if (u.generation == 0 && !u.loaded) {
+					u.loaded = true;
+					RtLayoutSeed(); // (before the first split is translated)
+					RtReadTargets(params.hash, u.pending, &u.later);
+					u.later_checked = now;
+				}
+				// v443: the last sessions' targets the guest had not loaded yet join once their code is
+				// there (looked at every growth interval), so they are compiled before they are called.
+				if (!u.later.empty() && now - u.later_checked >= grow_interval) {
+					u.later_checked = now;
+					size_t joined = 0;
+					for (auto it = u.later.begin(); it != u.later.end();) {
+						if (u.targets.contains(it->first) || u.pending.contains(it->first)) {
+							it = u.later.erase(it);
+							continue;
+						}
+						std::vector<uint32_t> guest(it->second.size());
+						bool same = ReadShaderGuestMemoryRaw(nullptr, it->first, guest);
+						for (size_t w = 0; same && w < guest.size(); w++) {
+							same = guest[w] == it->second[w] || it->second[w] == 0xbf810000u; // (as RtReadTargets)
+						}
+						if (same) {
+							u.pending.emplace(it->first, std::move(it->second));
+							it = u.later.erase(it);
+							joined++;
+						} else {
+							++it;
+						}
+					}
+					if (joined != 0) {
+						std::fprintf(stderr, "[rt-callables] %016llx: %zu call targets from the last sessions match the guest's memory now (%zu still do not)\n",
+						             static_cast<unsigned long long>(params.hash), joined, u.later.size());
+					}
+				}
+				for (auto& target: rt_split_code.targets) {
+					const auto known = u.targets.find(target.address);
+					if (known == u.targets.end()) {
+						u.pending.try_emplace(target.address, std::move(target.code));
+					} else if (known->second != target.code && RtReplaceChangedTargets()) {
+						if (u.replacements++ < 32) {
+							std::fprintf(stderr, "[rt-callables] %016llx: code at call target %012llx changed (%zu -> %zu words); the next generation compiles the new code, older ones are not used again\n",
+							             static_cast<unsigned long long>(params.hash), static_cast<unsigned long long>(target.address),
+							             known->second.size(), target.code.size());
+						}
+						u.replaced.insert_or_assign(target.address, std::move(target.code));
+					}
+				}
+				// v443: new targets wait for this shader's pipeline builds to end (RtBuildsPending) and
+				// then join together; changed code (v442b) is still compiled at once.
+				if ((!u.pending.empty() || !u.replaced.empty()) &&
+				    (u.generation == 0 || !u.replaced.empty() ||
+				     (now - u.grown >= grow_interval && !RtBuildsPending(params.hash)))) {
+					// v440q: a generation keeps the previous one's order and appends the new targets,
+					// so the modules it shares with it keep their resource indices.
+					std::vector<uint64_t> order = u.generation != 0 ? u.snapshots[u.generation] : std::vector<uint64_t> {};
+					for (auto& [address, code]: u.pending) {
+						u.targets.emplace(address, std::move(code));
+						order.push_back(address);
+					}
+					u.pending.clear();
+					for (auto& [address, code]: u.replaced) {
+						u.targets.insert_or_assign(address, std::move(code)); // keeps its place in the order
+					}
+					const bool replaced = !u.replaced.empty();
+					u.replaced.clear();
+					u.generation++;
+					if (replaced) {
+						u.safe_from = u.generation;
+					}
+					u.grown = now;
+					auto& snapshot = u.snapshots[u.generation];
+					snapshot       = std::move(order);
+					std::fprintf(stderr, "[rt-callables] %016llx: generation %u, %zu call targets\n",
+					             static_cast<unsigned long long>(params.hash), u.generation, snapshot.size());
+					RtWriteTargets(params.hash, u.targets);
+				}
+				const uint32_t generation = t_rt_forced_generation != 0 && u.snapshots.contains(t_rt_forced_generation)
+				                                ? t_rt_forced_generation
+				                                : u.generation;
+				const auto&    snapshot   = u.snapshots[generation];
+				rt_split_code.targets.clear();
+				for (const auto address: snapshot) {
+					rt_split_code.targets.push_back({address, u.targets[address]});
+				}
+				rt_split_generation = generation;
+				rt_split_safe_from  = u.safe_from;
+				key.push_back(rt_split_code.call_pc);
+				key.push_back(rt_split_code.source_reg | (rt_split_code.return_reg << 16u));
+				key.push_back(generation);
+				key.push_back(static_cast<uint32_t>(snapshot.size()));
+			}
+		};
 		std::optional<CpuCost::Phase> lookup_phase_;
 		lookup_phase_.emplace("Program::Lookup");
 		lookup_key.stage           = stage;
@@ -2795,6 +3867,10 @@ struct PipelineCache::ProgramCache {
 				return value != nullptr ? std::strtoul(value, nullptr, 10) : 1000ul;
 			}());
 			compute_memo_on = fast_program_on && SyncToggle::ComputeMemo();
+			// v443: not for a lookup in an older generation (t_rt_forced_generation): the memo and the
+			// fast entries name the newest generation's program, so the lookup that was to find the
+			// last ready generation got the unready newest one again and the dispatch was skipped.
+			compute_memo_on = compute_memo_on && t_rt_forced_generation == 0;
 			if (compute_memo_on && compute_memo.entry != nullptr && compute_memo.owner == this &&
 			    compute_memo.hash == params.hash && compute_memo.base == params.Base() &&
 			    compute_memo.code_size == params.code.size() &&
@@ -2826,6 +3902,24 @@ struct PipelineCache::ProgramCache {
 			    params.hash ^ params.Base() ^ (static_cast<uint64_t>(params.code.size()) << 32u));
 			gave_up_shader_key = shader_key;
 			gave_up_limit      = gave_up_after;
+			// v438n/v438o (h1 run 11-16: 100-170 ms frames for ~6 s after an area load): a shader an
+			// earlier session skipped as a whole (ShaderSkipKey: refused with KYTY_GAVE_UP_SHADER_AFTER
+			// inputs, no program for any) is skipped at its first lookup. Without this each new input
+			// expanded its functions (25-38 ms each for the title's four refused shaders) until that
+			// many refusals, once a session and shader. The file system is asked once per shader hash
+			// (ShaderSkippedBefore). Not ShaderRefusalKey, as v438n had it: that one is also written for
+			// shaders with working variants (see ShaderSkipKey). KYTY_GAVE_UP_FROM_DISK=0 turns it off.
+			static const bool gave_up_from_disk = [] {
+				const char* value = std::getenv("KYTY_GAVE_UP_FROM_DISK");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (fast && gave_up_after != 0 && gave_up_from_disk && disk != nullptr && params.hash != 0 &&
+			    refusal_checked.insert(shader_key).second && ShaderSkippedBefore(params.hash)) {
+				gave_up_shaders[shader_key] = gave_up_after;
+				std::fprintf(stderr, "[gave-up] cs %016" PRIx64 " at 0x%016" PRIx64
+				             ": skipped as a whole in an earlier session (disk cache), not expanded\n",
+				             params.hash, static_cast<uint64_t>(params.Base()));
+			}
 			if (fast && gave_up_after != 0) {
 				if (const auto it = gave_up_shaders.find(shader_key);
 				    it != gave_up_shaders.end() && it->second >= gave_up_after) {
@@ -2873,9 +3967,11 @@ struct PipelineCache::ProgramCache {
 				    params.hash ^ params.Base() ^
 				        (static_cast<uint64_t>(input_info.wave_size) << 56u) ^
 				        (static_cast<uint64_t>(params.code.size()) << 32u));
-				return XXH3_64bits_withSeed(lookup_key.static_state.data(),
-				                            lookup_key.static_state.size() * sizeof(uint32_t),
-				                            inputs) |
+				// v443: a lookup in an older generation of a callable split has its own entries.
+				return (XXH3_64bits_withSeed(lookup_key.static_state.data(),
+				                             lookup_key.static_state.size() * sizeof(uint32_t),
+				                             inputs) ^
+				        (uint64_t {t_rt_forced_generation} * 0x9e3779b97f4a7c15ull)) |
 				       1u;
 			};
 			if (fast_program) {
@@ -2898,8 +3994,21 @@ struct PipelineCache::ProgramCache {
 			}
 			if (fast_hit == nullptr) {
 				KYTY_PROFILER_BLOCK("ProgramCache::ExpandFunctions");
+				const auto expand_start = std::chrono::steady_clock::now();
 				ExpandShaderFunctions(params, user_data, input_info.wave_size,
 				                      lookup_key.function_code);
+				if (rt_callables) {
+					rt_key_from_split();
+				}
+				// v438zl: [expand-slow]. A dispatch with inputs not seen before expands its
+				// functions on the GPU thread before its program, or its refusal, is known. For
+				// the title's call shader fc0537b7278db60c that is 25-100 ms each time (cost1 and
+				// pB1, 11-16: one to four such lookups made the 123, 124 and 217 ms frames), and
+				// it keeps its refusals per input because one of its variants works (v438o), so
+				// every new input pays again. The line names each one; [long-frame] has the
+				// frame's total. KYTY_EXPAND_SLOW_MS sets the bar (default 5; 0: no lines).
+				NoteExpansion(params.hash, params.Base(), expand_start, lookup_key.function_code.size(),
+				              [&] { return unsupported.contains(lookup_key); });
 				if (fast_key != 0) {
 					// Kept under the registers this expansion consulted.
 					fast_key = make_fast_key();
@@ -2913,7 +4022,12 @@ struct PipelineCache::ProgramCache {
 					gave_up_key = ExpansionInputsHash(params, user_data, input_info.wave_size,
 					                                  gave_up_shader_key) |
 					              1u;
-					if (gave_up_fast.insert(gave_up_key).second && gave_up_limit != 0) {
+					// v438o: a shader one of whose inputs found a program in this session keeps its
+					// refusals per input (its working variants go on running); the whole-shader skip
+					// is for shaders nothing of which ran. KYTY_GAVE_UP_KEEP_WORKING=0: as before.
+					const bool has_program = compute_with_program.contains(params.hash);
+					if (gave_up_fast.insert(gave_up_key).second && gave_up_limit != 0 &&
+					    !(KeepWorkingVariants() && has_program)) {
 						auto& refusals = gave_up_shaders[gave_up_shader_key];
 						if (++refusals == gave_up_limit) {
 							std::fprintf(stderr, "[gave-up] cs %016" PRIx64 " at 0x%016" PRIx64
@@ -2921,7 +4035,11 @@ struct PipelineCache::ProgramCache {
 							             params.hash, static_cast<uint64_t>(params.Base()), refusals);
 							if (disk != nullptr) {
 								const uint8_t marker = 1;
-								disk->Save(ShaderRefusalKey(params.hash), std::span(&marker, 1));
+								disk->Save(ShaderRefusalKeyV2(DiskSessionKey(), params.hash), std::span(&marker, 1));
+								if (!has_program) {
+									disk->Save(ShaderSkipKey(DiskSessionKey(), params.hash), std::span(&marker, 1));
+									skipped_before[params.hash] = true;
+								}
 							}
 						}
 					}
@@ -3021,7 +4139,28 @@ struct PipelineCache::ProgramCache {
 				};
 				t_srt_shader_hash = params.hash;
 				bool materialized = false;
+				// v445z: KYTY_SRT_REPEAT_STATS.
+				const bool repeat_stats = SrtRepeatStats();
+				uint64_t   repeat_key   = 0;
+				if (repeat_stats) {
+					g_srt_repeat.refresh++;
+					XXH64_state_t* xs = XXH64_createState();
+					XXH64_reset(xs, static_cast<XXH64_hash_t>(stage));
+					XXH64_update(xs, user_data.data(), user_data.size_bytes());
+					if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+						XXH64_update(xs, input_info.workgroup_counts, sizeof(input_info.workgroup_counts));
+					}
+					repeat_key = XXH64_digest(xs) | 1u;
+					XXH64_freeState(xs);
+					runtime.read_memory = SrtRepeatRead;
+					runtime.map_clean_page = +[](void* userdata, uint64_t page) {
+						t_srt_repeat_pages++;
+						return static_cast<GuestPageReadCache*>(userdata)->Map(page);
+					};
+					t_srt_repeat_reads = t_srt_repeat_bytes = t_srt_repeat_pages = 0;
+				}
 				if (TakePrepared(&entry->second)) {
+					if (repeat_stats) g_srt_repeat.prepared++;
 					entry->second.prepared_serial = 0;
 					// Refreshed in this draw's parallel window (PrepareStagesInParallel).
 					static const bool verify = std::getenv("KYTY_STAGE_PREP_VERIFY") != nullptr;
@@ -3033,6 +4172,7 @@ struct PipelineCache::ProgramCache {
 				           TakeScanned(entry->second, stage, runtime, params.hash)) {
 					// Prepared by the draw-prep scanner from the same inputs and bytes.
 					materialized = true;
+					if (repeat_stats) g_srt_repeat.scanned++;
 				} else {
 					std::lock_guard walk_lock(entry->second.walk_mutex);
 					entry->second.prepared_serial = 0;
@@ -3048,6 +4188,25 @@ struct PipelineCache::ProgramCache {
 					    entry->second.resource_plan, runtime, entry->second.resources,
 					    entry->second.specialization);
 					t_srt_verify = nullptr;
+					if (repeat_stats) {
+						const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+						                                          std::chrono::steady_clock::now() - walk_begin)
+						                                          .count());
+						auto&      st = g_srt_repeat;
+						st.walks++;
+						st.walk_ns += ns;
+						auto& last = st.last_key[&entry->second];
+						if (last == repeat_key) {
+							st.repeats++;
+							st.repeat_ns += ns;
+						}
+						last = repeat_key;
+						st.reads += t_srt_repeat_reads;
+						st.read_bytes += t_srt_repeat_bytes;
+						st.pages += t_srt_repeat_pages;
+						st.deferred += t_srt_defer_tick != 0 ? 1u : 0u;
+						st.gpu_fills += entry->second.resources.gpu_fills.empty() ? 0u : 1u;
+					}
 					if (t_srt_qualify) {
 						t_srt_qualify = false;
 						if (materialized) {
@@ -3088,6 +4247,9 @@ struct PipelineCache::ProgramCache {
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
 				runtime.gpu_fills   = nullptr;
+				if (repeat_stats) {
+					SrtRepeatReport();
+				}
 				if (ShaderRecompiler::IR::SrtNativeStats stats;
 				    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
 					LOGF("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64
@@ -3164,11 +4326,21 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			// v443: a lookup in an older generation of a callable split (the newest one's pipeline is
+			// being built) only finds what that generation has; nothing is translated for it.
+			if (t_rt_forced_generation != 0) {
+				return ShaderProgram {};
+			}
+		}
 		if (fast_hit != nullptr) {
 			// No permutation fits: the compile below needs the expanded code.
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				ExpandShaderFunctions(params, user_data, input_info.wave_size,
 				                      lookup_key.function_code);
+				if (rt_callables) {
+					rt_key_from_split();
+				}
 			}
 		}
 		// A translation on the workers (TranslationWorkers): the draw waits for it by being skipped.
@@ -3225,9 +4397,41 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
-		const auto compile_code = lookup_key.function_code.empty()
-		                              ? params.code
-		                              : std::span<const uint32_t>(lookup_key.function_code);
+		auto compile_code = lookup_key.function_code.empty()
+		                        ? params.code
+		                        : std::span<const uint32_t>(lookup_key.function_code);
+		// v440 M3: the callable split (main as ray generation, each call target as a callable)
+		// instead of the inlined code; the program key stays the expanded code's.
+		ShaderRecompiler::IR::RtSplitInput         rt_split;
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (rt_callables) {
+				if (lookup_key.function_code.empty() || lookup_key.function_code[0] != 0x5254434bu) {
+					rt_key_from_split(); // (a lookup that found its entry without expanding)
+				}
+				if (!rt_split_done) {
+					static std::atomic<uint32_t> logged {0};
+					if (logged.fetch_add(1) < 16) {
+						std::fprintf(stderr, "[rt-callables] %016llx: no callable split: %s\n",
+						             static_cast<unsigned long long>(params.hash), rt_split_reason.c_str());
+					}
+					unsupported.insert(lookup_key);
+					return ShaderProgram {};
+				}
+				rt_split.generation = rt_split_generation;
+				rt_split.safe_from  = rt_split_safe_from;
+				rt_split.call_pc    = rt_split_code.call_pc;
+				rt_split.source_reg = rt_split_code.source_reg;
+				rt_split.return_reg = rt_split_code.return_reg;
+				for (const auto& target: rt_split_code.targets) {
+					rt_split.targets.push_back({.address = target.address, .code = target.code});
+				}
+				options.rt_split = &rt_split;
+				compile_code     = rt_split_code.main_code;
+				std::fprintf(stderr, "[rt-callables] %016llx: split at pc 0x%x, %zu callables, main %zu words\n",
+				             static_cast<unsigned long long>(params.hash), rt_split.call_pc, rt_split.targets.size(),
+				             compile_code.size());
+			}
+		}
 		// The shader disk cache (shaderDiskCache.h): a source entry stands in for the translation
 		// of a source new to this session, a permutation entry for the compile. In verify mode
 		// both are only compared with a fresh translation. A hit is not a compile: it is not
@@ -3258,7 +4462,12 @@ struct PipelineCache::ProgramCache {
 				CountDiskLookup();
 				std::vector<uint8_t>          payload;
 				ShaderDiskCache::SourceRecord record;
-				if (!disk->Load(source_key, payload)) {
+				bool                          source_loaded = false;
+				{
+					const CpuCost::Phase load_phase_("Program::SourceLoad");
+					source_loaded = GplPrefetchTakeRecord(source_key, payload) || disk->Load(source_key, payload);
+				}
+				if (!source_loaded) {
 					disk->counters.source_misses++;
 				} else if (disk_verify) {
 					disk->counters.source_hits++;
@@ -3280,17 +4489,9 @@ struct PipelineCache::ProgramCache {
 						                  "Shader gave up: %s 0x%016" PRIx64 ": in an earlier run (disk cache)",
 						                  stage_name, params.hash);
 						unsupported.insert(lookup_key);
-						// A compute shader refused before: its other sources (other code lengths of
-						// the same shader) are refused without translating them (ShaderRefusalKey).
-						if (stage == ShaderType::Compute) {
-							static std::mutex                   refused_mutex;
-							static std::unordered_set<uint64_t> refused_written;
-							std::lock_guard                     refused_lock(refused_mutex);
-							if (refused_written.insert(params.hash).second) {
-								const uint8_t marker = 1;
-								disk->Save(ShaderRefusalKey(params.hash), std::span(&marker, 1));
-							}
-						}
+						// v438o: this source stays refused; the shader as a whole no longer is (it was,
+						// by a ShaderRefusalKey written here: one refused variant then kept every
+						// other variant of the shader from being translated).
 						return ShaderProgram {};
 					}
 					if (record.uses_clock && !shader_clock) {
@@ -3301,6 +4502,9 @@ struct PipelineCache::ProgramCache {
 					{
 						std::unique_lock programs_lock(programs_mutex);
 						entry = &*programs.try_emplace(lookup_key, std::move(record.plan)).first;
+					}
+					if (stage == ShaderType::Compute) {
+						compute_with_program.insert(params.hash);
 					}
 					entry->second.plan_fingerprint = XXH3_64bits(payload.data(), payload.size());
 					if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
@@ -3316,7 +4520,7 @@ struct PipelineCache::ProgramCache {
 				bool                               loaded     = false;
 				{
 					const CpuCost::Phase load_phase_("Program::DiskLoad");
-					loaded = disk->Load(permutation_key, payload);
+					loaded = GplPrefetchTakeRecord(permutation_key, payload) || disk->Load(permutation_key, payload);
 				}
 				bool                               compatible = false;
 				ShaderRecompiler::IR::ResourceSpecialization matched;
@@ -3345,6 +4549,9 @@ struct PipelineCache::ProgramCache {
 					disk->counters.permutation_misses++;
 				} else {
 					disk->counters.permutation_hits++;
+					if (!compatible) {
+						GplWarmNoteDrawn(stage, permutation_key, params.hash, push_data_cursor); // v438t
+					}
 					Profiler::Message(Profiler::MessageInfo,
 					                  "Shader from the disk cache: %s 0x%016" PRIx64 ", %zu SPIR-V words",
 					                  stage_name, params.hash, record.spirv.size());
@@ -3364,8 +4571,18 @@ struct PipelineCache::ProgramCache {
 
 		// A compute shader with a shader-level refusal is not translated in another variant: some
 		// take minutes on the GPU thread only to be refused (e6d76d24f59f8015, 10-26).
+		// v438o: unless a variant of it found a program in this session. The refusal is also in the
+		// cache for shaders one listed variant of which failed in the startup warm-up (171 compute
+		// shaders after a first start with the shipped list, c4df2a00067e0666 and 65730dab35e283f7
+		// among them: the list holds their code before the function expansion), and a variant of
+		// those the list lacks was never translated, in any session.
+		// The refusal of this session's kind (ShaderRefusalKeyV2: expensive to repeat) always
+		// counts; one of the old kind only for a shader nothing of which has run in this session
+		// (the title's four refused shaders have theirs from earlier builds).
 		if (stage == ShaderType::Compute && disk != nullptr &&
-		    disk->Contains(ShaderRefusalKey(params.hash))) {
+		    (disk->Contains(ShaderRefusalKeyV2(DiskSessionKey(), params.hash)) ||
+		     (!(KeepWorkingVariants() && compute_with_program.contains(params.hash)) &&
+		      disk->Contains(ShaderRefusalKey(params.hash))))) {
 			static std::atomic<uint32_t> reported {0};
 			if (reported.fetch_add(1) < 64) {
 				std::fprintf(stderr, "[gave-up] %s 0x%016" PRIx64 ": refused shader (disk cache), not translated\n",
@@ -3419,6 +4636,14 @@ struct PipelineCache::ProgramCache {
 			translated = TimedTranslate(compile_code, options);
 		}
 		if (translated.unsupported) {
+			// v438o: a compute translation that took long only to be refused is not repeated for the
+			// shader's other variants (ShaderRefusalKeyV2).
+			if (stage == ShaderType::Compute && disk != nullptr && !translated.input_dependent_refusal &&
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_begin).count() >=
+			        RefusalKeyMs()) {
+				const uint8_t marker = 1;
+				disk->Save(ShaderRefusalKeyV2(DiskSessionKey(), params.hash), std::span(&marker, 1));
+			}
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
 			if (disk != nullptr && entry == nullptr) {
@@ -3457,6 +4682,9 @@ struct PipelineCache::ProgramCache {
 				std::unique_lock programs_lock(programs_mutex);
 				entry = &*programs.try_emplace(lookup_key, std::move(*plan)).first;
 			}
+			if (stage == ShaderType::Compute) {
+				compute_with_program.insert(params.hash);
+			}
 			entry->second.plan_fingerprint = plan_fingerprint;
 			if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 				return ShaderProgram {};
@@ -3493,7 +4721,8 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto handle = AddPermutation(entry->second, stage_name, options, compiled.spirv,
 		                                   std::move(compiled.program), input_info,
-		                                   push_data_cursor);
+		                                   push_data_cursor, nullptr, &compiled.rt_callable_spirv,
+		                                   &compiled.rt_callable_records);
 		{
 			const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 			                                         std::chrono::steady_clock::now() - compile_begin)
@@ -3591,7 +4820,81 @@ struct PipelineCache::ProgramCache {
 		// Step D4: graphics permutations whose libraries the driver cache lacks (GplWarm*).
 		std::mutex                                                 warm_mutex;
 		std::vector<std::pair<ShaderType, std::vector<uint8_t>>>   warm_queue;
+		// v438q: per worker, set when it left the replay (exited) or when the replay stopped
+		// waiting for it inside a translation that would not finish (abandoned, TimedTranslate).
+		// Slots for the first workers and up to 64 replacements of abandoned ones (allocated once,
+		// so a worker's flag never moves).
+		uint32_t                                                   slots = 0;
+		std::unique_ptr<std::atomic<bool>[]>                       exited;
+		std::unique_ptr<std::atomic<bool>[]>                       abandoned;
+		// v438q: at most one source of a shader translates at a time; the others wait in
+		// `deferred` and run after it (a stuck one is refused when abandoned, and they then skip).
+		// Up to 6 listed variants of e6d76d24f59f8015 had started together and stuck 6 workers.
+		std::mutex                                                 inflight_mutex;
+		std::unordered_set<uint64_t>                               inflight;
+		std::unordered_set<uint64_t>                               abandoned_shaders; // refused this run
+		std::deque<size_t>                                         deferred;
 	};
+
+	static inline thread_local int    t_precompile_worker = -1; // v438q: index in PrecompileJob
+	static inline thread_local size_t t_precompile_source = 0;  // v438q: the source it replays
+
+	// v438q: whether this worker may translate a source of `shader_hash` now. No when another
+	// source of the shader is translating: this source is deferred to the end of the replay
+	// (PrecompileWorker), where it runs after that one finished or was abandoned.
+	enum class ReplayStart { Translate, Deferred, Refused };
+	ReplayStart BeginReplayTranslation(PrecompileJob& job, uint64_t shader_hash) {
+		std::lock_guard lock(job.inflight_mutex);
+		if (job.abandoned_shaders.contains(shader_hash)) {
+			return ReplayStart::Refused; // its refusal may not be on disk yet (written by a thread)
+		}
+		if (job.inflight.insert(shader_hash).second) {
+			return ReplayStart::Translate;
+		}
+		job.deferred.push_back(t_precompile_source);
+		return ReplayStart::Deferred;
+	}
+	void EndReplayTranslation(PrecompileJob& job, uint64_t shader_hash) {
+		std::lock_guard lock(job.inflight_mutex);
+		job.inflight.erase(shader_hash);
+	}
+
+	// v438q: what the replay does when it stops waiting for a worker's translation: the worker
+	// leaves the replay when the translation returns (nothing of it is stored), the shader gets
+	// this build's refusal (unless the replay is stopping), and the replay finishes without it.
+	std::function<void()> AbandonTranslation(PrecompileJob& job, uint64_t shader_hash, size_t words) {
+		const int index = t_precompile_worker;
+		if (index < 0 || static_cast<uint32_t>(index) >= job.slots) {
+			return {};
+		}
+		// Called by TimedTranslate's monitor thread, under its lock, while this worker is inside the
+		// translation (so the worker's thread, which holds the job, is alive, and the worker cannot
+		// leave the translation before this returns). `abandoned` is set last: once the replay's
+		// thread sees it, it may finish, and at shutdown the cache (`this`) is destroyed after it.
+		return [this, &job, index, shader_hash, words] {
+			if (job.abandoned[index].load(std::memory_order_acquire)) {
+				return;
+			}
+			job.unusable.fetch_add(1, std::memory_order_relaxed);
+			const bool stopping = precompile_stop.load(std::memory_order_acquire);
+			if (!stopping && disk != nullptr) {
+				const uint8_t marker = 1;
+				disk->Save(ShaderRefusalKeyV2(disk_session_key, shader_hash), std::span(&marker, 1));
+			}
+			{
+				std::lock_guard lock(job.inflight_mutex);
+				if (!stopping) {
+					job.abandoned_shaders.insert(shader_hash);
+				}
+				job.inflight.erase(shader_hash); // its deferred sources go on (and find the refusal)
+			}
+			std::fprintf(stderr,
+			             "[translate-abandoned] %016" PRIx64 " (%zu words): replay worker %d stopped waiting for it (%s)%s\n",
+			             shader_hash, words, index, stopping ? "replay stopping" : "time limit, KYTY_TRANSLATE_ABANDON_S",
+			             stopping ? "" : "; refused for later starts of this build");
+			job.abandoned[index].store(true, std::memory_order_release);
+		};
+	}
 
 	void StartPrecompile() {
 		if (ledger == nullptr || disk == nullptr || !disk_owner || !precompile_threads.empty()) {
@@ -3724,14 +5027,45 @@ struct PipelineCache::ProgramCache {
 		PipelineCacheLog("Shader precompile: {} sources and {} permutations from the ledger on {} threads",
 		                 job->sources.size(), total - job->sources.size(), threads);
 		job->running.store(threads);
+		job->slots     = threads + 64;
+		job->exited    = std::unique_ptr<std::atomic<bool>[]>(new std::atomic<bool>[job->slots]());
+		job->abandoned = std::unique_ptr<std::atomic<bool>[]>(new std::atomic<bool>[job->slots]());
+		// v438q: every worker on its own thread (each holds the job), and this thread waits until
+		// each has left or been abandoned; an abandoned one is detached (it finishes on its own,
+		// touching nothing of the replay) and replaced, so the replay keeps its threads.
 		std::vector<std::thread> workers;
-		for (uint32_t t = 1; t < threads; t++) {
-			workers.emplace_back([this, job] { PrecompileWorker(*job); });
+		std::vector<bool>        replaced(job->slots, false);
+		for (uint32_t t = 0; t < threads; t++) {
+			workers.emplace_back([this, job, t] { PrecompileWorker(*job, t); });
 		}
-		PrecompileWorker(*job);
-		for (auto& worker: workers) {
-			worker.join();
+		for (;;) {
+			bool all = true;
+			for (uint32_t t = 0; t < workers.size(); t++) {
+				if (job->abandoned[t].load(std::memory_order_acquire)) {
+					if (!replaced[t]) {
+						replaced[t] = true;
+						if (workers.size() < job->slots && !precompile_stop.load(std::memory_order_acquire)) {
+							const auto n = static_cast<uint32_t>(workers.size());
+							workers.emplace_back([this, job, n] { PrecompileWorker(*job, n); });
+						}
+					}
+				} else if (!job->exited[t].load(std::memory_order_acquire)) {
+					all = false;
+				}
+			}
+			if (all) {
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		}
+		for (uint32_t t = 0; t < workers.size(); t++) {
+			if (job->exited[t].load(std::memory_order_acquire)) {
+				workers[t].join();
+			} else {
+				workers[t].detach();
+			}
+		}
+		FinishPrecompile(*job);
 	}
 
 	void StopPrecompile() {
@@ -3744,18 +5078,43 @@ struct PipelineCache::ProgramCache {
 		precompile_threads.clear();
 	}
 
-	void PrecompileWorker(PrecompileJob& job) {
+	void PrecompileWorker(PrecompileJob& job, uint32_t worker) {
 		Common::LowerBackgroundThreadPriority();
+		t_precompile_worker = static_cast<int>(worker);
 		auto& progress = GetShaderPrecompileProgress();
 		for (;;) {
+			if (job.abandoned[worker].load(std::memory_order_acquire)) {
+				return; // v438q: the replay finished without this worker; touch nothing more
+			}
 			if (precompile_stop.load(std::memory_order_acquire)) {
 				break;
 			}
 			progress.YieldToForeground(); // v438l
-			const size_t index = job.next.fetch_add(1);
+			size_t index = job.next.fetch_add(1);
 			if (index >= job.sources.size()) {
-				break;
+				// v438q: the sources deferred behind another source of their shader.
+				bool waiting = false;
+				{
+					std::lock_guard lock(job.inflight_mutex);
+					index = SIZE_MAX;
+					for (auto it = job.deferred.begin(); it != job.deferred.end(); ++it) {
+						if (!job.inflight.contains(job.sources[*it].shader_hash)) {
+							index = *it;
+							job.deferred.erase(it);
+							break;
+						}
+					}
+					waiting = index == SIZE_MAX && !job.deferred.empty();
+				}
+				if (index == SIZE_MAX) {
+					if (!waiting) {
+						break;
+					}
+					std::this_thread::sleep_for(std::chrono::milliseconds(20));
+					continue;
+				}
 			}
+			t_precompile_source = index;
 			const auto& recipe = job.sources[index];
 			const auto  found  = job.by_source.find(recipe.id);
 			static const std::vector<size_t> none;
@@ -3779,7 +5138,17 @@ struct PipelineCache::ProgramCache {
 				default: progress.done.fetch_add(1 + static_cast<uint32_t>(permutations.size())); break;
 			}
 		}
-		if (job.running.fetch_sub(1) == 1) {
+		if (job.abandoned[worker].load(std::memory_order_acquire)) {
+			return;
+		}
+		job.exited[worker].store(true, std::memory_order_release);
+	}
+
+	// The end of the startup replay, after every worker left or was abandoned (v438q: was the last
+	// worker's job).
+	void FinishPrecompile(PrecompileJob& job) {
+		auto& progress = GetShaderPrecompileProgress();
+		{
 			const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
 			                                                   job.begin)
 			                         .count();
@@ -3871,20 +5240,24 @@ struct PipelineCache::ProgramCache {
 				}
 				std::vector<uint8_t>               payload;
 				ShaderDiskCache::PermutationRecord record;
+				// v438zk: a pixel permutation's twin is looked at with it (GplWarmTwinLibrary); one
+				// warmed before v438zk is read for its twin only.
+				const bool twin = stage == ShaderType::Pixel && PopsPlainBuffersEnabled();
+				const bool own  = GplWarmOwnWanted(key);
 				if (!disk->Load(key, payload)) {
 					GplWarmInFlight(worker, {});
 					no_record.fetch_add(1); // not compiled yet: warmed at a later start
 				} else if (!ShaderDiskCache::DecodePermutationRecord(payload, record)) {
 					GplWarmInFlight(worker, {});
 					undecodable.fetch_add(1);
-					GplWarmDone(key); // the same bytes every start
+					GplWarmDone(key, twin); // the same bytes every start
 				} else if ((trace ? (std::fprintf(stderr, "[warm-trace] %zu shader %016llx\n", index,
 				                                  static_cast<unsigned long long>(record.program.shader_hash)),
 				                     std::fflush(stderr), 0)
 				                  : 0),
-				           GplWarmLibraryNow(stage, record.spirv, record.program)) {
+				           GplWarmLibraryNow(stage, record.spirv, record.program, own)) {
 					GplWarmInFlight(worker, {});
-					GplWarmDone(key);
+					GplWarmDone(key, twin);
 					if (stage == ShaderType::Compute) {
 						compute_made.fetch_add(1);
 					}
@@ -3897,7 +5270,7 @@ struct PipelineCache::ProgramCache {
 				} else {
 					GplWarmInFlight(worker, {});
 					failed.fetch_add(1);
-					GplWarmDone(key); // not warmable (stage, or the driver refused it): not retried
+					GplWarmDone(key, twin); // not warmable (stage, or the driver refused it): not retried
 				}
 				progress.gpl_warm_done.fetch_add(1, std::memory_order_relaxed);
 			}
@@ -3983,9 +5356,25 @@ struct PipelineCache::ProgramCache {
 		            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(),
 		            precompile_stop.load() ? " (stopped)" : "");
 		std::fflush(stdout);
+		if (made.load() != compute_made.load()) {
+			std::printf("[gpl-warm] %u of the %u libraries were not in the driver cache (compiled now)\n",
+			            g_warm_fresh.load(), made.load() - compute_made.load());
+			std::fflush(stdout);
+		}
+		// v438zk: the plain-buffer twins. On stderr too, next to [pops-buffers].
+		if (PopsPlainBuffersEnabled()) {
+			std::fprintf(stderr,
+			             "[gpl-warm] twins: %u fragment libraries made for plain-buffer twins, %u of them not in the driver "
+			             "cache (compiled now); %u pixel records warmed before were read for their twin only\n",
+			             g_warm_twins.load(), g_warm_twin_fresh.load(), g_warm_twin_records.load());
+			std::fflush(stderr);
+		}
 		// Step D7: the caches written now, so the record holds the warm-up (not only at exit).
 		if (made.load() != 0 && g_warm_save_hook) {
 			g_warm_save_hook();
+		}
+		if (!precompile_stop.load(std::memory_order_acquire)) {
+			GplWarmVerified(); // v438t
 		}
 	}
 
@@ -4023,7 +5412,17 @@ struct PipelineCache::ProgramCache {
 		options.non_fatal       = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
 
-		if (disk->Contains(ShaderRefusalKey(recipe.shader_hash))) {
+		// v440p: a callable split (KYTY_RT_CALLABLES) is translated by Get only; the listed
+		// source is the inlined code (hundreds of thousands of words, minutes on a worker).
+		if (RtCallablesFor(recipe.shader_hash)) {
+			progress.done.fetch_add(1 + static_cast<uint32_t>(permutations.size()));
+			job.unusable.fetch_add(1 + static_cast<uint32_t>(permutations.size()), std::memory_order_relaxed);
+			return;
+		}
+		// v438o: the refusal of this session's kind only (disk_session_key is built before the
+		// replay's workers start). The old kind made the warm-up skip every listed source of 171
+		// compute shaders, also after a recompiler change.
+		if (disk->Contains(ShaderRefusalKeyV2(disk_session_key, recipe.shader_hash))) {
 			progress.done.fetch_add(1 + static_cast<uint32_t>(permutations.size()));
 			job.unusable.fetch_add(1 + static_cast<uint32_t>(permutations.size()), std::memory_order_relaxed);
 			return;
@@ -4047,7 +5446,24 @@ struct PipelineCache::ProgramCache {
 			}
 		} else {
 			bool fatal = false;
-			translated = ReplayTranslate(recipe.code, options, &fatal);
+			switch (BeginReplayTranslation(job, recipe.shader_hash)) {
+				case ReplayStart::Translate: break;
+				case ReplayStart::Deferred: return; // v438q: runs after the other source of its shader
+				case ReplayStart::Refused:
+					progress.done.fetch_add(1 + static_cast<uint32_t>(permutations.size()));
+					job.unusable.fetch_add(1 + static_cast<uint32_t>(permutations.size()), std::memory_order_relaxed);
+					return;
+			}
+			const auto translate_begin = std::chrono::steady_clock::now();
+			translated = ReplayTranslate(recipe.code, options, &fatal,
+			                             AbandonTranslation(job, recipe.shader_hash, recipe.code.size()),
+			                             &precompile_stop);
+			if (t_precompile_worker >= 0 && job.abandoned[t_precompile_worker].load(std::memory_order_acquire)) {
+				return; // v438q: the replay went on without it; refused (and left `inflight`) when abandoned
+			}
+			EndReplayTranslation(job, recipe.shader_hash);
+			const double translate_ms =
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - translate_begin).count();
 			progress.compiled.fetch_add(1);
 			if (fatal) {
 				// Recorded for this source key only, so later starts skip it; no shader-wide refusal.
@@ -4061,8 +5477,15 @@ struct PipelineCache::ProgramCache {
 				if (ShaderDiskCache::EncodeSourceRecord(true, false, nullptr, record)) {
 					StoreEntry(true, recipe.shader_hash, source_key, {}, record);
 				}
-				const uint8_t marker = 1;
-				disk->Save(ShaderRefusalKey(recipe.shader_hash), std::span(&marker, 1));
+				// v438o: the shader-wide refusal keeps the shader's other variants from being
+				// translated, which is its purpose for a failure that takes long (the title's four
+				// refused shaders: seconds to minutes each). A failure found at once costs nothing to
+				// find again, and the shader's other variants may translate, so it stays with this
+				// source. KYTY_REFUSAL_KEY_MS (default 3000; 0: every failure).
+				if (translate_ms >= RefusalKeyMs() && !translated.input_dependent_refusal) {
+					const uint8_t marker = 1;
+					disk->Save(ShaderRefusalKeyV2(disk_session_key, recipe.shader_hash), std::span(&marker, 1));
+				}
 				usable = false;
 			} else {
 				const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
@@ -4079,6 +5502,9 @@ struct PipelineCache::ProgramCache {
 		progress.done.fetch_add(1);
 		if (!usable) {
 			job.unusable.fetch_add(1 + static_cast<uint32_t>(permutations.size()), std::memory_order_relaxed);
+		} else {
+			// Record prefetch: the shader's source entry, read ahead with its permutations.
+			GplPrefetchIndexAddSource(options.stage, recipe.shader_hash, source_key);
 		}
 		// v420 carry-over (Mac 11-13: every recompiler change dropped most of the list): a
 		// permutation specialized against another plan (an older recompiler) is replayed against
@@ -4267,7 +5693,13 @@ struct PipelineCache::ProgramCache {
 			}
 			if (!have_translation) {
 				// IR::Program is move-only and CompileProgram consumes it: translate again.
-				translated = ReplayTranslate(recipe.code, options);
+				translated = ReplayTranslate(recipe.code, options, nullptr,
+				                             AbandonTranslation(job, recipe.shader_hash, recipe.code.size()),
+				                             &precompile_stop);
+				if (t_precompile_worker >= 0 &&
+				    job.abandoned[t_precompile_worker].load(std::memory_order_acquire)) {
+					return; // v438q
+				}
 				if (translated.unsupported) {
 					done_one(work);
 					continue;
@@ -4398,6 +5830,34 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// v438o, KYTY_GAVE_UP_KEEP_WORKING (default 1): a compute shader with a program in this session
+	// is neither skipped as a whole nor refused a new variant because another variant failed.
+	static bool KeepWorkingVariants() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_GAVE_UP_KEEP_WORKING");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	// The session key (built at first use: the device layer has set the emitter's switches by then).
+	const std::vector<uint8_t>& DiskSessionKey() {
+		if (disk_session_key.empty()) {
+			disk_session_key = ShaderDiskCache::SessionKey(disk_session);
+		}
+		return disk_session_key;
+	}
+
+	// v438o: whether an earlier session (or this one) skipped the compute shader as a whole
+	// (ShaderSkipKey). One file-system query per shader hash, whatever its code address.
+	bool ShaderSkippedBefore(uint64_t shader_hash) {
+		const auto [found, fresh] = skipped_before.try_emplace(shader_hash, false);
+		if (fresh) {
+			found->second = disk->Contains(ShaderSkipKey(DiskSessionKey(), shader_hash));
+		}
+		return found->second;
+	}
+
 	// KYTY_EXPAND_BY_CONSULTED=0: the reuse and fast-program keys hash all of the user data.
 	static bool KeyByConsulted() {
 		static const bool enabled = [] {
@@ -4503,6 +5963,63 @@ struct PipelineCache::ProgramCache {
 			// Kept under the registers this resolution consulted.
 			remember.key = ExpansionInputsHash(params, user_data, wave_size, reuse_seed);
 		}
+		// v440: KYTY_RT_SPLIT_DUMP=<hash,...> with KYTY_DUMP_GAVE_UP=<folder>: the callable split of
+		// those shaders (main with the call as s_nop, each target's code, the call's registers and
+		// the user data), once per shader, for the offline translator work.
+		if (static const std::string split_dump = [] {
+			    const char* value = std::getenv("KYTY_RT_SPLIT_DUMP");
+			    return value != nullptr ? std::string(value) : std::string();
+		    }();
+		    !split_dump.empty() && params.hash != 0 &&
+		    split_dump.find(fmt::format("{:016x}", params.hash)) != std::string::npos) {
+			static std::mutex                           split_mutex;
+			static std::unordered_map<uint64_t, size_t> split_done; // targets in the last dump
+			const char*                                 folder = std::getenv("KYTY_DUMP_GAVE_UP");
+			std::lock_guard                             split_lock(split_mutex);
+			ShaderRecompiler::Decoder::ShaderCallSplit  split;
+			std::string                                 split_reason;
+			bool                                        split_ok = false;
+			if (folder != nullptr) {
+				split_ok = ShaderRecompiler::Decoder::SplitShaderCalls(
+				    params.code, params.Base(), user_data,
+				    [](uint64_t address, std::span<uint32_t> words) {
+					    return ReadShaderGuestMemoryRaw(nullptr, address, words);
+				    },
+				    wave_size, split, split_reason);
+			}
+			// Written again whenever the shader has more targets than in its last dump.
+			if (const auto [last, fresh] = split_done.try_emplace(params.hash, 0);
+			    folder != nullptr && (fresh || split.targets.size() > last->second) &&
+			    (last->second = split.targets.size(), true)) {
+				const auto write = [&](const std::string& name, std::span<const uint32_t> words) {
+					if (FILE* file = std::fopen(fmt::format("{}/{}", folder, name).c_str(), "wb"); file != nullptr) {
+						std::fwrite(words.data(), 4, words.size(), file);
+						std::fclose(file);
+					}
+				};
+				std::string meta = fmt::format("hash {:016x}\nok {}\nreason {}\nwave {}\nbase {:x}\ncall_pc {:x}\nsource s{}\nreturn s{}\nuser_data",
+				                               params.hash, split_ok ? 1 : 0, split_reason, wave_size, params.Base(),
+				                               split.call_pc, split.source_reg, split.return_reg);
+				for (const auto value: user_data) {
+					meta += fmt::format(" {:x}", value);
+				}
+				meta += fmt::format("\ntargets {}\n", split.targets.size());
+				for (size_t index = 0; index < split.targets.size(); index++) {
+					meta += fmt::format("t{} {:x} {} words\n", index, split.targets[index].address,
+					                    split.targets[index].code.size());
+					write(fmt::format("rt_{:016x}_t{}.bin", params.hash, index), split.targets[index].code);
+				}
+				write(fmt::format("rt_{:016x}_main.bin", params.hash), split.main_code);
+				if (FILE* file = std::fopen(fmt::format("{}/rt_{:016x}_meta.txt", folder, params.hash).c_str(), "wb");
+				    file != nullptr) {
+					std::fwrite(meta.data(), 1, meta.size(), file);
+					std::fclose(file);
+				}
+				std::fprintf(stderr, "[rt-split] %016llx: %s, %zu targets%s%s\n",
+				             static_cast<unsigned long long>(params.hash), split_ok ? "ok" : "failed",
+				             split.targets.size(), split_reason.empty() ? "" : ": ", split_reason.c_str());
+			}
+		}
 		if (expanded_ok && expanded.empty() && reason.empty() && params.hash != 0 &&
 		    !function_expander.HasCalls(params.code)) {
 			no_call_shaders.insert(no_call_key);
@@ -4562,6 +6079,9 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
 	std::unordered_set<uint64_t>                                   gave_up_fast;
 	std::unordered_map<uint64_t, uint32_t>                         gave_up_shaders;
+	std::unordered_set<uint64_t>                                   refusal_checked; // v438n: by shader key
+	std::unordered_map<uint64_t, bool>                             skipped_before;  // v438o: by shader hash
+	std::unordered_set<uint64_t>                                   compute_with_program; // v438o
 	struct ExpandReused {
 		std::vector<uint32_t>                 code;
 		std::chrono::steady_clock::time_point validated;
@@ -4576,6 +6096,26 @@ struct PipelineCache::ProgramCache {
 		return params.hash ^ params.Base() ^ (static_cast<uint64_t>(wave_size) << 56u) ^
 		       (static_cast<uint64_t>(params.code.size()) << 32u);
 	}
+	// v440 M3: the call targets each callable split has had (pipelineCache.cpp, rt_key_from_split).
+	struct RtUnion {
+		std::map<uint64_t, std::vector<uint32_t>>    targets;  // in the newest generation
+		std::map<uint64_t, std::vector<uint32_t>>    pending;  // seen, joining at the next growth
+		std::map<uint32_t, std::vector<uint64_t>>    snapshots; // each generation's targets
+		uint32_t                                     generation = 0;
+		std::chrono::steady_clock::time_point        grown {};
+		bool                                         loaded = false; // v441c: the target file was read
+		// v443: targets of the last sessions whose code the guest's memory did not have yet when the
+		// file was read (g442c: 117 of 151 at the title screen); looked at again at each growth.
+		std::map<uint64_t, std::vector<uint32_t>>    later;
+		std::chrono::steady_clock::time_point        later_checked {};
+		// v442b: a known call target whose guest code changed (the game streams other code to the
+		// same address). The next generation, made at once, compiles the new code there; the older
+		// generations run the old code at that address, so none below safe_from is used again.
+		std::map<uint64_t, std::vector<uint32_t>>    replaced;
+		uint32_t                                     safe_from    = 0;
+		uint32_t                                     replacements = 0;
+	};
+	std::unordered_map<uint64_t, RtUnion>                          rt_unions;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
 	ProgramKey                                                     lookup_key;
 	vk::Device                                                  device;
@@ -5137,6 +6677,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
               .float_image_atomics = Config::FloatImageAtomicsEnabled()},
           ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	g_rt_callables_device.store(graphics.ray_tracing_pipeline_enabled, std::memory_order_relaxed);
 	if (GuestGpu::AsyncThreadConfigured()) {
 		m_async_program_cache = std::make_unique<ProgramCache>(
 		    graphics.device, graphics.shader_device_clock_enabled,
@@ -5345,6 +6886,14 @@ void PipelineCache::StartPipelinePrecompile() {
 }
 
 PipelineCache::~PipelineCache() {
+	{
+		std::lock_guard lock(m_rt_mutex);
+		m_rt_stop = true;
+	}
+	m_rt_wake.notify_all();
+	if (m_rt_builder.joinable()) {
+		m_rt_builder.join(); // after the build in progress, if any
+	}
 	if (m_recipes != nullptr) {
 		m_recipes->stop.store(true, std::memory_order_release);
 		if (m_recipes->thread.joinable()) {
@@ -5367,11 +6916,14 @@ PipelineCache::~PipelineCache() {
 				m_graphics.device.destroyPipeline(pipeline->pending->pipeline, nullptr);
 			}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			ReleaseRtLibraries(m_graphics, *pipeline);
 			if (pipeline->optimized != nullptr) {
 				m_graphics.device.destroyPipeline(vk::Pipeline(pipeline->optimized->exchange(VK_NULL_HANDLE)), nullptr);
 			}
-			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
-			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+			if (!pipeline->rt_shared_layouts) {
+				m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+				m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+			}
 			if (pipeline->ps_set_layout != nullptr) {
 				m_graphics.device.destroyDescriptorSetLayout(pipeline->ps_set_layout, nullptr);
 			}
@@ -5379,6 +6931,7 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	DestroyRtShared(m_graphics);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -5487,6 +7040,28 @@ void PipelineCache::InitializeDriverCache() {
 			char name[32];
 			std::snprintf(name, sizeof(name), "_%s_%02u.bin", which == 0 ? "lib" : "cs", i);
 			auto path = std::filesystem::path("_PipelineCache") / (title_id + "_" + config + name);
+			// v438x: library shards whose entries the driver does not serve start over once (Save
+			// wrote <main cache>.rebuild): the old file is kept as .old, the shard counts as missing,
+			// so the warmed record is dropped and the warm-up fills new caches. The .rebuilt file
+			// stays: a second mark on rebuilt shards is only logged (Save), never acted on.
+			if (which == 0) {
+				auto rebuild_path  = m_driver_cache_path;
+				rebuild_path      += ".rebuild";
+				std::error_code rebuild_error;
+				if (std::filesystem::exists(rebuild_path, rebuild_error)) {
+					auto old_path  = path;
+					old_path      += ".old";
+					std::filesystem::remove(old_path, rebuild_error);
+					std::filesystem::rename(path, old_path, rebuild_error);
+					if (i + 1 == count) {
+						auto rebuilt_path  = m_driver_cache_path;
+						rebuilt_path      += ".rebuilt";
+						std::filesystem::rename(rebuild_path, rebuilt_path, rebuild_error);
+						PipelineCacheLog("Vulkan pipeline cache: library shards started over (the driver compiled libraries they "
+						                 "already held); the old files are kept as .old");
+					}
+				}
+			}
 			auto data = ReadDriverCacheFile(path);
 			vk::PipelineCacheCreateInfo info {};
 			info.initialDataSize = data.size();
@@ -5566,6 +7141,24 @@ void PipelineCache::Save() {
 	}
 	g_warm_save_hook = nullptr;
 	ZeroCompileReport("exit");
+	// v438t: every program came from the list (nothing translated, nothing new recorded) and the
+	// driver still compiled stage libraries: the warmed record named libraries the cache lacks.
+	// KYTY_GPL_STALE_MISSES (default 8; 0: off).
+	{
+		static const uint64_t limit = [] {
+			const char* value = std::getenv("KYTY_GPL_STALE_MISSES");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : 8ull;
+		}();
+		const auto misses = ZeroCompileCount(ZeroCompileEvent::LibraryMiss);
+		std::fprintf(stderr, "[gpl-warm] exit: %u drawn graphics permutations the warm-up was never given, %u libraries the "
+		                     "record named that the prefetch found missing\n",
+		             g_warm_unlisted.load(), g_warm_stale.load());
+		if (limit != 0 && misses >= limit && ZeroCompileCount(ZeroCompileEvent::Translation) == 0 &&
+		    ZeroCompileCount(ZeroCompileEvent::LedgerRecord) == 0 &&
+		    GetShaderPrecompileProgress().gpl_warm_finished.load(std::memory_order_acquire)) {
+			GplWarmMarkStale("stage libraries compiled at draw time in a session that drew only listed permutations", misses);
+		}
+	}
 	{
 		// What the caches gained since startup: after a complete warm-up (a restart),
 		// new entries are compiles the warm-ups did not cover (the gate with the counters).
@@ -5581,6 +7174,35 @@ void PipelineCache::Save() {
 		for (size_t i = 0; i < m_aux[1].caches.size(); i++) cs += grown(m_aux[1].caches[i], m_aux[1].loaded[i]);
 		std::fprintf(stderr, "[zero-compile] cache growth since startup: libraries %+lld, compute %+lld, main %+lld bytes\n",
 		             lib, cs, m_driver_cache != nullptr ? grown(m_driver_cache, m_driver_cache_loaded) : 0ll);
+		// v438x: the warm-up compiled libraries (each took KYTY_GPL_MISS_MS or more without a cache
+		// hit) and the shards did not grow by them: the shards hold entries under those keys that
+		// the driver neither serves nor replaces (h5, h6b: ~32,000 compiled in ~2,300 s, +2 to +6 MB;
+		// a compiled library adds ~80 KB when its key is new). Nothing made now is kept either, so the
+		// shards start over at the next start. KYTY_GPL_REBUILD_MIN (default 1000 compiled; 0: off).
+		static const uint32_t rebuild_min = [] {
+			const char* value = std::getenv("KYTY_GPL_REBUILD_MIN");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 1000u;
+		}();
+		const uint32_t compiled = g_warm_fresh.load(std::memory_order_relaxed);
+		if (rebuild_min != 0 && compiled >= rebuild_min && lib < static_cast<long long>(compiled) * 16384ll) {
+			auto rebuilt_path  = m_driver_cache_path;
+			rebuilt_path      += ".rebuilt";
+			std::error_code rebuild_error;
+			if (std::filesystem::exists(rebuilt_path, rebuild_error)) {
+				std::fprintf(stderr, "[gpl-warm] %u libraries compiled and the shards grew %+lld bytes again, on shards that were "
+				                     "already started over: not the shard files (left as they are)\n",
+				             compiled, lib);
+			} else {
+				auto rebuild_path  = m_driver_cache_path;
+				rebuild_path      += ".rebuild";
+				if (std::FILE* out = std::fopen(Common::PathToString(rebuild_path).c_str(), "wb"); out != nullptr) {
+					std::fclose(out);
+				}
+				std::fprintf(stderr, "[gpl-warm] %u libraries compiled, shards grew %+lld bytes: they hold entries the driver does "
+				                     "not serve; the library shards start over at the next start\n",
+				             compiled, lib);
+			}
+		}
 	}
 	if (WriteDriverCache()) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
@@ -5632,6 +7254,7 @@ bool PipelineCache::WriteDriverCache() {
 		return false;
 	}
 	auto       pending = GplWarmTakePending(); // made before this write: in the data it fetches
+	const auto save_begin = std::chrono::steady_clock::now();
 	const bool main = WriteDriverCacheIfChanged(m_driver_cache, m_driver_cache_path, m_driver_cache_saved);
 	bool       aux  = true;
 	for (auto& shards: m_aux) {
@@ -5641,6 +7264,11 @@ bool PipelineCache::WriteDriverCache() {
 	}
 	// Step D7: the warm record names only what a written cache holds.
 	GplWarmCommit(pending, aux);
+	// On stderr, between the [floor] lines: a pass that took time (it fetches and writes whole shards).
+	if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - save_begin).count();
+	    ms >= 50.0) {
+		std::fprintf(stderr, "[cache-save] driver caches checked and written in %.0f ms\n", ms);
+	}
 	return main;
 }
 
@@ -5855,6 +7483,9 @@ bool PipelineCache::DescribeGraphicsStages(
 		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		// v446i: the A/B translation variant (static buffer formats only: bit 1).
+		vertex_info[0].translation_variant =
+		    TranslationVariantStage(2u) ? (TranslationVariantFor(vertex_params[0].hash) & 1u) : 0u;
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -5893,6 +7524,8 @@ bool PipelineCache::DescribeGraphicsStages(
 	}
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_info.translation_variant =
+		    TranslationVariantStage(4u) ? (TranslationVariantFor(pixel_params.hash) & 1u) : 0u;
 		ApplyDepthBeforeShader(sh, pixel_params.hash, pixel_info);
 		ApplyEarlyTestsWithKill(sh, context, pixel_params.hash, pixel_info);
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
@@ -6145,13 +7778,47 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	const CpuCost::Phase cpu_phase_("GetComputeProgram");
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	input_info.translation_variant = TranslationVariantStage(1u) ? TranslationVariantFor(params.hash) : 0u;
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	// v440 M3: ray-tracing stages have no workgroup memory; a callable split's LDS is a buffer.
+	input_info.lds_storage = input_info.lds_storage || RtCallablesFor(params.hash);
 	uint32_t          push_data_cursor = 0;
 	auto&             cache            = m_async_program_cache != nullptr && GuestGpu::IsAsyncThread()
 	                                         ? *m_async_program_cache
 	                                         : *m_program_cache;
+	const ShaderComputeInputInfo input_before = input_info;
 	auto              program          = cache.Get(params, input_info, push_data_cursor);
+	// v440 M3: a callable split whose newest generation's pipeline is still being built runs the
+	// last generation whose pipeline is ready (its new call targets call nothing meanwhile).
+	if (program && program.rt_callables != nullptr) {
+		const auto& pipeline = GetComputePipeline(input_info, program);
+		auto&       last     = m_rt_last_ready[params.hash];
+		if (pipeline.rt_ready == nullptr || pipeline.rt_ready->load(std::memory_order_acquire)) {
+			last = program.rt_callables->generation;
+		} else if (RtFallbackEnabled() && last != 0 && last != program.rt_callables->generation &&
+		           last >= program.rt_callables->safe_from) {
+			ShaderComputeInputInfo older  = input_before;
+			uint32_t               cursor = 0;
+			t_rt_forced_generation        = last;
+			auto fallback                 = cache.Get(params, older, cursor);
+			t_rt_forced_generation        = 0;
+			const bool taken = fallback && fallback.rt_callables != nullptr && fallback.rt_callables->generation == last;
+			// v443: which one runs while the newest builds (the first few times per session).
+			static std::atomic<uint32_t> logged {0};
+			if (logged.load(std::memory_order_relaxed) < 24 && logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+				std::fprintf(stderr, "[rt-callables] %016llx: generation %u's pipeline is being built; %s\n",
+				             static_cast<unsigned long long>(params.hash), program.rt_callables->generation,
+				             taken ? fmt::format("generation {} runs meanwhile", last).c_str()
+				                   : fmt::format("generation {} was not found for this dispatch, which is skipped", last).c_str());
+			}
+			if (taken) {
+				program          = fallback;
+				input_info       = older;
+				push_data_cursor = cursor;
+			}
+		}
+	}
 	if (program && input_info.stage.program != nullptr) {
 		const auto* compiled = input_info.stage.program;
 		GpuTiming::NoteComputeLanes(compiled->shader_hash,
@@ -6170,12 +7837,19 @@ bool PipelineCache::DrawPrepCompute(const HW::ComputeShaderInfo& regs, const HW:
 	out.stage_count = 0;
 	if (!DrawPrep::IsGoodPair(regs.cs_regs.data_addr, UINT64_MAX)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
+		// A compute shader the GPU thread has not dispatched yet: its listed records are read on the
+		// prefetch workers meanwhile (once per shader), so the dispatch's lookup reads no file.
+		if (GplPrefetchEnabled() && regs.cs_regs.data_addr != 0) {
+			GplPrefetchRequest(ShaderDeclaredHash(regs.cs_regs.data_addr));
+		}
 		return false;
 	}
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto params             = PrepareProgram(regs, sh, input_info);
+	input_info.translation_variant = TranslationVariantStage(1u) ? TranslationVariantFor(params.hash) : 0u;
 	input_info.lds_storage        = input_info.lds_size_dwords * 4u >
 	                         m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	input_info.lds_storage        = input_info.lds_storage || RtCallablesFor(params.hash);
 	// The cache the queue's dispatches will look up in: the async thread's while it runs the
 	// compute queues (with KYTY_SYNC_TOGGLE_MODE=async only in the on windows).
 	auto& cache = m_async_program_cache != nullptr && queue != 0 && GuestGpu::AsyncThreadActiveNow()
@@ -6476,8 +8150,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	// A pipeline built at startup from its recipe (StartPipelinePrecompile): taken as is.
 	std::vector<uint8_t>    recipe;
 	PipelineRecipe::Hash128 recipe_hash;
-	// Linked (GPL) pipelines get no recipe: their libraries are warmed instead.
-	if (m_recipes != nullptr && !build->gpl && PipelineRecipe::Serialize(*build, recipe)) {
+	// Linked (GPL) pipelines get no recipe: their libraries are warmed instead. Neither do the
+	// pipelines of a twin module (KYTY_POPS_NOINTERLOCK, v438zh; KYTY_POPS_BUFFER_COHERENT, v438zi):
+	// it exists only once the draw path made its original, so a recipe could never be prebuilt and
+	// would only add a module the recipe file's module map does not know.
+	if (m_recipes != nullptr && !build->gpl && (ps_id & (PopsNoInterlockIdBit | PopsPlainBuffersIdBit)) == 0 &&
+	    PipelineRecipe::Serialize(*build, recipe)) {
 		recipe_hash = PipelineRecipe::HashBytes(recipe);
 		if (const auto prebuilt = m_recipes->Take(recipe_hash); prebuilt != nullptr) {
 			cached->pipeline = prebuilt;
@@ -6647,8 +8325,81 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	// v440 M3: a callable split's ray-tracing pipeline takes the driver tens of seconds the first
+	// time (its libraries are kept, so later target sets cost less): it is built on a worker, and
+	// the dispatches skip it until it is ready. KYTY_RT_ASYNC=0 builds it here.
+	static const bool rt_async = [] {
+		const char* value = std::getenv("KYTY_RT_ASYNC");
+		return value == nullptr || value[0] != '0';
+	}();
+	const auto queue_rt_build = [&](Pipeline* target) {
+		const uint64_t hash       = input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
+		const uint32_t generation = compute_program.rt_callables->generation;
+		{
+			std::lock_guard lock(m_rt_mutex);
+			for (auto& job: m_rt_jobs) {
+				// The newer program (more call targets) is built instead. v443: only an older
+				// generation's: another program of the same generation (the shader's other
+				// permutation) used to be dropped too and then was never built.
+				if (job.shader_hash == hash && job.program.rt_callables != nullptr &&
+				    job.program.rt_callables->generation < generation) {
+					job.superseded = true;
+				}
+			}
+			m_rt_jobs.push_back({.target = target, .input_info = input_info, .program = compute_program,
+			                     .shader_hash = hash});
+			RtBuildsAdd(hash, 1); // (until its build ends or is dropped: the target set waits, rt_key_from_split)
+			if (!m_rt_builder.joinable()) {
+				m_rt_builder = std::thread([this] {
+					// v443: below the emulator's own threads, like the library compiles it starts.
+					Common::LowerBackgroundThreadPriority();
+					for (;;) {
+						RtBuildJob job;
+						{
+							std::unique_lock lock(m_rt_mutex);
+							m_rt_wake.wait(lock, [this] { return m_rt_stop || !m_rt_jobs.empty(); });
+							if (m_rt_stop) {
+								return;
+							}
+							job = m_rt_jobs.front();
+							m_rt_jobs.pop_front();
+						}
+						if (job.superseded) {
+							std::fprintf(stderr, "[rt-callables] %016llx: an older program's pipeline is not built (a newer one is queued)\n",
+							             static_cast<unsigned long long>(job.shader_hash));
+							// v443: built after all if the program is dispatched again (GetComputePipeline).
+							job.target->rt_dropped->store(true, std::memory_order_release);
+							RtBuildsAdd(job.shader_hash, -1);
+							continue;
+						}
+						CreateRtPipelineInternal(m_graphics, *job.target, job.input_info, job.program, m_driver_cache);
+						job.target->rt_ready->store(true, std::memory_order_release);
+						RtBuildsAdd(job.shader_hash, -1);
+					}
+				});
+			}
+		}
+		m_rt_wake.notify_one();
+	};
+
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		auto& found = *iter->second;
+		if (found.rt_dropped != nullptr && compute_program.rt_callables != nullptr &&
+		    found.rt_dropped->exchange(false, std::memory_order_acq_rel)) {
+			queue_rt_build(&found); // v443: its build was dropped for a newer generation's, and it runs again
+		}
+		return found;
+	}
+
+	if (compute_program.rt_callables != nullptr && rt_async) {
+		auto cached        = std::make_unique<Pipeline>();
+		cached->rt_ready   = std::make_shared<std::atomic<bool>>(false);
+		cached->rt_dropped = std::make_shared<std::atomic<bool>>(false);
+		auto* target       = cached.get();
+		auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+		EXIT_IF(!inserted);
+		queue_rt_build(target);
 		return *iter->second;
 	}
 
@@ -6667,7 +8418,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		const vk::PipelineCache shard = AuxCacheFor(AuxCache::Compute, ModuleShardHash(compute_program.module));
 		{
 			const ForegroundWaitScope foreground_(Libs::Graphics::GuestGpu::IsGpuThread());
-			CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, shard ? shard : m_driver_cache);
+			if (compute_program.rt_callables != nullptr) {
+				// v440 M3: a callable split (KYTY_RT_CALLABLES).
+				CreateRtPipelineInternal(m_graphics, *cached, input_info, compute_program, m_driver_cache);
+			} else {
+				CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+				                       shard ? shard : m_driver_cache);
+			}
 		}
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
 		// NVIDIA (621.14) reports no application cache hit for compute pipelines its cache does
@@ -6688,6 +8445,64 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	return *iter->second;
 }
+// streamBuffer.cpp: a callable split's binding table leaves the device-fault registry's live set.
+void FaultForgetRtTable(uint64_t device, uint64_t tick);
+
+void PipelineCache::NoteRtDispatch(uint64_t shader_hash, uint32_t generation, uint64_t program_id, uint64_t tick,
+                                   const std::function<bool(uint64_t)>& is_free) {
+	static const bool retire = [] {
+		const char* value = std::getenv("KYTY_RT_RETIRE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!retire) {
+		return;
+	}
+	auto& entry = m_rt_used[shader_hash];
+	if (std::ranges::find(entry.used, std::pair {generation, program_id}) == entry.used.end()) {
+		entry.used.emplace_back(generation, program_id);
+	}
+	if (generation > entry.newest) {
+		entry.newest = generation;
+		std::erase_if(entry.used, [&](const std::pair<uint32_t, uint64_t>& old) {
+			if (old.first >= generation) {
+				return false;
+			}
+			m_rt_retiring.emplace_back(old.second, tick);
+			return true;
+		});
+	}
+	std::erase_if(m_rt_retiring, [&](const std::pair<uint64_t, uint64_t>& old) {
+		if (!is_free(old.second)) {
+			return false;
+		}
+		const auto found = m_compute_pipelines.find(old.first);
+		if (found == m_compute_pipelines.end()) {
+			return true;
+		}
+		auto& pipeline = *found->second;
+		if (pipeline.rt_ready != nullptr && !pipeline.rt_ready->load(std::memory_order_acquire)) {
+			return false; // (not built: never dispatched, kept)
+		}
+		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		const auto libraries = pipeline.rt_libraries.size();
+		// v442: the libraries the newer generations took again stay (ReleaseRtLibraries).
+		ReleaseRtLibraries(m_graphics, pipeline);
+		if (pipeline.rt_sbt_buffer != nullptr) {
+			FaultForgetRtTable(pipeline.rt_sbt_address, tick);
+			m_graphics.device.destroyBuffer(pipeline.rt_sbt_buffer, nullptr);
+		}
+		if (pipeline.rt_sbt_memory != nullptr) {
+			m_graphics.device.freeMemory(pipeline.rt_sbt_memory, nullptr);
+		}
+		std::fprintf(stderr, "[rt-callables] %016llx: an older generation's pipeline destroyed (%zu library uses given back)\n",
+		             static_cast<unsigned long long>(shader_hash), libraries);
+		// The layouts stay (descriptor sets made with them may be cached); the entry is erased, so
+		// the program would build a new pipeline if it ever ran again.
+		m_compute_pipelines.erase(found);
+		return true;
+	});
+}
+
 void SrtVerifyReportMiss(uint64_t shader_hash) {
 	bool inserted = false;
 	{
@@ -6740,6 +8555,10 @@ void ZeroCompileNote(ZeroCompileEvent event, uint64_t hash, double ms) {
 		std::fprintf(stderr, "[zero-compile] %s %016llx %.1f ms\n", ZeroName(event),
 		             static_cast<unsigned long long>(hash), ms);
 	}
+}
+
+uint64_t ZeroCompileCount(ZeroCompileEvent event) {
+	return g_zero_counts[static_cast<size_t>(event)].load(std::memory_order_relaxed);
 }
 
 void ZeroCompileReport(const char* when) {

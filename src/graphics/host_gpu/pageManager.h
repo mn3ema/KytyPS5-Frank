@@ -4,9 +4,23 @@
 #include "common/common.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <cstddef>
 #include <memory>
 
 namespace Libs::Graphics {
+
+// KYTY_PROTECT_STATS=1 (or KYTY_FPS_LOG's diagnostics), [fault-census] (v445m, counters only):
+// every access violation on guest memory that reaches the tracker (PageManager::ResolveStale, the
+// first step of the fault handler) is counted by page, guest thread, read or write, and what the
+// tracker held for the page at that moment (GPU-dirty: read-watched; CPU-clean: write-watched).
+// The handler writes a fixed table of atomics only. The report (every 5 s, on the GPU thread)
+// prints the totals and the ten heaviest entries, each with the buffer that owns the page now.
+namespace FaultCensus {
+[[nodiscard]] bool Enabled() noexcept;
+// Writes what owns the guest page at `address` into `out` (the buffer cache's answer).
+using Describe = void (*)(void* context, uint64_t address, char* out, size_t size);
+void Report(void* context, Describe describe);
+} // namespace FaultCensus
 
 enum class PageFaultAccess { Read, Write, Execute, Unknown };
 

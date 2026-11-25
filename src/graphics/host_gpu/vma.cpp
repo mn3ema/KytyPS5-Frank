@@ -82,6 +82,25 @@ bool GraphicContext::CreateAllocator() {
 		}
 	}
 
+	// KYTY_VMA_BLOCK_MB=<n> (v438zo; unset: the allocator's own 256 MB): the size of the blocks the
+	// default pools are made of. An allocation over half a block gets memory of its own, and a
+	// block goes back to the driver only when everything in it is freed. In Mac's play of 11-17 the
+	// free space left inside 256 MB blocks grew from 0.6 GB at minute 10 to 1.9 GB at minute 22
+	// (16.2 GB allocated in 18.1 GB of blocks), while the device sat at its ceiling: textures come
+	// and go as he moves, and one live texture keeps its whole block. Smaller blocks empty sooner.
+	// It changes where memory comes from, not what is in it. Drivers limit the number of memory
+	// objects (maxMemoryAllocationCount; 4,096 is the usual value and was not read from this
+	// device), so 16 is the floor: 18 GB of 16 MB blocks is ~1,150 of them, next to one per guest
+	// buffer. [vma-frag] shows the result.
+	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr) {
+		const auto mb = std::strtoull(value, nullptr, 10);
+		if (mb >= 16 && mb <= 1024) {
+			info.preferredLargeHeapBlockSize = static_cast<VkDeviceSize>(mb) << 20u;
+			std::fprintf(stderr, "[vma-frag] KYTY_VMA_BLOCK_MB: default pool blocks of %llu MB\n",
+			             static_cast<unsigned long long>(mb));
+		}
+	}
+
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
@@ -439,6 +458,8 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 // streamBuffer.cpp (KYTY_FAULT_MAP=1): images by device address, to name GPU fault addresses.
 void FaultMapNoteImage(GraphicContext& graphics, VmaAllocation allocation,
                        const vk::ImageCreateInfo& info, bool created, VkImage image);
+
+void FaultMapNoteSparseImage(VkImage image, bool created); // streamBuffer.cpp
 
 void GpuPoolNoteAllocation(VmaAllocator allocator, VmaAllocation allocation); // below
 
@@ -893,6 +914,282 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	Quarantine(allocator, image.image, VK_NULL_HANDLE, image.allocation, canary);
 	image.image      = nullptr;
 	image.allocation = nullptr;
+}
+
+// v438zy: the mode when KYTY_TEX_SPARSE is not set (vulkanWindow.cpp sets it once, before the
+// device is made: KYTY_TEX_SPARSE_NVIDIA on NVIDIA GPUs, else off).
+static std::atomic<uint32_t> g_tex_sparse_default {0};
+
+void SetTexSparseDefault(uint32_t mode) {
+	g_tex_sparse_default.store(mode <= 2 ? mode : 0u, std::memory_order_relaxed);
+}
+
+uint32_t TexSparseMode() {
+	static const int env = [] {
+		const char* value = std::getenv("KYTY_TEX_SPARSE");
+		if (value == nullptr || value[0] == '\0') {
+			return -1;
+		}
+		return value[0] == '1' || value[0] == '2' ? value[0] - '0' : 0;
+	}();
+	return env >= 0 ? static_cast<uint32_t>(env) : g_tex_sparse_default.load(std::memory_order_relaxed);
+}
+
+bool TexSparseVerify() {
+	static const bool verify = [] {
+		const char* value = std::getenv("KYTY_TEX_SPARSE_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return verify;
+}
+
+// v438zr (KYTY_TEX_SPARSE). The image keeps its size and all its levels; memory is bound level
+// by level. Outside the allocator's image path: no pool, no quarantine, no fault map.
+bool GraphicContext::CreateSparseImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+                                       SparseImageState& state) {
+	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
+	if (!sparse_images || image_info.arrayLayers != 1 || image_info.imageType != vk::ImageType::e2D ||
+	    image_info.samples != vk::SampleCountFlagBits::e1 || image_info.mipLevels < 2) {
+		return false;
+	}
+	auto info   = image_info;
+	info.flags |= vk::ImageCreateFlagBits::eSparseBinding | vk::ImageCreateFlagBits::eSparseResidency;
+	vk::Image native = nullptr;
+	if (device.createImage(&info, nullptr, &native) != vk::Result::eSuccess) {
+		return false;
+	}
+	vk::MemoryRequirements memory {};
+	device.getImageMemoryRequirements(native, &memory);
+	uint32_t count = 0;
+	device.getImageSparseMemoryRequirements(native, &count, nullptr);
+	std::vector<vk::SparseImageMemoryRequirements> sparse(count);
+	if (count != 0) {
+		device.getImageSparseMemoryRequirements(native, &count, sparse.data());
+	}
+	const vk::SparseImageMemoryRequirements* color = nullptr;
+	for (uint32_t i = 0; i < count; i++) {
+		if (sparse[i].formatProperties.aspectMask & vk::ImageAspectFlagBits::eColor) {
+			color = &sparse[i];
+			break;
+		}
+	}
+	// One colour aspect, blocks of whole texels, a tail the driver sizes: anything else stays whole.
+	if (color == nullptr || memory.alignment == 0 || color->formatProperties.imageGranularity.width == 0 ||
+	    color->formatProperties.imageGranularity.height == 0 || color->imageMipTailSize % memory.alignment != 0 ||
+	    static_cast<bool>(color->formatProperties.flags & vk::SparseImageFormatFlagBits::eNonstandardBlockSize)) {
+		device.destroyImage(native, nullptr);
+		return false;
+	}
+	state                  = {};
+	state.sparse           = true;
+	state.levels           = image_info.mipLevels;
+	state.tail_first       = std::min(color->imageMipTailFirstLod, image_info.mipLevels);
+	state.granularity      = color->formatProperties.imageGranularity;
+	state.block_bytes      = memory.alignment;
+	state.tail_offset      = color->imageMipTailOffset;
+	state.tail_size        = color->imageMipTailSize;
+	state.memory_type_bits = memory.memoryTypeBits;
+
+	image.image      = native;
+	image.allocation = nullptr;
+	image.format     = image_info.format;
+	image.image_type = image_info.imageType;
+	image.extent     = image_info.extent;
+	image.layers     = image_info.arrayLayers;
+	image.mip_levels = image_info.mipLevels;
+	image.samples    = static_cast<uint32_t>(image_info.samples);
+	image.usage      = image_info.usage;
+	image.flags      = info.flags;
+	image.state      = {.layout = image_info.initialLayout};
+	image.subresource_states.clear();
+	FaultMapNoteSparseImage(static_cast<VkImage>(image.image), true);
+	return true;
+}
+
+bool GraphicContext::BindSparseLevels(VulkanImage& image, SparseImageState& state, uint32_t first) {
+	EXIT_IF(!state.sparse || image.image == nullptr);
+	first                 = std::min(first, state.tail_first);
+	const uint32_t before = std::min(state.bound_first, state.tail_first);
+	if (first >= before && state.tail_bound) {
+		return true;
+	}
+	VmaAllocationCreateInfo alloc_info {};
+	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	std::vector<vk::SparseImageMemoryBind> binds;
+	std::vector<VmaAllocation>             made;
+	uint64_t                               bytes = 0;
+	const auto allocate = [&](uint64_t size, vk::DeviceMemory& out_memory, vk::DeviceSize& out_offset) {
+		VkMemoryRequirements requirements {};
+		requirements.size           = size;
+		requirements.alignment      = state.block_bytes;
+		requirements.memoryTypeBits = state.memory_type_bits;
+		VmaAllocation     allocation = nullptr;
+		VmaAllocationInfo placed {};
+		if (vmaAllocateMemory(allocator, &requirements, &alloc_info, &allocation, &placed) != VK_SUCCESS) {
+			return false;
+		}
+		made.push_back(allocation);
+		out_memory = placed.deviceMemory;
+		out_offset = placed.offset;
+		bytes     += size;
+		return true;
+	};
+	bool ok = true;
+	for (uint32_t level = first; level < before && ok; level++) {
+		const uint32_t width  = std::max(image.extent.width >> level, 1u);
+		const uint32_t height = std::max(image.extent.height >> level, 1u);
+		const uint64_t blocks = static_cast<uint64_t>((width + state.granularity.width - 1) / state.granularity.width) *
+		                        ((height + state.granularity.height - 1) / state.granularity.height);
+		vk::SparseImageMemoryBind bind {};
+		bind.subresource = vk::ImageSubresource {vk::ImageAspectFlagBits::eColor, level, 0};
+		bind.offset      = vk::Offset3D {0, 0, 0};
+		bind.extent      = vk::Extent3D {width, height, 1};
+		ok               = allocate(blocks * state.block_bytes, bind.memory, bind.memoryOffset);
+		binds.push_back(bind);
+	}
+	vk::SparseMemoryBind tail {};
+	const bool           with_tail = !state.tail_bound && state.tail_size != 0;
+	if (ok && with_tail) {
+		tail.resourceOffset = state.tail_offset;
+		tail.size           = state.tail_size;
+		ok                  = allocate(state.tail_size, tail.memory, tail.memoryOffset);
+	}
+	vk::Fence fence = nullptr;
+	if (ok) {
+		vk::SparseImageMemoryBindInfo image_bind {};
+		image_bind.image     = image.image;
+		image_bind.bindCount = static_cast<uint32_t>(binds.size());
+		image_bind.pBinds    = binds.data();
+		vk::SparseImageOpaqueMemoryBindInfo opaque_bind {};
+		opaque_bind.image     = image.image;
+		opaque_bind.bindCount = 1;
+		opaque_bind.pBinds    = &tail;
+		vk::BindSparseInfo bind_info {};
+		bind_info.imageBindCount       = binds.empty() ? 0u : 1u;
+		bind_info.pImageBinds          = &image_bind;
+		bind_info.imageOpaqueBindCount = with_tail ? 1u : 0u;
+		bind_info.pImageOpaqueBinds    = &opaque_bind;
+		const vk::FenceCreateInfo fence_info {};
+		ok = device.createFence(&fence_info, nullptr, &fence) == vk::Result::eSuccess;
+		if (ok) {
+			// The same queue as the submits, under its mutex; the caller goes on only when the
+			// device has bound the memory, so every command recorded after this sees it bound.
+			vk::Result result;
+			{
+				Common::LockGuard lock(queue_mutex);
+				result = queue.bindSparse(1, &bind_info, fence);
+			}
+			static const bool wait_here = [] {
+				const char* value = std::getenv("KYTY_TEX_SPARSE_WAIT");
+				return value != nullptr && value[0] == '1';
+			}();
+			ok = result == vk::Result::eSuccess;
+			if (ok && !wait_here) {
+				std::scoped_lock lock(sparse_fence_mutex);
+				sparse_fences.push_back(fence);
+				fence = nullptr; // WaitSparseBinds waits for it and destroys it
+			} else if (ok) {
+				ok = device.waitForFences(1, &fence, VK_TRUE, UINT64_C(10'000'000'000)) == vk::Result::eSuccess;
+			}
+		}
+	}
+	if (fence) {
+		device.destroyFence(fence, nullptr);
+	}
+	if (!ok) {
+		for (const auto allocation: made) {
+			vmaFreeMemory(allocator, allocation);
+		}
+		return false;
+	}
+	state.allocations.insert(state.allocations.end(), made.begin(), made.end());
+	state.bound_first  = std::min(state.bound_first, first);
+	state.tail_bound   = state.tail_bound || with_tail || state.tail_size == 0;
+	state.bound_bytes += bytes;
+	state.binds++;
+	return true;
+}
+
+void GraphicContext::WaitSparseBinds() {
+	std::vector<vk::Fence> fences;
+	{
+		std::scoped_lock lock(sparse_fence_mutex);
+		if (sparse_fences.empty()) {
+			return;
+		}
+		fences.swap(sparse_fences);
+	}
+	// A bind waits behind the queue's work, so a GPU hang ends here as often as in a tick's wait
+	// (MasterSemaphore::Wait). v443e: as there, the hang is reported after 5 s ([gpu-hang]), and the
+	// device loss it ends in is reported ([device-fault], what the GPU was in) before this exits;
+	// the fatal used to come first, at 10 s, and the run ended without either (g443c).
+	const auto begin  = std::chrono::steady_clock::now();
+	const auto waited = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(); };
+	auto result = device.waitForFences(static_cast<uint32_t>(fences.size()), fences.data(), VK_TRUE, UINT64_C(5'000'000'000));
+	for (uint32_t reports = 0; result == vk::Result::eTimeout && reports < 3; reports++) {
+		DumpGpuHangCheckpoints(*this, 0, waited());
+		result = device.waitForFences(static_cast<uint32_t>(fences.size()), fences.data(), VK_TRUE, UINT64_C(15'000'000'000));
+	}
+	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			DumpDeviceLossDiagnostics(*this);
+		}
+		EXIT("sparse texture memory was not bound: %s after %.1f s (%zu binds)\n", vk::to_string(result).c_str(), waited(),
+		     fences.size());
+	}
+	for (const auto fence: fences) {
+		device.destroyFence(fence, nullptr);
+	}
+}
+
+void GraphicContext::DeleteSparseImage(VulkanImage& image, SparseImageState& state) {
+	EXIT_IF(allocator == nullptr || !state.sparse || image.image == nullptr);
+	WaitSparseBinds(); // no bind of this image may still be on its way
+	FaultMapNoteSparseImage(static_cast<VkImage>(image.image), false);
+	device.destroyImage(image.image, nullptr);
+	for (const auto allocation: state.allocations) {
+		vmaFreeMemory(allocator, allocation);
+	}
+	image.image = nullptr;
+	state       = {};
+}
+
+std::string GraphicContext::DescribeFragmentation() const {
+	std::string text;
+	if (allocator == nullptr || physical_device == nullptr) {
+		return text;
+	}
+	const auto&        properties = GetPhysicalDeviceMemoryProperties();
+	VmaTotalStatistics total {};
+	vmaCalculateStatistics(allocator, &total);
+	char line[256];
+	for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+		const auto& type = total.memoryType[i];
+		if (type.statistics.blockCount == 0) {
+			continue;
+		}
+		const auto free_bytes = type.statistics.blockBytes - type.statistics.allocationBytes;
+		std::snprintf(line, sizeof(line),
+		              " | type %u (heap %u): %u blocks %" PRIu64 " MB, %u allocations %" PRIu64 " MB (largest %" PRIu64
+		              " MB), free inside blocks %" PRIu64 " MB in %u ranges (largest %" PRIu64 " MB)",
+		              i, properties.memoryTypes[i].heapIndex, type.statistics.blockCount,
+		              static_cast<uint64_t>(type.statistics.blockBytes) >> 20u, type.statistics.allocationCount,
+		              static_cast<uint64_t>(type.statistics.allocationBytes) >> 20u,
+		              type.statistics.allocationCount != 0 ? static_cast<uint64_t>(type.allocationSizeMax) >> 20u : 0,
+		              static_cast<uint64_t>(free_bytes) >> 20u, type.unusedRangeCount,
+		              type.unusedRangeCount != 0 ? static_cast<uint64_t>(type.unusedRangeSizeMax) >> 20u : 0);
+		text += line;
+	}
+	return text;
+}
+
+uint64_t GraphicContext::ImageAllocationBytes(const VulkanImage& image) const {
+	if (allocator == nullptr || image.allocation == nullptr) {
+		return 0;
+	}
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, image.allocation, &info);
+	return info.size;
 }
 
 std::string GraphicContext::DescribeDeviceMemory() const {

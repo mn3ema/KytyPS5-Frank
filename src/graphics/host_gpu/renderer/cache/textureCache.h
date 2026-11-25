@@ -48,6 +48,10 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		// v438zr: the shader reads this texture without filtering (a texel fetch or a size
+		// query), or writes it: such a view keeps every level (a fetch is not clamped by the
+		// minimum LOD). Not part of any lookup.
+		bool          whole_chain = false;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -121,6 +125,7 @@ public:
 	[[nodiscard]] size_t   ImageCount() const noexcept { return m_slot_images.size(); }
 	[[nodiscard]] uint64_t PressureThreshold() const noexcept { return m_pressure_gc_memory; }
 	[[nodiscard]] size_t   EvictableCount() const noexcept { return m_bindless_evictable.size(); }
+	[[nodiscard]] uint64_t EvictableBytes() const noexcept { return m_evictable_bytes; }
 	// v387: the collector's totals since start ([mem-census]): images freed, MB freed, of them
 	// bindless ones (unsampled in the last usage probe), GPU-written ones written back first.
 	struct GcTotals {
@@ -128,6 +133,69 @@ public:
 		         trim_gpu_skipped = 0;
 	};
 	[[nodiscard]] GcTotals GetGcTotals() const;
+	// v438zn [tex-levels]: how much of the texture memory is in levels finer than any view asks
+	// for. A streamed texture's descriptor names the whole chain and a base level; the game maps
+	// memory for the levels from the base level on, and the host image is made for the whole chain.
+	// Counted over registered images with more than one level, one sample, a host image and no
+	// GPU writes; `pinned_*` is the part of each number that heap textures hold.
+	struct LevelCensus {
+		uint64_t images = 0, bytes = 0, pinned_bytes = 0;
+		// Levels finer than the finest level any view has asked for since the image was made.
+		uint64_t unasked_images = 0, unasked_bytes = 0, unasked_pinned_bytes = 0;
+		// Of those bytes: in guest memory the game does not have mapped now.
+		uint64_t unasked_unmapped_bytes = 0;
+		// Levels finer than the base level of the view asked for last.
+		uint64_t below_latest_images = 0, below_latest_bytes = 0, below_latest_pinned_bytes = 0;
+		// Images no view has asked for at all.
+		uint64_t unviewed_images = 0, unviewed_bytes = 0;
+	};
+	[[nodiscard]] LevelCensus GetLevelCensus();
+	// v438zo [tex-share]: whether the texture memory is held once. Over every registered image with
+	// a host image and a guest range: the guest bytes they are accounted with, the bytes the
+	// allocator gave them, the bytes of guest memory their ranges cover together (less than the
+	// sum when images share memory), the images whose range lies inside another image's, and the
+	// bytes of their ranges the game does not have mapped now.
+	struct ShareCensus {
+		uint64_t images = 0, bytes = 0, host_bytes = 0, covered_bytes = 0;
+		uint64_t inside_images = 0, inside_bytes = 0, same_range_images = 0, same_range_bytes = 0;
+		uint64_t unmapped_images = 0, unmapped_bytes = 0;
+		uint64_t pinned_images = 0, pinned_bytes = 0, pinned_covered_bytes = 0;
+		uint64_t gpu_written_bytes = 0;
+	};
+	[[nodiscard]] ShareCensus GetShareCensus();
+	// v438zp [tex-reach]: [tex-share] counts an image as not mapped from its first unmapped byte
+	// on, and a chain's finest level comes first: 5 GB "not mapped" (E1) is then either images
+	// the game dropped, or chains whose finest levels the game has not mapped and keeps out of
+	// reach with the descriptor's minimum LOD. This census tells them apart, level by level. Over
+	// the images of LevelCensus:
+	struct ReachCensus {
+		uint64_t images = 0, bytes = 0;
+		// Levels finer than any view can reach (base level plus the whole part of its LOD clamp).
+		uint64_t out_of_reach_images = 0, out_of_reach_bytes = 0, out_of_reach_pinned_bytes = 0;
+		uint64_t out_of_reach_unmapped_bytes = 0; // of them: not mapped by the game
+		// Levels a view can reach whose memory the game has not mapped (they upload as zeros).
+		uint64_t reachable_unmapped_images = 0, reachable_unmapped_bytes = 0;
+		// Images with no level mapped at all.
+		uint64_t no_level_mapped_images = 0, no_level_mapped_bytes = 0;
+		// Levels finer than the last view can reach.
+		uint64_t below_latest_reach_bytes = 0;
+		// Images whose views carry a LOD clamp of one level or more.
+		uint64_t clamped_images = 0;
+		// The check on the test itself: bytes the range table calls not mapped whose first byte the
+		// backing store can still read (the two tables disagree; should be 0).
+		uint64_t unmapped_but_readable_bytes = 0;
+	};
+	[[nodiscard]] ReachCensus GetReachCensus();
+	// v438zr [tex-sparse]: the sparse images, the memory bound to them, and the bytes of their
+	// levels that have none.
+	struct SparseCensus {
+		uint64_t images = 0, bound_bytes = 0, unbound_bytes = 0, partly_images = 0, binds = 0;
+		// v438zu: levels that have memory but are finer than the last view can reach (by guest
+		// size): what unbinding could free. Small as long as the game unmaps what it drops, since
+		// an unmap frees the image and it is made again with the levels in reach.
+		uint64_t idle_images = 0, idle_bytes = 0;
+	};
+	[[nodiscard]] SparseCensus GetSparseCensus();
 	// Image bytes the collector may free: all but the bindless-pinned ones (refreshed once a frame).
 	// v392: under memory pressure (the trim mark or the shared shortfall) the pinned images the
 	// last usage probe found unsampled count too: the collector may free them then, and with only

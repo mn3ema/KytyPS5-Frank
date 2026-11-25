@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/syncToggle.h"
 #include "graphics/host_gpu/timeline.h"
 #include "common/fpsLog.h"
 
@@ -327,9 +328,22 @@ void LogCountersIfDue() {
 void NoteGoodPair(uint64_t vs_addr, uint64_t ps_addr) {
 	thread_local std::unordered_set<uint64_t> known;
 	const auto                                key = PairKey(vs_addr, ps_addr);
-	if (!known.insert(key).second) {
+	// v445o (KYTY_TIMERS_CUT): the pair of the call before is in `known` (noted below whatever
+	// the cut's state): no second lookup for a run of draws with one pair.
+	constinit thread_local uint64_t last_key   = 0;
+	constinit thread_local bool     last_valid = false;
+	if (last_valid && key == last_key && SyncToggle::TimersCut()) {
+		SyncToggle::Bump(SyncToggle::Hits().pair_memo);
 		return;
 	}
+	SyncToggle::Bump(SyncToggle::Hits().pair_set);
+	if (!known.insert(key).second) {
+		last_key   = key;
+		last_valid = true;
+		return;
+	}
+	last_key   = key;
+	last_valid = true;
 	auto&           pairs = GetGoodPairs();
 	std::unique_lock lock(pairs.mutex);
 	pairs.pairs.insert(key);

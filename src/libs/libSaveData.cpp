@@ -1,3 +1,4 @@
+#include "common/gameStarted.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -680,6 +681,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	     mount->mount_mode, mount->resource);
 
 	*mount_result = {};
+	Common::GameStarted::Trace("mount", mount->dir_name->data, mount->mount_mode);
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name  = mount->dir_name->data;
@@ -741,6 +743,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
                                                SaveDataMemorySetupResult*  result) {
 	PRINT_NAME();
+	Common::GameStarted::Trace("SetupSaveDataMemory2", "", 0);
 
 	if (setup_param == nullptr || setup_param->slot_id >= 4 || setup_param->memory_size == 0 ||
 	    setup_param->memory_size > SAVE_DATA_MEMORY_MAX_SIZE || (setup_param->option & ~3u) != 0) {
@@ -800,6 +803,7 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 
 int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	PRINT_NAME();
+	Common::GameStarted::Trace("GetSaveDataMemory2", "", 0);
 
 	if (get_param == nullptr || get_param->slot_id >= 4) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -844,6 +848,7 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 
 int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param) {
 	PRINT_NAME();
+	Common::GameStarted::Trace("SetSaveDataMemory2", "", 0);
 
 	if (set_param == nullptr || set_param->slot_id >= 4 || set_param->data_num > 5 ||
 	    (set_param->data == nullptr && set_param->data_num != 0)) {

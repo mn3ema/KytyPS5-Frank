@@ -85,6 +85,35 @@ struct SpirvRequirements {
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 
+// The id of a descriptor variable. Everywhere but in a callable split it is a plain id. A module of
+// a callable split with the fixed layout (BindingLayout::rt_fixed) must declare only what its own
+// code uses, in an order its own code decides (IR/RtCallable.h): the ids are reserved before any
+// code is emitted (ReserveRtDescriptors) and the variables whose id was read are declared after it
+// (DefineUsedRtDescriptors). Reading the id (the conversion) marks it; a comparison does not.
+class DescriptorVariable {
+public:
+	DescriptorVariable()                                     = default;
+	DescriptorVariable(const DescriptorVariable&)            = delete;
+	DescriptorVariable& operator=(const DescriptorVariable&) = delete;
+	DescriptorVariable& operator=(uint32_t id) {
+		m_id = id;
+		return *this;
+	}
+	// NOLINTNEXTLINE(google-explicit-constructor)
+	operator uint32_t() const {
+		m_used = true;
+		return m_id;
+	}
+	[[nodiscard]] bool operator==(uint32_t id) const { return m_id == id; }
+	[[nodiscard]] bool operator==(int id) const { return m_id == static_cast<uint32_t>(id); }
+	[[nodiscard]] uint32_t Id() const { return m_id; }
+	[[nodiscard]] bool     Used() const { return m_used; }
+
+private:
+	uint32_t     m_id   = 0;
+	mutable bool m_used = false;
+};
+
 // KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
 bool FloatControlsDisabled(uint64_t shader_hash);
 
@@ -92,7 +121,8 @@ struct ValueEmitContext;
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
-	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
+	    : builder(program_.stage == ShaderType::Mesh || program_.rt_role != IR::RtRole::None ? 0x00010400u
+	                                                                                        : 0x00010300u),
 	      program(program_), input_info(input_info_),
 	      requirements(AnalyzeProgramRequirements(program_)) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
@@ -100,6 +130,14 @@ struct EmitterState {
 		}
 		if (IR::FindBinding(program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
+		}
+		rt_relocate = program.bindings.rt_shared && program.rt_role == IR::RtRole::Callable;
+		if (program.bindings.rt_fixed) {
+			// v442: what this module itself reads and writes (program.blocks is its range).
+			rt_shared = IR::CollectMemoryResources(program, program.blocks, rt_module_buffers);
+			if (input_info.compute != nullptr && input_info.compute->lds_storage) {
+				lds_storage_class = spv::StorageClassStorageBuffer; // not the other modules' business
+			}
 		}
 	}
 
@@ -138,10 +176,10 @@ struct EmitterState {
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
 	uint32_t                                         wave_lds_scope          = 0;
 	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
-	uint32_t                                         storage_buffer_u8_variable = 0;
-	uint32_t                                         storage_buffer_u16_variable = 0;
-	uint32_t                                         storage_buffer_u64_variable = 0;
+	DescriptorVariable                               storage_buffer_variable;
+	DescriptorVariable                               storage_buffer_u8_variable;
+	DescriptorVariable                               storage_buffer_u16_variable;
+	DescriptorVariable                               storage_buffer_u64_variable;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
 	// v424g: the per-draw stride data words (BindingLayout::BufferStrideDword), loaded once at
@@ -156,8 +194,8 @@ struct EmitterState {
 	// The instruction EmitDirectInstruction is emitting, and its lane (gpu_records_ssa bounds).
 	const IR::Inst*                                  emitting_inst           = nullptr;
 	ValueEmitContext*                                emitting_ctx            = nullptr;
-	uint32_t                                         bda_pagetable_variable  = 0;
-	uint32_t                                         fault_buffer_variable   = 0;
+	DescriptorVariable                               bda_pagetable_variable;
+	DescriptorVariable                               fault_buffer_variable;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
 	// One formatted component through a GPU-selected descriptor (see spirvEmitterMemory.cpp);
@@ -165,23 +203,34 @@ struct EmitterState {
 	uint32_t                                         indirect_formatted_function = 0;
 	// v432: BoundFormattedLoad's decode function, without and with coherent (volatile) loads.
 	std::array<uint32_t, 2>                          bound_formatted_function {};
-	uint32_t                                         gds_variable            = 0;
+	// v446a: which branch blocks of this wave32 program take per-lane EXEC/VCC branches
+	// (spirvEmitterFlow.cpp WaveUniformBranch; the others stay wave-uniform); filled when the first
+	// branch asks. wave_per_lane_all: every branch per-lane.
+	bool                                             wave_uniform_ready = false;
+	bool                                             wave_per_lane_all  = false;
+	std::unordered_set<const IR::Block*>             wave_per_lane_blocks;
+	DescriptorVariable                               gds_variable;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         shader_data_storage_variable = 0;
-	uint32_t shader_data_uniform_variable = 0; // KYTY_SHADER_DATA_UBO
-	uint32_t                                         flattened_srt_variable  = 0;
+	DescriptorVariable                               shader_data_storage_variable;
+	DescriptorVariable shader_data_uniform_variable; // KYTY_SHADER_DATA_UBO
+	DescriptorVariable                               flattened_srt_variable;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	// v440 callable split: the payload variable (CallableDataKHR in the ray-generation shader,
+	// IncomingCallableDataKHR in a callable) and the launch built-ins.
+	uint32_t                                         rt_payload_variable = 0;
+	uint32_t                                         rt_launch_id        = 0;
+	uint32_t                                         rt_launch_size      = 0;
 	uint32_t                                         lds_base_dwords         = 0;
-	uint32_t                                         lds_variable            = 0;
-	uint32_t                                         lds_u64_variable        = 0;
+	DescriptorVariable                               lds_variable;
+	DescriptorVariable                               lds_u64_variable;
 	std::array<uint32_t, 2>                          scratch_variable {};
-	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	std::array<DescriptorVariable, IR::ImageBindingCount> image_variables {};
 	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
 	// and the slot EmitImage computed for the instruction being emitted (0 when none).
 	std::map<uint32_t, uint32_t>                     bindless_image_variables;
-	uint32_t                                         bindless_translation_variable = 0;
-	uint32_t                                         bindless_feedback_variable    = 0;
+	DescriptorVariable                               bindless_translation_variable;
+	DescriptorVariable                               bindless_feedback_variable;
 	uint32_t                                         bindless_slot                 = 0;
 	// The raw translation entry behind bindless_slot (BindlessSlotArrayFlag marks a 2D or 2D-array
 	// texture a 3D image instruction samples).
@@ -190,9 +239,9 @@ struct EmitterState {
 	// it: the same instruction emitted against another view type of its texture.
 	uint32_t                                         image_override_index          = UINT32_MAX;
 	IR::ImageResource                                image_override {};
-	uint32_t                                         bindless_sampler_variable     = 0;
+	DescriptorVariable                               bindless_sampler_variable;
 	uint32_t                                         bindless_sampler_slot         = 0;
-	uint32_t                   sampler_variable                      = 0;
+	DescriptorVariable         sampler_variable;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
 	uint32_t                   mesh_allocation                       = 0;
@@ -215,8 +264,17 @@ struct EmitterState {
 	// loop exit is taken, so a loop whose trip count comes from bad data ends instead of hanging
 	// the GPU (structured loops; the dispatcher has its own bound).
 	uint32_t                   loop_guard_variable                   = 0;
+	// v443 (a ray-generation module with loops, KYTY_RT_MISSING_CALL=0: none): function-local,
+	// set once a lane's call target was not in the pipeline's target table (EmitExecuteCallable).
+	uint32_t                   rt_missing_call_variable              = 0;
 	uint32_t                   loop_guard_report_function            = 0; // void(u32 decisions)
+	// v443e: a callable's loop cap (IR::RtCallableLoopLimit) uses the guard's counter with its own
+	// limit and report: void(u32 decisions, u32 pc) (DefineRtLoopCapReport, spirvEmitterRt.cpp).
+	uint32_t                   rt_loop_cap                           = 0;
+	uint32_t                   rt_loop_cap_report_function           = 0;
+	uint32_t                   rt_entry_lanes_variable               = 0; // function-local: the subgroup's lanes at the callable's start
 	std::vector<uint32_t>      loop_guard_merges;
+	std::vector<uint32_t>      rt_call_loop_merges; // v443: the merge blocks of the loops the call is in
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	// KYTY_PROBE_TESS_LEVELS=1 with a probed evaluation shader: gl_TessLevelOuter / Inner inputs.
 	uint32_t                   probe_tess_outer_variable = 0;
@@ -233,6 +291,19 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	// v442, a module of a callable split with the fixed layout (BindingLayout::rt_fixed): the
+	// buffers (resource indices) its own code accesses and whether it uses LDS or GDS.
+	std::vector<uint32_t>      rt_module_buffers;
+	IR::SharedMemoryResources  rt_shared;
+	// v443, a shared callable (BindingLayout::rt_shared, IR/RtCallable.h): the numbers that depend
+	// on its place in the merged program come from its shader record (RtPlaced). The record's
+	// variable, its words so far and the slot of each number by what it means.
+	bool                       rt_relocate        = false;
+	uint32_t                   rt_record_variable = 0;
+	std::vector<uint32_t>      rt_record_words;
+	std::map<std::pair<uint32_t, uint32_t>, uint32_t> rt_record_slots;
+	// The binding index of each memory binding as a value (EmitMemoryOffsets), by binding index.
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> rt_buffer_index_ids {};
 	std::unordered_map<const IR::Block*, uint32_t> labels;
 };
 
@@ -497,6 +568,11 @@ uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
 void     DefineModule(EmitterState& state);
+// v442 (BindingLayout::rt_fixed): declares the descriptor variables the emitted code named.
+void     DefineUsedRtDescriptors(EmitterState& state);
+// The set-1 runtime array of a bindless image's type; a callable split's module declares it at its
+// first use.
+uint32_t BindlessImageVariable(EmitterState& state, const IR::ImageResource& image);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
@@ -541,6 +617,42 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
+// The shader data dword `base` + `index` (a value): only where the data is in the ShaderData
+// storage buffer (a callable split).
+uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t base, uint32_t index);
+
+// v443 (shared callables, IR/RtCallable.h): what a number in a callable's module means when it
+// depends on the callable's place in the merged program. The key is the merged index it is about.
+enum class RtRecordSlot : uint32_t {
+	BufferBinding,  // the index of a memory binding (the buffer array, the offsets and lengths)
+	BufferResource, // the index of a buffer resource (its stride word)
+	ImageArray,     // the index of an image in its kind's array (key: kind << 16 | index)
+	ImageResource,  // the index of an image resource (its bit in the per-draw image flags)
+	ImageMapping,   // the first flattened-SRT word of a bindless image (key: image resource)
+	SamplerArray,   // the index of a sampler in the sampler array (key: sampler resource)
+	SamplerMapping, // the first flattened-SRT word of a bindless sampler (key: sampler resource)
+	UserData,       // the shader-data word of a user-data register (key: the register)
+};
+// A value equal to `value`: the constant, or in a shared callable a load of the shader record's
+// word for (kind, key), which the host fills with `value` for this split.
+uint32_t RtPlaced(EmitterState& state, RtRecordSlot kind, uint32_t key, uint32_t value);
+// Declares the shader record a shared callable's code read (after the code).
+void     DefineRtRecord(EmitterState& state);
+void     DefineRtLoopCapReport(EmitterState& state);
+// KYTY_RT_TRACE_PC=1 in a callable (IR/RtCallable.h): the marks at its start, its end and the end
+// of each guest block.
+enum class RtTraceMark : uint32_t { Start, End, Block };
+uint32_t EmitRtAddressUsable(EmitterState& state, uint32_t address);
+void     EmitRtAddressTrapped(EmitterState& state, uint32_t address, uint32_t site, uint32_t guest = 0);
+bool     RtTracePc(const EmitterState& state);
+void     EmitRtTraceMark(EmitterState& state, RtTraceMark mark, uint32_t pc = 0);
+// The index of memory binding `index` in the buffer arrays, as a value.
+uint32_t BufferBindingIndex(EmitterState& state, uint32_t index);
+
+// v440 callable split: a compute workgroup built-in from the ray-tracing launch (spirvEmitterRt.cpp).
+uint32_t EmitRtWorkgroupInput(EmitterState& state, IR::StageInputKind kind, uint32_t component);
+void     DefineRtInterface(EmitterState& state);
+uint32_t EmitDispatchThreadCount(EmitterState& state, uint32_t axis);
 
 // A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
 [[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
@@ -557,6 +669,9 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+// The byte offset of memory binding `index`'s guest base in its bound range (preloaded by
+// EmitMemoryOffsets).
+uint32_t MemoryByteOffset(EmitterState& state, uint32_t index);
 void EmitSrtVerify(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
@@ -775,9 +890,15 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	                                     std::forward<Fn>(fn));
 }
 
+// The memory scope of LDS accesses: Workgroup, or Device in the ray-tracing stages of a callable
+// split (no Workgroup scope there; their LDS is a storage-buffer region, shared within a wave).
+inline spv::Scope LdsMemoryScope(const EmitterState& state) {
+	return state.program.rt_role != IR::RtRole::None ? spv::ScopeDevice : spv::ScopeWorkgroup;
+}
+
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
-	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+	const auto scope     = kind == IR::ResourceKind::Lds ? LdsMemoryScope(state) : spv::ScopeDevice;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();
 	const auto cont      = state.builder.AllocateId();
@@ -809,6 +930,9 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitAtomicMemoryBarrier(state, kind);
 	return observed;
 }
+
+// v446o (spirvEmitterFlow.cpp): whether the program may take per-lane EXEC/VCC branches.
+bool MayUsePerLaneBranches(EmitterState& state);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 

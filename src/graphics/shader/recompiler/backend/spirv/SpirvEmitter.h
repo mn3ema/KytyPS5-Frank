@@ -9,8 +9,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+// `rt_record` (v443): for a shared callable's module (BindingLayout::rt_shared), the words of its
+// shader record (IR/RtCallable.h).
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  std::vector<uint32_t>* rt_record = nullptr);
 
 // Optional image features of the device, set once by the device layer.
 struct HostImageFeatures {
@@ -50,6 +52,10 @@ bool GetCoherentLoadAcquire();
 // and outputs of every FP32 operation itself, as the guest ALU does. KYTY_DENORM_FTZ_MODE=0 keeps
 // the software flushes.
 void SetDenormFlushToZero32(bool supported);
+// v441a: the device has VK_KHR_shader_maximal_reconvergence (enabled with the ray-tracing
+// pipeline): callable-split modules declare MaximallyReconvergesKHR.
+void SetRtMaximalReconvergence(bool supported);
+bool GetRtMaximalReconvergence();
 bool GetDenormFlushToZero32();
 
 // The device bounds-checks storage buffers to the byte (robustBufferAccess2 with a 1-byte

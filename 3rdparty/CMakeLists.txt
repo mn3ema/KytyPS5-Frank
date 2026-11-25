@@ -125,6 +125,55 @@ else()
 	target_compile_options(imgui PRIVATE -w)
 endif()
 
+# FSR 3.1's host code and Vulkan backend; Kyty supplies the shader blobs (fsr3Blobs.cpp) and the
+# Vulkan functions the backend calls directly (fsr3.cpp).
+set(ffx_dir "${CMAKE_CURRENT_SOURCE_DIR}/FidelityFX-SDK")
+add_library(fidelityfx_fsr3 STATIC
+	"${ffx_dir}/sdk/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp"
+	"${ffx_dir}/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp"
+	"${ffx_dir}/sdk/src/components/opticalflow/ffx_opticalflow.cpp"
+	"${ffx_dir}/sdk/src/backends/vk/ffx_vk.cpp"
+	"${ffx_dir}/sdk/src/backends/shared/ffx_shader_blobs.cpp"
+	"${ffx_dir}/sdk/src/shared/ffx_assert.cpp"
+	"${ffx_dir}/sdk/src/shared/ffx_breadcrumbs_list.cpp"
+	"${ffx_dir}/sdk/src/shared/ffx_message.cpp"
+	"${ffx_dir}/sdk/src/shared/ffx_object_management.cpp"
+)
+target_include_directories(fidelityfx_fsr3 PUBLIC
+	"${ffx_dir}/sdk/include"
+	"${ffx_dir}/sdk/src/backends/shared" # the blob accessor's declarations
+	"${ffx_dir}/kyty"                    # the frame interpolation swapchain's Vulkan function list
+)
+target_include_directories(fidelityfx_fsr3 PRIVATE "${ffx_dir}/sdk/src/shared")
+target_compile_definitions(fidelityfx_fsr3 PRIVATE FFX_FSR3UPSCALER FFX_FI FFX_OF)
+# The frame interpolation swapchain (frame generation's presents and pacing) is Windows code
+# (threads, critical sections). Its direct Vulkan calls go through Kyty's pointers (ffx_vk_fi_loader.h).
+set(ffx_fi_swapchain_dir "${ffx_dir}/sdk/src/backends/vk/FrameInterpolationSwapchain")
+set(ffx_fi_swapchain_src
+	"${ffx_fi_swapchain_dir}/FrameInterpolationSwapchainVK.cpp"
+	"${ffx_fi_swapchain_dir}/FrameInterpolationSwapchainVK_DebugPacing.cpp"
+	"${ffx_fi_swapchain_dir}/FrameInterpolationSwapchainVK_Helpers.cpp"
+	"${ffx_fi_swapchain_dir}/FrameInterpolationSwapchainVK_UiComposition.cpp"
+)
+if(WIN32)
+	target_sources(fidelityfx_fsr3 PRIVATE ${ffx_fi_swapchain_src})
+	target_compile_definitions(fidelityfx_fsr3 PRIVATE KYTY_FFX_FRAME_INTERPOLATION_SWAPCHAIN=1)
+endif()
+target_link_libraries(fidelityfx_fsr3 PUBLIC Vulkan::Headers)
+# ffx_util.h calls std::popcount at C++20 without including <bit>.
+if(MSVC)
+	target_compile_options(fidelityfx_fsr3 PRIVATE /W0 /FIbit)
+	set_source_files_properties("${ffx_dir}/sdk/src/backends/vk/ffx_vk.cpp" PROPERTIES
+		COMPILE_OPTIONS "/FI${ffx_dir}/kyty/ffx_vk_loader.h")
+	set_source_files_properties(${ffx_fi_swapchain_src} PROPERTIES
+		COMPILE_OPTIONS "/FI${ffx_dir}/kyty/ffx_vk_fi_loader.h")
+else()
+	# ffx_portable.h: <bit>, plus the MSVC CRT names (_countof, wcscpy_s, ...) the SDK's portable code calls.
+	target_compile_options(fidelityfx_fsr3 PRIVATE -w -include "${ffx_dir}/kyty/ffx_portable.h")
+	set_source_files_properties("${ffx_dir}/sdk/src/backends/vk/ffx_vk.cpp" PROPERTIES
+		COMPILE_OPTIONS "-include;${ffx_dir}/kyty/ffx_vk_loader.h")
+endif()
+
 set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
 set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
@@ -181,6 +230,9 @@ if (NOT TARGET FFmpeg::ffmpeg)
 endif()
 
 file(GLOB LIBATRAC9_SOURCES LibAtrac9/C/src/*.c)
+# v446m: unpack.c with a band-extension bounds check (src/libs/ajm/libatrac9/unpack.c).
+list(FILTER LIBATRAC9_SOURCES EXCLUDE REGEX "/unpack\\.c$")
+list(APPEND LIBATRAC9_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../src/libs/ajm/libatrac9/unpack.c")
 add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
 target_include_directories(LibAtrac9 PUBLIC LibAtrac9/C/src)
 if(MSVC)

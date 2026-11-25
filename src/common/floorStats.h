@@ -46,6 +46,39 @@ struct Counters {
 	std::atomic<uint64_t> replayed {0};          // multi-draw sub-draws replayed
 	std::atomic<uint64_t> dispatches {0};        // DispatchDirect + DispatchIndirect packets
 	std::atomic<uint64_t> cmd_buffers {0};       // command buffers submitted
+	// Smoothness plan (11-16): what a long frame held ([long-frame], renderDoc.cpp).
+	std::atomic<uint64_t> gpu_wait_ns {0};       // GPU thread waiting for the host GPU (scheduler Wait/Finish)
+	std::atomic<uint64_t> gpu_waits {0};         //   waits
+	std::atomic<uint64_t> ring_wait_ns {0};      //   of it: an upload ring wrapped onto bytes the GPU still needs
+	std::atomic<uint64_t> tex_created {0};       // images made
+	std::atomic<uint64_t> tex_created_bytes {0};
+	std::atomic<uint64_t> tex_uploads {0};       // image uploads (guest bytes read, detiled, copied)
+	std::atomic<uint64_t> tex_upload_bytes {0};
+	std::atomic<uint64_t> tex_deleted {0};       // images deleted
+	std::atomic<uint64_t> heap_keys {0};         // heap textures settled in a feedback round (a draw asked)
+	std::atomic<uint64_t> gpu_unmaps {0};        // ranges unmapped on the GPU thread
+	std::atomic<uint64_t> amm_batches {0};       // the game's map/unmap batches (any thread)
+	std::atomic<uint64_t> amm_batch_ns {0};      //   time in them
+	std::atomic<uint64_t> amm_wait_ns {0};       //   of it: waiting on an address or a counter
+	std::atomic<uint64_t> buf_created {0};       // guest buffers made (a new range, or a merge of older ones)
+	std::atomic<uint64_t> buf_created_bytes {0};
+	// Which wall binds (review 9, 11-16): the stages behind the GPU thread, per second in [floor].
+	std::atomic<uint64_t> record_busy_ns {0};    // recording thread: executing chunks (Vulkan calls, vkQueueSubmit)
+	std::atomic<uint64_t> record_drain_ns {0};   // a thread waiting for the recording thread (DrainRecording)
+	std::atomic<uint64_t> record_drains {0};     //   waits that had to block
+	std::atomic<uint64_t> lag_ticks {0};         // command buffers handed off and not finished by the GPU, summed
+	std::atomic<uint64_t> lag_samples {0};       //   over these samples (every 8th submit)
+	// v438zk (next-phase plan, S5 and S2): what became of the flips the game asked for, and texture
+	// bytes uploaded again unchanged, per frame in [long-frame].
+	std::atomic<uint64_t> flip_requests {0};     // flips the game asked for (FlipQueue::Reserve)
+	std::atomic<uint64_t> flip_replaced {0};     //   replaced by a newer request before they were shown
+	std::atomic<uint64_t> flip_refused {0};      //   refused: the port's flip queue was full
+	std::atomic<uint64_t> flip_cancelled {0};    //   cancelled (the port closed or changed, a failed prepare)
+	std::atomic<uint64_t> flip_held {0};         // a ready flip the present thread held back (flip rate, vblank)
+	std::atomic<uint64_t> tex_again {0};         // uploads of bytes uploaded before (KYTY_TEX_UPLOAD_STATS)
+	std::atomic<uint64_t> tex_same_bytes {0};    //   of their bytes: unchanged since that upload
+	std::atomic<uint64_t> expand_ns {0};         // v438zl: compute lookups that expanded their functions: time
+	std::atomic<uint64_t> expand_slow {0};       //   of them, the ones over KYTY_EXPAND_SLOW_MS (5 ms)
 };
 
 inline Counters& Get() {

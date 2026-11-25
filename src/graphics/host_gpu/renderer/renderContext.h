@@ -116,6 +116,12 @@ public:
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	                                     uint64_t size) const noexcept;
+	// v445s (KYTY_FAST_FINISH_CLEANREAD / toggle mode "ffclean", with fastfinish on). A game
+	// thread's read faulted on a page watched because the GPU wrote to it. 1: no GPU-written
+	// byte is left on the page and its protection is lifted, the access runs again; 2
+	// (KYTY_FAST_FINISH_VERIFY): it would have been, the caller takes the ordinary readback, which
+	// is compared; 0: the caller emulates the load as before.
+	[[nodiscard]] int TryLiftCleanReadPage(uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

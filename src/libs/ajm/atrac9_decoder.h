@@ -5,9 +5,11 @@
 #include "libs/ajm/decoder.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -217,6 +219,10 @@ public:
 			if (ret != 0) {
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 				result.internal_result = ret;
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::fprintf(stderr, "[atrac9] frame rejected by the decoder (status %d)\n", ret);
+				}
 				break;
 			}
 			if (bytes_used <= 0 || static_cast<size_t>(bytes_used) > remaining_input ||

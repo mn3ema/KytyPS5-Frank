@@ -17,6 +17,10 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -108,14 +112,98 @@ struct PipelineVertexInputState {
 	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
+// v440 M3: a callable split's callables (callable index i: call target targets[i]).
+struct RtCallables {
+	std::vector<vk::ShaderModule> modules;
+	std::vector<uint64_t>         targets;
+	uint32_t                      generation = 0; // of the shader's target set (pipelineCache.cpp)
+	uint32_t                      safe_from  = 0; // v442b: no older generation may stand in for this one
+	// v443: each callable's shader record words (IR/RtCallable.h; empty: none), written after its
+	// group handle in the shader binding table.
+	std::vector<std::vector<uint32_t>> records;
+	// v443e: each callable's code hash (IR::RtCodeHash), which its loop cap's report carries.
+	std::vector<uint32_t>              code_hashes;
+};
+
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
 	uint32_t         spirv_words = 0;
 	uint64_t         hash        = 0;
+	// KYTY_POPS_NOINTERLOCK=1 (v438zh): for a pixel shader whose module has a fragment interlock
+	// execution mode, the same SPIR-V without the interlock (StripPixelInterlock), made with the
+	// module; null otherwise. Only draws that cannot put two fragments on one pixel take it
+	// (RenderExecutor::ExecutePreparedDraw). Flags: PopsTwinFlag.
+	vk::ShaderModule no_interlock_module = nullptr;
+	uint32_t         no_interlock_flags  = 0;
+	// KYTY_POPS_BUFFER_COHERENT=0 (v438zi): for a pixel shader with a fragment interlock that only
+	// reads its storage buffers, the same SPIR-V (interlock included) without the Coherent
+	// decoration on its storage buffer arrays (StripBufferCoherent); null otherwise.
+	vk::ShaderModule plain_buffers_module = nullptr;
+	// v440 M3 (KYTY_RT_CALLABLES): a callable split of a ray-tracing shader. `module` is then its
+	// ray-generation shader and these its callables (callable index i: call target i); the pipeline
+	// is a ray-tracing pipeline (PipelineCache::GetComputePipeline) traced instead of dispatched.
+	// Owned by the program cache's permutation (stays trivially copyable for DrawRenderState).
+	const struct RtCallables* rt_callables = nullptr;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
+
+// KYTY_POPS_NOINTERLOCK=1 (v438zh, experiment, off by default). A primitive-ordered pixel shader
+// is emitted with a fragment interlock and with Coherent storage images and buffers; the interlock
+// orders and excludes the fragments that land on one pixel, and the decorations make their
+// stores visible to each other. A draw that cannot put two fragments on one pixel needs neither.
+// On this NVIDIA driver the decorations are what costs (review 9/10, PS 2209aa94: 724 us a call
+// as emitted, 744 with an empty section, 800 without the interlock but with the decorations, 165
+// without both); the execution mode alone costs nothing measurable.
+// - Host side only: the twin module is the cached SPIR-V with the interlock and those
+//   decorations taken out (StripPixelInterlock), made when the module is made. The recompiler,
+//   its output and the shader disk cache are untouched.
+// - The twin's pipelines are keyed by the program id with PopsNoInterlockIdBit set.
+[[nodiscard]] bool PopsNoInterlockEnabled();
+enum PopsTwinFlag : uint32_t {
+	// The SPIR-V reads gl_PrimitiveID: its draws are not recorded triangle by triangle.
+	PopsTwinReadsPrimitiveId = 1u << 0u,
+	// KYTY_POPS_NOINTERLOCK_COHERENT (StripPixelInterlock), for the log: Coherent taken from the
+	// storage image arrays / the storage buffer arrays / everything (mode 0), and "the module
+	// polls memory or has atomics: its Coherent decorations stay" (modes 2 to 4).
+	PopsTwinImagesNotCoherent  = 1u << 1u,
+	PopsTwinBuffersNotCoherent = 1u << 2u,
+	PopsTwinCoherentRemoved    = 1u << 3u,
+	PopsTwinCoherentNeeded     = 1u << 4u,
+};
+inline constexpr uint64_t PopsNoInterlockIdBit = uint64_t {1} << 62u;
+// KYTY_POPS_BUFFER_COHERENT=0 (v438zi, experiment, off by default). The recompiler makes every
+// storage buffer array of a primitive-ordered pixel shader Coherent, for the case that the shader
+// reads and writes a buffer inside its ordered section. Coherent asks that a load sees the stores
+// other invocations made to that memory. In a shader that never stores to its buffers there are
+// no such stores, in any draw, with or without overlapping fragments: the decoration only tells
+// the driver's compiler that every one of the shader's buffer loads (2209aa94: 139 of them, in
+// and around 4 loops) may change under it. The twin module has the interlock and the images'
+// Coherent decorations as they were; only the buffer arrays lose theirs. Taken for every draw of
+// the shader (no draw is split) unless a vertex stage of the draw writes memory.
+// - Made only when the recompiler's own record says the program writes no buffer, has no buffer
+//   atomics and no address writes, and the SPIR-V agrees: no store, copy or call through a
+//   pointer into a buffer array, no Volatile access, no atomic operation, no memory barrier.
+// - Pipelines keyed by the program id with PopsPlainBuffersIdBit set; no recipes.
+[[nodiscard]] bool PopsPlainBuffersEnabled();
+inline constexpr uint64_t PopsPlainBuffersIdBit = uint64_t {1} << 61u;
+// The recompiler's side of the conditions above: the program writes no buffer, has no buffer
+// atomics and no address writes. One test for the module's creation and the library warm-up
+// (v438zk), so both make a twin for the same shaders.
+[[nodiscard]] bool PopsPlainBuffersProgram(const ShaderRecompiler::IR::CompiledShaderInfo& program);
+// `out`: `spirv` without the Coherent decoration on its storage buffer arrays. False when the
+// module has no interlock execution mode, fails the SPIR-V conditions above, or has no such
+// decoration. `arrays`: decorations removed; `loads`: loads through those arrays.
+[[nodiscard]] bool StripBufferCoherent(std::span<const uint32_t> spirv, std::vector<uint32_t>& out,
+                                       uint32_t& arrays, uint32_t& loads);
+// `out`: `spirv` without the interlock: no interlock execution mode, no
+// OpBegin/EndInvocationInterlockEXT, no interlock capability or extension; everything else word
+// for word, but for the Coherent decorations KYTY_POPS_NOINTERLOCK_COHERENT takes out (shaders.cpp).
+// False (and `out` unspecified) when `spirv` has no interlock execution mode or is malformed.
+// `removed`: the begin/end instructions taken out.
+[[nodiscard]] bool StripPixelInterlock(std::span<const uint32_t> spirv, std::vector<uint32_t>& out,
+                                       uint32_t& flags, uint32_t& removed);
 
 // Everything vkCreateGraphicsPipelines reads for one graphics pipeline, owned in one place so the
 // driver compile can run on a worker thread (the structures point into each other: it stays
@@ -188,6 +276,10 @@ class PipelineCompiler;
 // their pipeline compiles (pipelineCache.cpp).
 bool SmallColorTargetDraw(const HW::Context& context);
 
+// v440 M3: KYTY_RT_CALLABLES=<hash,...> names the compute shaders that run as callable splits on the
+// ray-tracing pipeline (ray generation + one callable per call target), on a device that has it.
+[[nodiscard]] bool RtCallablesFor(uint64_t shader_hash);
+
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
@@ -215,6 +307,39 @@ public:
 		uint32_t                bindless_set          = 1;
 		// Samples bindless images: descriptor set 1 is the bindless table.
 		bool                    uses_bindless         = false;
+		// v440 M3 (KYTY_RT_CALLABLES): a ray-tracing pipeline of a callable split, traced instead of
+		// dispatched (ray generation group 0, callable i group i + 1), with its shader binding table.
+		bool                              ray_tracing = false;
+		vk::StridedDeviceAddressRegionKHR rt_raygen_region {};
+		vk::StridedDeviceAddressRegionKHR rt_callable_region {};
+		vk::Buffer                        rt_sbt_buffer = nullptr;
+		vk::DeviceMemory                  rt_sbt_memory = nullptr;
+		// The call targets' table (IR/RtCallable.h): its device address goes into the shader data.
+		uint64_t                          rt_target_table = 0;
+		// v443: the binding table buffer's device address range (named in a device-fault report).
+		uint64_t                          rt_sbt_address = 0;
+		uint64_t                          rt_sbt_bytes   = 0;
+		// v440s: the pipeline libraries it was linked from (the NVIDIA driver reads them after
+		// linking: g440r crashed in the group-handle query after they were destroyed). v442: shared
+		// with the split's other generations; each entry is one use, given back by
+		// ReleaseRtLibraries.
+		std::vector<vk::Pipeline>         rt_libraries;
+		// v442: pipeline_layout and descriptor_set_layout are the fixed layout's shared objects
+		// (BindingLayout::rt_fixed, shaders.cpp): not this pipeline's to destroy.
+		bool                              rt_shared_layouts = false;
+		// The counters after the target table (IR/RtCallable.h), host-mapped (v443e: always, for the
+		// callables' loop cap; the call-site counters are written with KYTY_RT_COUNT=1: rt_count).
+		const uint32_t*                   rt_counters = nullptr;
+		bool                              rt_count     = false;
+		uint32_t                          rt_cap_hits  = 0; // the loop cap hits already reported
+		uint32_t                          rt_stack_bytes = 0; // v443q: KYTY_RT_STACK_BYTES (0: the driver's)
+		uint32_t                          rt_trap_hits = 0; // v443j: address-trap reads already reported
+		// Set while a worker builds this ray-tracing pipeline (KYTY_RT_ASYNC, default on): its
+		// dispatches are skipped until it is true.
+		std::shared_ptr<std::atomic<bool>> rt_ready;
+		// v443: its queued build was dropped for a newer generation's; queued again if it is
+		// dispatched after all (GetComputePipeline).
+		std::shared_ptr<std::atomic<bool>> rt_dropped;
 		// Set while a worker compiles `pipeline`; draws skip it until the compile finishes.
 		std::shared_ptr<PendingGraphicsPipeline> pending;
 		// Step D6: a linked pipeline's optimized link, made in the background; bound instead of
@@ -296,6 +421,11 @@ public:
 	                                 const GraphicsPrograms& programs, bool may_defer);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// v440u: a callable split's dispatch with its built pipeline (GPU thread). Once a shader runs a
+	// newer generation, its older generations' pipelines (and their libraries and binding tables)
+	// are destroyed when the GPU has passed `tick` (is_free). KYTY_RT_RETIRE=0 keeps them.
+	void NoteRtDispatch(uint64_t shader_hash, uint32_t generation, uint64_t program_id, uint64_t tick,
+	                    const std::function<bool(uint64_t)>& is_free);
 
 private:
 	struct ProgramCache;
@@ -354,6 +484,27 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// v440 M3 (KYTY_RT_ASYNC): one worker builds the callable splits' ray-tracing pipelines, one at a
+	// time; a queued build is dropped when a newer program of the same shader is queued.
+	struct RtBuildJob {
+		Pipeline*              target = nullptr;
+		ShaderComputeInputInfo input_info;
+		ShaderProgram          program;
+		uint64_t               shader_hash = 0;
+		bool                   superseded  = false;
+	};
+	std::unordered_map<uint64_t, uint32_t> m_rt_last_ready; // shader hash -> generation
+	struct RtGenerationPipelines {
+		uint32_t                                newest = 0;
+		std::vector<std::pair<uint32_t, uint64_t>> used; // generation, program id
+	};
+	std::unordered_map<uint64_t, RtGenerationPipelines> m_rt_used;     // shader hash ->
+	std::vector<std::pair<uint64_t, uint64_t>>          m_rt_retiring; // program id, tick
+	std::mutex                         m_rt_mutex;
+	std::condition_variable            m_rt_wake;
+	std::deque<RtBuildJob>             m_rt_jobs;
+	bool                               m_rt_stop = false;
+	std::thread                        m_rt_builder;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
 	struct DriverCacheSaver;
@@ -415,11 +566,13 @@ enum class ZeroCompileEvent : uint32_t { Translation, LedgerRecord, SlowLibrary,
 int LastPipelineCacheHit();
 void ZeroCompileNote(ZeroCompileEvent event, uint64_t hash, double ms);
 void ZeroCompileReport(const char* when);
+uint64_t ZeroCompileCount(ZeroCompileEvent event);
 // Step D4: one stage's library made as a linked pipeline would make it, into `driver_cache`.
 // `keep` (the library prefetch): it stays alive in the linked pipelines' shared map instead.
+void GplMissLogWarmState(const GraphicContext& graphics); // v438s diagnosis
 bool GplWarmLibrary(GraphicContext& graphics, vk::PipelineCache driver_cache, ShaderType stage,
                     std::span<const uint32_t> spirv, const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                    bool keep = false);
+                    bool keep = false, bool* cache_miss = nullptr);
 // Library prefetch: the stage libraries of a shader pair the draw-prep scanner saw before the GPU
 // thread reached its draw are made on worker threads from the shader list's compiled records
 // (cache hits after the warm-up) and kept, so the draw's pipeline only links. KYTY_GPL_PREFETCH=0
@@ -476,6 +629,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+// v440 M3: the ray-tracing pipeline of a callable split (ShaderProgram::rt_callables) and its shader
+// binding table; the layout is the compute one with the ray-generation and callable stages.
+void CreateRtPipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                              const ShaderComputeInputInfo& input_info, const ShaderProgram& program,
+                              vk::PipelineCache driver_cache);
+// v442: gives back the pipeline's uses of its pipeline libraries (Pipeline::rt_libraries) when the
+// pipeline is destroyed; a library no pipeline uses any more is destroyed (shaders.cpp).
+void ReleaseRtLibraries(GraphicContext& graphics, PipelineCache::Pipeline& pipeline);
+// v442: at shutdown, after every pipeline is destroyed: the callable splits' shared layout objects
+// (Pipeline::rt_shared_layouts) and the libraries kept without a user.
+void DestroyRtShared(GraphicContext& graphics);
 
 } // namespace Libs::Graphics
 

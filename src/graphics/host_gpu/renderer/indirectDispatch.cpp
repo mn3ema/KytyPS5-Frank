@@ -31,6 +31,7 @@ struct PushConstants {
 	uint32_t report_high;
 	uint32_t hash_low;
 	uint32_t hash_high;
+	uint32_t rt_mode;
 };
 
 struct ClampReport {
@@ -52,7 +53,7 @@ IndirectDispatchGroups::IndirectDispatchGroups(GraphicContext& graphics, Command
     : m_graphics(graphics),
       m_groups(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
                vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer |
-                   vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                   vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eTransferDst,
                Entries * EntryDwords * sizeof(uint32_t)),
       m_report(graphics, scheduler, MemoryUsage::Download, 0,
                vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
@@ -111,8 +112,7 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	if ((++m_converted & 511u) == 0u) {
 		Report();
 	}
-	const auto entry  = m_next;
-	m_next            = (m_next + 1u) % Entries;
+	const auto entry  = NextEntry();
 	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
 
 	// The counts come from earlier shader or transfer writes; the entry's previous indirect read
@@ -142,7 +142,7 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	    limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1],
 	    limits.maxComputeWorkGroupCount[2], m_max_total,
 	    static_cast<uint32_t>(report), static_cast<uint32_t>(report >> 32u),
-	    static_cast<uint32_t>(shader_hash), static_cast<uint32_t>(shader_hash >> 32u)};
+	    static_cast<uint32_t>(shader_hash), static_cast<uint32_t>(shader_hash >> 32u), 0u};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1, &write);
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
@@ -163,6 +163,69 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	                        {}, 1, &groups_ready, 0, nullptr, 0, nullptr);
 	return {m_groups.Handle(), offset,
 	        m_groups.BufferDeviceAddress() + offset + 4u * sizeof(uint32_t)};
+}
+
+uint32_t IndirectDispatchGroups::NextEntry() {
+	const auto entry = m_next;
+	m_next           = (m_next + 1u) % Entries;
+	return entry;
+}
+
+IndirectDispatchGroups::RtLaunch IndirectDispatchGroups::ConvertRt(const CommandRecorder&         command,
+                                                                   vk::DeviceAddress              group_counts,
+                                                                   const std::array<uint32_t, 3>& local_size,
+                                                                   uint64_t                       shader_hash) {
+	const auto entry  = NextEntry();
+	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
+	// The counts come from earlier shader or transfer writes; the entry's previous reads finish
+	// before it is rewritten.
+	vk::MemoryBarrier counts_ready {};
+	counts_ready.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	counts_ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader, {}, 1,
+	                        &counts_ready, 0, nullptr, 0, nullptr);
+	const vk::DescriptorBufferInfo info {m_groups.Handle(), 0, VK_WHOLE_SIZE};
+	vk::WriteDescriptorSet         write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+	write.pBufferInfo     = &info;
+	const auto& limits = m_graphics.physical_device_properties.limits;
+	const PushConstants push {static_cast<uint32_t>(group_counts),
+	                          static_cast<uint32_t>(group_counts >> 32u),
+	                          {local_size[0], local_size[1], local_size[2]},
+	                          entry * EntryDwords,
+	                          limits.maxComputeWorkGroupCount[0],
+	                          limits.maxComputeWorkGroupCount[1],
+	                          limits.maxComputeWorkGroupCount[2],
+	                          m_max_total,
+	                          0u,
+	                          0u,
+	                          static_cast<uint32_t>(shader_hash),
+	                          static_cast<uint32_t>(shader_hash >> 32u),
+	                          1u};
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1, &write);
+	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	command.dispatch(1, 1, 1);
+	vk::MemoryBarrier launch_ready {};
+	launch_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	launch_ready.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eShaderRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eDrawIndirect | vk::PipelineStageFlagBits::eRayTracingShaderKHR, {},
+	                        1, &launch_ready, 0, nullptr, 0, nullptr);
+	const auto base = m_groups.BufferDeviceAddress() + offset;
+	return {base, base + 4u * sizeof(uint32_t)};
+}
+
+IndirectDispatchGroups::RtLaunch IndirectDispatchGroups::WriteRtExtents(const CommandRecorder&         command,
+                                                                        const std::array<uint32_t, 3>& extents) {
+	const auto entry  = NextEntry();
+	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
+	const uint32_t words[8] = {extents[0], extents[1], extents[2], 0u, extents[0] * extents[1] * extents[2], 1u, 1u, 0u};
+	command.updateBuffer(m_groups.Handle(), offset, sizeof(words), words);
+	const auto base = m_groups.BufferDeviceAddress() + offset;
+	return {base, base + 4u * sizeof(uint32_t)};
 }
 
 // Every 512 conversions, at most every 5 s: the dispatches emptied since the last report (the

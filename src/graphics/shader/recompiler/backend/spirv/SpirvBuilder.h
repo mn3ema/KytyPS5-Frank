@@ -112,8 +112,10 @@ private:
 	static size_t OperandWordCount(const T& operand) {
 		if constexpr (std::is_integral_v<T> || std::is_enum_v<T>) {
 			return 1;
-		} else {
+		} else if constexpr (requires { std::size(operand); }) {
 			return std::size(operand);
+		} else {
+			return 1; // a class that converts to an id
 		}
 	}
 

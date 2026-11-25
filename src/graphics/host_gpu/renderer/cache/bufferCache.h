@@ -36,12 +36,19 @@ namespace Libs::Graphics {
 [[nodiscard]] uint64_t UploadWorkerPushed();
 void                   WaitUploadWorker(uint64_t upto);
 
+// v445o (KYTY_SYNC_STATS_LOCAL): adds the calling thread's per-sync [floor] counts to the shared
+// counters (bufferCache.cpp RecordSync). Called at every guest flip.
+void FoldSyncCounters() noexcept;
+
 struct GraphicContext;
 class CommandScheduler;
 class TextureCache;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
+
+struct ReadbackCauseSample; // bufferCache.cpp (KYTY_READBACK_CAUSE)
+struct ExactVerifySample;   // bufferCache.cpp (KYTY_EXACT_WRITE_RANGES_VERIFY)
 
 class BufferCache {
 public:
@@ -78,6 +85,10 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// KYTY_FAULT_BENCH (faultBench.cpp) only: what a read-only sync that finds nothing to upload
+	// does to the tracker for the range, and no more: its CPU-dirty pages become CPU-clean and
+	// write-watched, so the next CPU write to them faults. Any thread.
+	void                   FaultBenchArm(uint64_t vaddr, uint64_t size);
 	// RenderContext: what a CPU write fault on [vaddr, vaddr + size) does (buffer cache, texture
 	// cache, bindless table), for host code about to write guest memory itself (CopyBuffer).
 	std::function<void(uint64_t, uint64_t)> on_cpu_write_range;
@@ -86,6 +97,9 @@ public:
 	// v386 [mem-census]: what the cache holds.
 	[[nodiscard]] uint64_t TotalUsedMemory() const noexcept { return m_total_used_memory; }
 	[[nodiscard]] size_t   BufferCount() const noexcept { return m_slot_buffers.size(); }
+	// v0.5b: true when [vaddr, vaddr+size) overlaps a live host zone without fitting inside it
+	// (KYTY_ZONE_CROSS_SNAPSHOT=0: always false).
+	[[nodiscard]] bool CrossesHostZone(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// The existing buffer holding [vaddr, vaddr + size), or NULL_BUFFER_ID; never creates one
 	// (diagnostics: KYTY_BUFFER_PROBE).
@@ -114,7 +128,17 @@ public:
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() {
+		ClearBdaPageTableOnce();
+		return &m_bda_pagetable_buffer;
+	}
+	// v443l: the guest address table starts as zeroes (no page is there). The device does not hand
+	// out zeroed memory, and the table was never cleared: the entry of a page no buffer had ever
+	// been registered for was whatever the memory held, which a shader then took for the page's
+	// device address (g443m: guest 0x10a080dad8 -> dev 0x500001b73). Before the table's first write
+	// or binding, on the GPU thread (as the fault buffer's, FaultManager::GetFaultBuffer).
+	// KYTY_BDA_TABLE_CLEAR=0: not cleared, as before.
+	void ClearBdaPageTableOnce();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	// GPU write bitmap (KYTY_WRITE_BITMAP=1, rework.md Phase 2 first step): one bit per 4 KiB
@@ -167,6 +191,21 @@ public:
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// KYTY_VERTEX_VERIFY=<n> (GPU thread, off unless set): every n-th draw, the bytes the draw
+	// binds for its vertex, index and read-only storage ranges are copied back from the host
+	// buffer and compared with guest memory ([vertex-verify] lines). 0: off.
+	[[nodiscard]] static uint32_t   VertexVerifyInterval();
+	// At the start of a draw: decides whether this draw's ranges are checked.
+	void                            VertexVerifyArm();
+	void                            VertexVerifyDisarm() noexcept { m_vertex_verify_armed = false; }
+	[[nodiscard]] bool              VertexVerifyArmed() const noexcept { return m_vertex_verify_armed; }
+	// A range the armed draw binds: guest [address, address + size) is at host_offset of host.
+	// Records a copy of (a window of) it into the current command buffer and compares the copy
+	// with guest memory when the GPU has run it. Changes nothing the draw reads.
+	[[nodiscard]] int               VertexVerifyGpuOwner(uint64_t address, uint64_t size);
+	void                            VertexVerifyRange(const char* kind, uint32_t slot, uint64_t shader,
+	                                                  uint64_t address, uint64_t size, vk::Buffer host,
+	                                                  uint64_t host_offset);
 	// The next sync of the range uploads it from guest memory (KYTY_SYNC_TOGGLE_MODE=upload).
 	void                            MarkRegionCpuModified(uint64_t vaddr, uint64_t size) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -222,6 +261,17 @@ public:
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
+	// v445s ([readback-cause]): its stage, a ShaderType as a number (0: none or unknown).
+	inline static thread_local uint8_t s_diag_shader_stage = 0;
+	// v445s, KYTY_FAST_FINISH_CLEANREAD / toggle mode "ffclean" (only with fastfinish on). Fault
+	// handler of a game thread, for a read that faulted on a page watched because the GPU wrote to
+	// it: 1 when the page had no GPU-written bytes left and its protection is lifted (the access
+	// runs again), 2 under KYTY_FAST_FINISH_VERIFY when it would have been (the caller sends the
+	// ordinary readback step, which is compared), 0 otherwise (the caller emulates the load).
+	[[nodiscard]] static bool FastFinishCleanReadEnabled();
+	[[nodiscard]] int         TryFastFinishCleanRead(uint64_t fault_vaddr);
+	// The lifted page is still read-watched (another watcher): counted, the load is emulated.
+	static void               NoteCleanReadStillWatched();
 
 	// A ReadMemoryStep result with this bit set names a copy-queue readback (see bufferCache.cpp)
 	// for the caller to complete, instead of a tick to wait for.
@@ -289,6 +339,9 @@ private:
 	static bool           HostZonesInWindows();
 	bool                  CreateHostZoneBuffer(HostZone& zone);
 	void                  DropHostZone(HostZone& zone, const char* reason);
+	// v0.5b: a read crossing a zone's edge is served from a snapshot; the zone stays.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> SnapshotZoneCrossing(uint64_t vaddr, uint64_t size,
+	                                                                bool needs_device_address);
 	friend struct BufferCacheTestAccess;
 
 	void ReleaseBuffer(BufferId id);
@@ -314,8 +367,10 @@ private:
 	void MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked = false);
 	// ReadMemoryStep: drops the pages of the readback window the bitmap shows the GPU did not
 	// write. True with wait_tick set when an asynchronous caller must first wait for that tick.
+	// v445t: clean_page, the faulting pages hold no GPU-written bytes and no download (the caller
+	// lifts them whatever the bitmap says): KYTY_BITMAP_CLEAN_LIFT then skips the wait.
 	bool RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size, bool async,
-	                           uint64_t& wait_tick);
+	                           uint64_t& wait_tick, bool clean_page = false);
 	// When a submission has completed: tracked pages its shaders did not write are released
 	// (no longer GPU-written, no longer protected). GPU thread.
 	void SettleWriteBitmap(uint64_t completed_tick);
@@ -354,6 +409,20 @@ private:
 	// protected when its era's copy is processed.
 	RangeSet                               m_predicted;
 	uint64_t                               m_predicted_generation = 0;
+	// v445c (KYTY_TRACKED_RANGE_MEMO): where m_predicted changed, oldest first, so a tracked binding
+	// can tell a change inside its range from one elsewhere (ObtainBufferTracked). Kept only with
+	// the memo, its verify or KYTY_QUEUE_STATS. Changes up to m_predicted_log_floor are not in it.
+	// Under m_dirty_ranges_mutex, as m_predicted.
+	struct PredictedChange {
+		uint64_t generation = 0; // m_predicted_generation after the change
+		uint64_t begin      = 0;
+		uint64_t end        = 0;
+	};
+	std::vector<PredictedChange> m_predicted_log;
+	uint64_t                     m_predicted_log_floor = 0;
+	// Every change of m_predicted goes through here, right after it (it moves the generation).
+	void               NotePredictedChange(uint64_t begin, uint64_t bytes);
+	[[nodiscard]] bool PredictedChangedIn(uint64_t since_generation, uint64_t vaddr, uint64_t size) const;
 	std::unordered_map<uint64_t, uint64_t> m_predict_seen; // page -> last era written
 	std::unordered_map<uint64_t, uint64_t> m_predict_seen_blocks; // 32-page block -> last era
 	struct BindingPrediction {
@@ -389,7 +458,16 @@ private:
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
 	                                      bool from_gpu_thread, bool async);
 	// Game-thread only, after a normal copy-queue readback published its bytes.
-	[[nodiscard]] bool FastFinishReadback(uint64_t vaddr, uint64_t size);
+	// v445s: lift = false only evaluates the predicate (same locks), for KYTY_FAST_FINISH_VERIFY.
+	[[nodiscard]] bool FastFinishReadback(uint64_t vaddr, uint64_t size, bool lift = true);
+	// v445s, KYTY_READBACK_CAUSE ([readback-cause]; GPU thread). What a game thread's readback is
+	// about to wait for on the main queue, and after the wait whether the write bitmap shows the
+	// faulting page written.
+	void NoteReadbackCauseWait(ReadbackCauseSample& sample, int reason, uint64_t vaddr, uint64_t size,
+	                           uint64_t window_begin, uint64_t window_end);
+	void ResolveReadbackCause(const ReadbackCauseSample& sample);
+	// 1 / 0: the page's bit in the write bitmap as the GPU has left it so far; -1: no bitmap there.
+	[[nodiscard]] int WriteBitmapLiveBit(uint64_t page) const;
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -402,8 +480,10 @@ private:
 	// Copy-queue readbacks (KYTY_COPY_QUEUE_READBACK, default on). GPU thread: when every GPU
 	// write to the window has executed, copies its GPU-written bytes on the second queue and
 	// returns the readback's marker (0: not taken, the caller downloads as before).
+	// v445t: exact_finished, the caller has found no unfinished write reaching the window by the
+	// writes' own ranges (ExactReadbackWindow); the 1 MiB block ticks are not asked.
 	[[nodiscard]] uint64_t TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
-	                                            uint64_t window_end);
+	                                            uint64_t window_end, bool exact_finished = false);
 	// GPU thread: the marker of an unfinished copy-queue readback overlapping the range, or 0.
 	[[nodiscard]] uint64_t FindCopyReadback(uint64_t vaddr, uint64_t size) const;
 	// Any thread: waits until no copy-queue readback is reading a cache buffer (before one is
@@ -412,6 +492,31 @@ private:
 	// GPU thread: the tick the bytes MarkGpuWritten records are written in, by 1 MiB block.
 	void                   NoteGpuWriteTick(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t LatestGpuWriteTick(uint64_t begin, uint64_t end) const;
+	// v445t (KYTY_EXACT_WRITE_RANGES / toggle mode "exactrange"; GPU thread). The writes
+	// NoteGpuWriteTick is told of, each with its own range and tick, while their ticks may still
+	// run (tick order). The block ticks above say "a writer still runs" for a whole 1 MiB block
+	// (and the readback asks them over its 4 MiB window); this log says where.
+	struct PendingWrite {
+		uint64_t begin;
+		uint64_t end;
+		uint64_t tick;
+	};
+	std::deque<PendingWrite> m_pending_writes;
+	// Entries dropped at the log's cap: until this tick has finished every range counts as reached.
+	uint64_t m_pending_writes_overflow = 0;
+	void     NotePendingWrite(uint64_t begin, uint64_t end, uint64_t tick);
+	// Narrows [window_begin, window_end) to its largest part around the pages [page_begin,
+	// page_end) that no unfinished write reaches, on page bounds. False when one reaches the pages
+	// themselves (the readback has to wait for it) or the log cannot tell.
+	[[nodiscard]] bool ExactReadbackWindow(uint64_t page_begin, uint64_t page_end, uint64_t& window_begin,
+	                                       uint64_t& window_end);
+	// KYTY_EXACT_WRITE_RANGES_VERIFY: the GPU's bytes of the window now, copied on the copy queue
+	// (nothing else changes); the main-queue download that follows compares its bytes with them
+	// when it publishes.
+	[[nodiscard]] std::shared_ptr<ExactVerifySample> TakeExactVerifySample(Buffer& buffer, uint64_t page,
+	                                                                      uint64_t window_begin,
+	                                                                      uint64_t window_end);
+	std::shared_ptr<ExactVerifySample> m_exact_verify_pending;
 	struct CopyReadbackSlot {
 		std::mutex                  mutex;
 		std::atomic<uint32_t>       busy {0};
@@ -428,6 +533,9 @@ private:
 		uint64_t                    total_size     = 0;
 		std::vector<vk::BufferCopy> copies;
 		bool                        snapshot       = false; // KYTY_READ_SNAPSHOT
+		// KYTY_READBACK_SUBMIT_THREAD (v445q): 0 while the worker thread has not yet submitted
+		// the slot's copy; the fence is not waited for before.
+		std::atomic<uint32_t>       submitted {1};
 	};
 	// KYTY_READ_SNAPSHOT: the GPU's current bytes of a window whose writers are still running,
 	// copied without waiting for them; and the windows whose snapshot is in guest memory, waiting
@@ -459,6 +567,7 @@ private:
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;
 	Buffer                                             m_bda_pagetable_buffer;
+	bool                                               m_bda_pagetable_cleared = false;
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;
@@ -538,6 +647,9 @@ private:
 	std::vector<UploadRead> m_upload_reads;
 	StreamBuffer                                       m_stream_buffer;
 	StreamBuffer                                       m_download_buffer;
+	bool                                               m_vertex_verify_armed  = false;
+	uint32_t                                           m_vertex_verify_ranges = 0;
+	uint64_t                                           m_vertex_verify_draw   = 0;
 	StreamBuffer                                       m_device_buffer;
 	TextureCache&                                      m_texture_cache;
 	uint64_t                                           m_total_used_memory = 0;

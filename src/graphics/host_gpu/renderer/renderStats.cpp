@@ -366,6 +366,45 @@ void NoteReplay(ReplayNote note) {
 	std::fflush(stderr);
 }
 
+void NoteMultiPacket(MultiPacketNote note, uint64_t count) {
+	if (!Enabled()) {
+		return;
+	}
+	static std::array<std::atomic<uint64_t>, static_cast<size_t>(MultiPacketNote::Count)> counts {};
+	static std::atomic<int64_t> window_start {0};
+	counts[static_cast<size_t>(note)].fetch_add(count, std::memory_order_relaxed);
+	const auto now   = NowMs();
+	auto       start = window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 ||
+	    !window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+		return;
+	}
+	static const char* const names[] = {
+	    "packets",        "sub-draws",     "single",         "indexed-packets",
+	    "indexed-rest",   "indexed-mesh",  "indexed-vertex", "indexed-writes",
+	    "replay-packets", "first-draws",   "first-no-base",  "first-other-commit",
+	    "first-state-changed", "first-same-state"};
+	static_assert(std::size(names) == static_cast<size_t>(MultiPacketNote::Count));
+	const double seconds = static_cast<double>(now - start) / 1000.0;
+	std::string  out     = "[multi-packets]";
+	for (size_t i = 0; i < std::size(names); i++) {
+		const auto n = counts[i].exchange(0, std::memory_order_relaxed);
+		if (n == 0) {
+			continue;
+		}
+		char text[64];
+		std::snprintf(text, sizeof(text), " %s=%.0f/s", names[i], static_cast<double>(n) / seconds);
+		out += text;
+	}
+	out += "\n";
+	std::fputs(out.c_str(), stderr);
+	std::fflush(stderr);
+}
+
 bool Enabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_RENDER_STATS");

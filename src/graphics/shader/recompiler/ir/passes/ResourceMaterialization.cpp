@@ -198,7 +198,9 @@ bool DynamicBufferFormat(const ShaderInfo& info, const ResourceSpecialization& s
 		const char* value = std::getenv("KYTY_BUFFER_DYNAMIC_FORMAT");
 		return value == nullptr || value[0] != '0';
 	}();
-	if (!enabled || !BufferStrideAsData() || index >= info.buffers.size() || index >= 0xffu ||
+	if (!enabled || (info.translation_variant & 1u) != 0u || info.static_buffer_formats != 0u ||
+	    !BufferStrideAsData() ||
+	    index >= info.buffers.size() || index >= 0xffu ||
 	    index >= specialization.buffers.size()) {
 		return false;
 	}
@@ -2821,6 +2823,8 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		    .indirect_search_iterations = image.indirect_search_iterations,
 		    .cube = image.cube,
 		    .bindless = image.bindless,
+		    .bindless_address = image.bindless_address,
+		    .bindless_value = image.bindless_value,
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
@@ -2832,6 +2836,38 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
+			if (indirect.bindless && indirect.value) {
+				// v439b: the shader looks the T#'s words up; the host brings the value heap of
+				// its binding into the draw. The two words stay for the layout's sake.
+				const auto mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+				snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+				snapshot.bindless_heaps.push_back({.image          = i,
+				                                   .mapping_offset = mapping_offset,
+				                                   .value          = true});
+				auto& root                      = specialization.images[i];
+				root.indirect_root              = i;
+				root.indirect_mapping_offset    = mapping_offset;
+				root.indirect_search_iterations = 0;
+				root.bindless                   = true;
+				root.bindless_value             = true;
+				continue;
+			}
+			if (indirect.bindless && indirect.address) {
+				// v439: no table to evaluate; the host patches the image's resource index and
+				// brings every address heap of its binding into the draw.
+				const auto mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+				snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+				snapshot.bindless_heaps.push_back({.image          = i,
+				                                   .mapping_offset = mapping_offset,
+				                                   .address        = true});
+				auto& root                      = specialization.images[i];
+				root.indirect_root              = i;
+				root.indirect_mapping_offset    = mapping_offset;
+				root.indirect_search_iterations = 0;
+				root.bindless                   = true;
+				root.bindless_address           = true;
+				continue;
+			}
 			if (indirect.bindless) {
 				DescriptorValue table_value;
 				if (!clean.EvaluateDescriptor(indirect.table_source, table_value) ||
@@ -3195,6 +3231,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.bindless                   = source.bindless;
+		image.bindless_address           = source.bindless_address;
+		image.bindless_value             = source.bindless_value;
 		image.cube                       = source.cube;
 		image.dynamic_class              = dynamic_class;
 		image.dynamic_layer              = dynamic_layer;

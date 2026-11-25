@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 8; // 8: MemoryInfo::table_resource; 7: BufferResource::table_read; 6: IndirectDescriptor::storage; 5: BindingLayout::loop_guard
+constexpr uint32_t FormatVersion = 11; // 11: ShaderInfo::static_buffer_formats (v446j); 10: value-keyed bindless images (v439b); 9: address-keyed bindless images (v439); 8: MemoryInfo::table_resource; 7: BufferResource::table_read; 6: IndirectDescriptor::storage; 5: BindingLayout::loop_guard
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -134,6 +134,8 @@ void Visit(Io& io, T& v) {
 	io(v.dynamic_layer);
 	io(v.dynamic_cube);
 	io(v.dynamic_3d);
+	io(v.bindless_address);
+	io(v.bindless_value);
 	io(v.indirect_resources);
 }
 
@@ -192,6 +194,7 @@ void Visit(Io& io, T& v) {
 	io(v.instance_offset_sgpr);
 	io(v.has_bitwise_xor);
 	io(v.uses_dma);
+	io(v.static_buffer_formats);
 }
 
 template <typename Io, typename T>
@@ -215,6 +218,9 @@ void Visit(Io& io, T& v) {
 	io(v.export_mapping);
 	io(v.image_flags);
 	io(v.buffer_stride_count);
+	io(v.rt_fixed);
+	io(v.rt_shared);
+	io(v.rt_image_kinds);
 	io(v.user_data_registers);
 	io(v.descriptors);
 }
@@ -249,6 +255,8 @@ void Visit(Io& io, T& v) {
 	io(v.key_mask);
 	io(v.bindless);
 	io(v.storage);
+	io(v.address);
+	io(v.value);
 	io(v.key_count);
 	io(v.selector_first);
 	io(v.selector_mask);
@@ -345,6 +353,8 @@ void Visit(Io& io, T& v) {
 	io(v.cube);
 	io(v.fmask);
 	io(v.bindless);
+	io(v.bindless_address);
+	io(v.bindless_value);
 }
 
 template <typename Io, typename T>
@@ -401,8 +411,8 @@ static_assert(sizeof(IR::StageInput) == 56);
 static_assert(sizeof(IR::StageOutput) == 48);
 static_assert(sizeof(IR::ShaderInfo) == 192);
 static_assert(sizeof(IR::DescriptorBinding) == 32);
-static_assert(sizeof(IR::BindingLayout) == 72);
-static_assert(sizeof(IR::CompiledShaderInfo) == 304);
+static_assert(sizeof(IR::BindingLayout) == 88); // 88: rt_shared, rt_image_kinds (v443)
+static_assert(sizeof(IR::CompiledShaderInfo) == 320); // 320: BindingLayout +16 (v443)
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);
@@ -412,7 +422,7 @@ static_assert(sizeof(IR::BufferWrite) == 72);
 static_assert(sizeof(IR::UniformFill) == 28);
 static_assert(sizeof(IR::UniformFillPlan) == 96);
 static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 44);
-static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
+static_assert(sizeof(IR::ResourceSpecialization::Image) == 40); // 40: bindless_address, bindless_value (v439)
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
 static_assert(sizeof(IR::ResourceSpecialization) == 72);
 static_assert(sizeof(IR::ResourcePlan) == 856);

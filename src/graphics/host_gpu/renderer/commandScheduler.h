@@ -88,6 +88,12 @@ public:
 	// keep using what the operation releases.
 	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// KYTY_QUEUE_STATS, [op-latency] (v445m, counters only). Inside a deferred operation: the
+	// steady-clock time (ns since its epoch) at which a thread waiting on the timeline alone saw
+	// the operation's tick finished on the GPU; 0 with the stats off or outside an operation.
+	[[nodiscard]] static int64_t OperationDoneNs() noexcept;
+	// A deferred end-of-pipe label is written now; done_ns is its operation's OperationDoneNs().
+	static void                  NoteLabelLatency(int64_t done_ns) noexcept;
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so
 	// vkQueueSubmit (and the queue lock that present also takes) leaves the recording thread.
@@ -139,6 +145,17 @@ public:
 	// Waits until the recording thread has run every queued command, and returns the command
 	// buffer it records into, for code that records directly.
 	vk::CommandBuffer DrainRecording();
+	// v445b (KYTY_DISPATCH_DELTA, renderCompute.cpp): moves whenever the compute bind point's state
+	// (the bound pipeline, the pushed descriptors) may have changed other than by a guest dispatch's
+	// own commit: a compute or ray-tracing pipeline bound through a threaded recorder
+	// (CommandRecorder::bindPipeline: every helper pass binds its own) or raw recording
+	// (DrainRecording). A new command buffer moves CurrentTick() instead. Producer thread only.
+	void                   NoteComputeState() noexcept { m_compute_state_serial++; }
+	[[nodiscard]] uint64_t ComputeStateSerial() const noexcept { return m_compute_state_serial; }
+	// v445d: one per command buffer begun (BeginCommand), whatever ended the one before. The
+	// producer's name for "the command buffer being recorded": with the recording thread the
+	// VkCommandBuffer itself is only known on that thread. A new one has nothing bound.
+	[[nodiscard]] uint64_t CommandSerial() const noexcept { return m_command_serial; }
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -283,8 +300,14 @@ private:
 	std::deque<std::unique_ptr<Chunk>>  m_record_queue;
 	std::vector<std::unique_ptr<Chunk>> m_free_chunks;
 	uint64_t                            m_chunks_dispatched = 0;
+	uint64_t                            m_compute_state_serial = 0; // NoteComputeState()
+	uint64_t                            m_command_serial       = 0; // CommandSerial()
 	uint64_t                            m_chunks_executed   = 0;
 	uint64_t                            m_drains            = 0;
+	uint32_t                            m_lag_sample_counter = 0; // GPU thread ([floor] lag=)
+	// v445e (KYTY_POP_POLL_US): the tick and time of PopPendingOperations' last look at the GPU.
+	uint64_t                              m_pop_poll_tick = 0;
+	std::chrono::steady_clock::time_point m_pop_poll_time {};
 	vk::CommandBuffer                   m_worker_buffer     = nullptr;
 	uint64_t                            m_record_report_buffers = 0;
 	uint64_t                            m_record_report_chunks  = 0;

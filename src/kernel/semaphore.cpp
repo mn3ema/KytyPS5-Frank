@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/guestWait.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -222,6 +223,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
 	waiter.need_count = need_count;
 	AddWaiter(&waiter);
+	const GuestWait::Scope guest_wait(GuestWait::Prim::Sema, this, m_name.c_str());
 
 	while (!waiter.ready) {
 		if ((elapsed >= micros && !infinitely)) {
@@ -408,6 +410,7 @@ public:
 		const bool    timed_wait = (micros != nullptr);
 		Common::Timer timer;
 		timer.Start();
+		LibKernel::GuestWait::Scope guest_wait; // KYTY_GUEST_WAIT_STATS: started when it has to wait
 
 		while (m_count <= 0) {
 			if (timed_wait && elapsed >= *micros) {
@@ -417,6 +420,7 @@ public:
 
 			m_waiters++;
 			SyncGuest();
+			guest_wait.Begin(LibKernel::GuestWait::Prim::Sema, m_guest, "posix sem");
 
 			if (timed_wait) {
 				m_cond_var.WaitFor(&m_mutex, *micros - elapsed);

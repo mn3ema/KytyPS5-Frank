@@ -153,6 +153,11 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 }
 
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
+	if (state.program.rt_role != IR::RtRole::None) {
+		if (const auto value = EmitRtWorkgroupInput(state, kind, component); value != 0) {
+			return value;
+		}
+	}
 	const auto variable = InputVariableForKind(state, kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
@@ -167,6 +172,9 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 }
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	if (state.program.rt_role != IR::RtRole::None) {
+		return EmitRtWorkgroupInput(state, IR::StageInputKind::LocalInvocationIndex, 0);
+	}
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);

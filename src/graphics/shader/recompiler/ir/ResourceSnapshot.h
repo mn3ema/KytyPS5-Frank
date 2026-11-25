@@ -39,6 +39,11 @@ struct BindlessHeapUse {
 	uint32_t table_offset   = 0;
 	uint32_t image          = 0;
 	uint32_t mapping_offset = 0;
+	// v439: an address-keyed image (no table): the host patches its resource index, and every
+	// address heap of its binding takes part in the draw.
+	bool     address        = false;
+	// v439b: a value-keyed image: the value heap of its binding takes part in the draw.
+	bool     value          = false;
 
 	bool operator==(const BindlessHeapUse&) const = default;
 };

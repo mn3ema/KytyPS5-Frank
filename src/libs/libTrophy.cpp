@@ -1,4 +1,5 @@
 #include "common/emulatorConfig.h"
+#include "common/gameStarted.h"
 #include "common/trophies.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "kernel/fileSystem.h"
@@ -7,7 +8,9 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -658,6 +661,20 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 	PRINT_NAME();
 	if (event == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
+	}
+	{
+		// v0.5 panels (Mac 11-25: on a fresh profile the panels stayed into the opening cinematic: the
+		// game writes its first save some 15 s after New Game). PS5 games post activity events (the
+		// system's activity cards) when play starts: "activityStart" / "activityResume" hide the
+		// title panels too (game-neutral). [uds-event] lines: the first 100 event names posted.
+		const auto& posted = *static_cast<const NpUniversalDataSystemEvent*>(event);
+		static std::atomic<int> traced {0};
+		if (traced.fetch_add(1, std::memory_order_relaxed) < 100) {
+			std::fprintf(stderr, "[uds-event] t=%.1f %s\n", Common::GameStarted::Seconds(), posted.name.c_str());
+		}
+		if (posted.name == "activityStart" || posted.name == "activityResume") {
+			Common::GameStarted::Note("the game started an activity");
+		}
 	}
 	std::scoped_lock lock(LibNpTrophy2::g_trophy_mutex);
 	const auto       it = g_contexts.find(context);

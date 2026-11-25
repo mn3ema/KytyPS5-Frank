@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "loader/systemContent.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -8,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/drawPipe.h"
+#include "kernel/guestWait.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -22,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <magic_enum.hpp>
 #include <map>
 #include <optional>
@@ -1233,7 +1236,11 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
+	// PS5 Pro mode (--trinity, a title that supports it) gives the game 1216 MiB more, as upstream does.
+	static uint64_t TotalSize() {
+		return (static_cast<uint64_t>(13824) + (Loader::SystemContentIsTrinityMode() ? 1216u : 0u)) *
+		       1024 * 1024;
+	}
 	static uint64_t           Size() {
 		EXIT_IF(g_flexible_memory_size >= TotalSize());
 		return TotalSize() - g_flexible_memory_size;
@@ -1268,7 +1275,9 @@ public:
 	[[nodiscard]] const std::map<uint64_t, AllocatedBlock>& GetPhysicalBlocks() const {
 		return m_physical;
 	}
-	[[nodiscard]] const std::vector<AllocatedBlock>& GetMappings() const { return m_mappings; }
+	// In the order the mappings were made (a split's right part last), as before v438zk.
+	using MappingList = std::list<AllocatedBlock>;
+	[[nodiscard]] const MappingList& GetMappings() const { return m_mappings; }
 
 private:
 	static void RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start,
@@ -1276,10 +1285,60 @@ private:
 	static void AddFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t size);
 	void        ReclaimAutomatic(uint64_t start, uint64_t size);
 
+	// v438zk (S4): an unmap searched every mapping, erased from the middle of a vector, searched
+	// them all again for the host address and, for automatic memory, a third time: ~0.13 ms a
+	// call with the title's thousands of mappings, 2,200-5,800 calls in one frame when it frees an
+	// area (Mac's play of 11-16: frames of 180-275 ms with the GPU thread idle). The mappings are
+	// now a list in the same order, with three indexes kept under m_mutex:
+	// - by guest address, used only while no two mappings overlap in guest addresses (checked at
+	//   every insert; one overlap ever seen and the search is the old one from then on): the
+	//   first mapping in list order that holds an address is then the only one that does;
+	// - by physical address, for the mappings over a physical range (ReclaimAutomatic);
+	// - how many mappings carry each host range (the last-user test of Unmap).
+	// KYTY_UNMAP_INDEX=0: the searches of before (on the list); =verify: both, and an exit when
+	// they differ.
+	// v438zm (Build C): two more things went through every mapping, and on the list of v438zk
+	// each step of that is a cache miss: SetVirtualRangeMemoryType at every direct map ("set
+	// physical type": 334 us a map in Mac's play of 11-17, 34 us in the play of 11-16 before the
+	// list) and ReclaimAutomatic's walk, whose window was the largest mapping ever made, so one
+	// large mapping made it the whole index ("owner": 1.2 ms an unmap, 0.3 before). 45 s of that
+	// play went there, in frames of 290-440 ms with the GPU thread idle.
+	// - By physical address the mappings are now kept by size class (class c: size <= 2^c). A
+	//   mapping over [start, end) begins below end and above start - 2^c, so each class is asked
+	//   for that window only: exact with any overlaps, and no mapping's size widens another's
+	//   window. A mapping that shrinks in place stays in its class (still an upper bound).
+	// - By guest address the ranges use m_by_vaddr, while the mappings are disjoint there.
+	// KYTY_UNMAP_INDEX=verify also runs the walk over every mapping for each of these and exits
+	// on a difference; =0 is the walk alone.
+	static constexpr uint32_t PhysClasses = 49;
+	[[nodiscard]] static uint32_t PhysClass(uint64_t size) {
+		return size <= 1 ? 0u : std::min<uint32_t>(PhysClasses - 1, static_cast<uint32_t>(std::bit_width(size - 1)));
+	}
+	template <typename Function>
+	void ForEachPhysOverlap(uint64_t start, uint64_t end, Function&& function);
+	// The mappings that overlap [vaddr, vaddr + len) in guest addresses, from the index; false
+	// when the index cannot answer (off, or the mappings are not disjoint) and nothing was called.
+	template <typename Function>
+	bool ForEachVaddrOverlap(uint64_t vaddr, uint64_t len, Function&& function);
+	// The same by a walk over every mapping, in list order.
+	[[nodiscard]] std::vector<MappingList::iterator> WalkVaddrOverlap(uint64_t vaddr, uint64_t len);
+	void                                 IndexAdd(MappingList::iterator it);
+	void                                 IndexRemove(MappingList::iterator it); // before its keys change
+	// [direct-map], once a minute at a map: how large each structure a map or an unmap touches
+	// is, so that a cost that grows with play time can be matched to the one that grew.
+	void                                 ReportSizes();
+	[[nodiscard]] MappingList::iterator  FindForUnmap(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool                   HostRangeMapped(uint64_t host_vaddr, uint64_t host_size);
+	[[nodiscard]] static int             UnmapIndexMode(); // 0 off, 1 on, 2 verify
+
 	std::map<uint64_t, AllocatedBlock> m_physical;
 	std::map<uint64_t, uint64_t>       m_free;
 	std::map<uint64_t, uint64_t>       m_automatic_free;
-	std::vector<AllocatedBlock>        m_mappings;
+	MappingList                        m_mappings;
+	std::map<uint64_t, MappingList::iterator>             m_by_vaddr; // map_vaddr; while m_vaddr_disjoint
+	bool                                                  m_vaddr_disjoint = true;
+	std::array<std::multimap<uint64_t, MappingList::iterator>, PhysClasses> m_by_phys; // start_addr, by size class
+	std::map<std::pair<uint64_t, uint64_t>, uint32_t>     m_host_refs; // {host_vaddr, host_size} -> mappings
 	Common::Mutex                      m_mutex;
 };
 
@@ -1398,7 +1457,15 @@ public:
 	explicit MemoryOperationLock(const char* where) {
 		const auto limit_ms = MemLockLogMs();
 		if (limit_ms == 0 || t_memlock_depth != 0) {
-			g_memory_operation_mutex.lock();
+			if (GuestWait::Enabled()) [[unlikely]] {
+				// KYTY_GUEST_WAIT_STATS: only a lock that finds the mutex held is timed (mem-lock).
+				if (!g_memory_operation_mutex.try_lock()) {
+					const GuestWait::Scope guest_wait(GuestWait::Prim::MemLock);
+					g_memory_operation_mutex.lock();
+				}
+			} else {
+				g_memory_operation_mutex.lock();
+			}
 			t_memlock_depth++;
 			return;
 		}
@@ -1406,6 +1473,7 @@ public:
 		if (!g_memory_operation_mutex.try_lock()) {
 			const char* holder       = g_memlock_holder.load(std::memory_order_relaxed);
 			const auto  holder_since = g_memlock_since_ns.load(std::memory_order_relaxed);
+			const GuestWait::Scope guest_wait(GuestWait::Prim::MemLock);
 			g_memory_operation_mutex.lock();
 			const auto waited = CostNowNs() - wait_begin;
 			if (waited >= uint64_t {limit_ms} * 1000000u && g_memlock_lines.fetch_add(1) < 256u) {
@@ -1566,6 +1634,18 @@ bool IsGpuBufferWritten(uint64_t vaddr, uint64_t size) {
 	return GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
+bool IsGpuBufferPending(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	if (t_gpu_read_delegate || !Graphics::GuestGpu::IsGpuThread()) {
+		return IsGpuBufferWritten(vaddr, size);
+	}
+	DrawPipeDrainForGpuState();
+	auto& buffers = GetGpuResources().GetBufferCache();
+	return buffers.HasGpuDirtyBytes(vaddr, size) || buffers.HasPendingDownload(vaddr, size);
+}
+
 void SetGpuReadDelegate(bool delegate) {
 	t_gpu_read_delegate = delegate;
 }
@@ -1604,6 +1684,10 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 	return g_gpu_resources != nullptr &&
 	       g_gpu_resources->CanServeCleanRead(fault_vaddr, vaddr, size) &&
 	       TryReadBacking(vaddr, data, size);
+}
+
+int TryLiftCleanFaultingPage(uint64_t fault_vaddr) noexcept {
+	return g_gpu_resources != nullptr ? g_gpu_resources->TryLiftCleanReadPage(fault_vaddr) : 0;
 }
 
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -2161,14 +2245,243 @@ void PhysicalMemory::ReclaimAutomatic(uint64_t start, uint64_t size) {
 		automatic = true;
 	}
 	if (automatic) {
-		for (const auto& mapping: m_mappings) {
+		const auto keep_mapped = [&](const AllocatedBlock& mapping) {
 			const auto first = std::max(start, mapping.start_addr);
 			const auto last  = std::min(end, mapping.start_addr + mapping.size);
 			if (first < last) {
 				RemoveFreeRange(m_automatic_free, first, last - first);
 			}
+		};
+		const int mode = UnmapIndexMode();
+		if (mode == 0) {
+			for (const auto& mapping: m_mappings) {
+				keep_mapped(mapping);
+			}
+		} else {
+			// The removals commute, so their order (by class and physical address here, list
+			// order before) does not change the free ranges.
+			std::map<uint64_t, uint64_t> walked;
+			if (mode == 2) {
+				walked = m_automatic_free;
+				for (const auto& mapping: m_mappings) {
+					const auto first = std::max(start, mapping.start_addr);
+					const auto last  = std::min(end, mapping.start_addr + mapping.size);
+					if (first < last) {
+						RemoveFreeRange(walked, first, last - first);
+					}
+				}
+			}
+			ForEachPhysOverlap(start, end, [&](MappingList::iterator mapping) { keep_mapped(*mapping); });
+			if (mode == 2 && walked != m_automatic_free) {
+				EXIT("PhysicalMemory: the physical index and the walk leave different free ranges at 0x%016" PRIx64
+				     "+0x%" PRIx64 "\n",
+				     start, size);
+			}
 		}
 	}
+}
+
+int PhysicalMemory::UnmapIndexMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_UNMAP_INDEX");
+		if (value == nullptr) {
+			return 1;
+		}
+		return value[0] == '0' ? 0 : (std::strcmp(value, "verify") == 0 ? 2 : 1);
+	}();
+	return mode;
+}
+
+template <typename Function>
+void PhysicalMemory::ForEachPhysOverlap(uint64_t start, uint64_t end, Function&& function) {
+	for (uint32_t c = 0; c < PhysClasses; c++) {
+		const auto& index = m_by_phys[c];
+		if (index.empty()) {
+			continue;
+		}
+		// No mapping of this class is larger than 2^c (the last class: any size, asked whole).
+		const uint64_t reach = uint64_t {1} << c;
+		const uint64_t from  = c + 1 == PhysClasses || start < reach ? 0 : start - reach + 1;
+		for (auto it = index.lower_bound(from); it != index.end() && it->first < end; ++it) {
+			const auto& mapping = *it->second;
+			if (mapping.size != 0 && mapping.start_addr + mapping.size > start) {
+				function(it->second);
+			}
+		}
+	}
+}
+
+std::vector<PhysicalMemory::MappingList::iterator> PhysicalMemory::WalkVaddrOverlap(uint64_t vaddr,
+                                                                                    uint64_t len) {
+	std::vector<MappingList::iterator> found;
+	for (auto it = m_mappings.begin(); it != m_mappings.end(); ++it) {
+		if (VirtualRangesOverlap(vaddr, len, it->map_vaddr, it->map_size)) {
+			found.push_back(it);
+		}
+	}
+	return found;
+}
+
+template <typename Function>
+bool PhysicalMemory::ForEachVaddrOverlap(uint64_t vaddr, uint64_t len, Function&& function) {
+	const int mode = UnmapIndexMode();
+	if (mode == 0 || !m_vaddr_disjoint || len == 0 || UINT64_MAX - vaddr < len) {
+		return false;
+	}
+	// Disjoint mappings in address order: the one that begins at or below vaddr, and those that
+	// begin inside the range. Collected first: the callers may change the list.
+	std::vector<MappingList::iterator> found;
+	auto                               at = m_by_vaddr.upper_bound(vaddr);
+	if (at != m_by_vaddr.begin()) {
+		--at;
+	}
+	for (; at != m_by_vaddr.end() && at->first < vaddr + len; ++at) {
+		if (VirtualRangesOverlap(vaddr, len, at->second->map_vaddr, at->second->map_size)) {
+			found.push_back(at->second);
+		}
+	}
+	if (mode == 2) {
+		auto walked = WalkVaddrOverlap(vaddr, len);
+		auto sorted = found;
+		const auto by_node = [](MappingList::iterator a, MappingList::iterator b) { return &*a < &*b; };
+		std::sort(walked.begin(), walked.end(), by_node);
+		std::sort(sorted.begin(), sorted.end(), by_node);
+		if (walked != sorted) {
+			EXIT("PhysicalMemory: the guest-address index and the walk find different mappings at 0x%016" PRIx64
+			     "+0x%" PRIx64 " (%zu and %zu)\n",
+			     vaddr, len, sorted.size(), walked.size());
+		}
+	}
+	for (const auto it: found) {
+		function(it);
+	}
+	return true;
+}
+
+void PhysicalMemory::ReportSizes() {
+	static const auto start = std::chrono::steady_clock::now();
+	static auto       last  = start;
+	const auto        now   = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(60)) {
+		return;
+	}
+	last = now;
+	uint64_t largest = 0;
+	uint32_t classes = 0;
+	for (uint32_t c = 0; c < PhysClasses; c++) {
+		if (!m_by_phys[c].empty()) {
+			classes++;
+			largest = c;
+		}
+	}
+	std::fprintf(stderr,
+	             "[direct-map] t=%.0f mappings %zu (in %u size classes, the largest up to 2^%llu bytes; guest index %zu%s) | "
+	             "physical blocks %zu | free ranges %zu, automatic free %zu | host ranges %zu\n",
+	             std::chrono::duration<double>(now - start).count(), m_mappings.size(), classes,
+	             static_cast<unsigned long long>(largest), m_by_vaddr.size(),
+	             m_vaddr_disjoint ? "" : ", off: mappings overlap", m_physical.size(), m_free.size(),
+	             m_automatic_free.size(), m_host_refs.size());
+}
+
+void PhysicalMemory::IndexAdd(MappingList::iterator it) {
+	const auto& b = *it;
+	m_by_phys[PhysClass(b.size)].emplace(b.start_addr, it);
+	if (b.host_vaddr != 0 && b.host_size != 0) {
+		m_host_refs[{b.host_vaddr, b.host_size}]++;
+	}
+	if (!m_vaddr_disjoint) {
+		return;
+	}
+	// Disjoint from its neighbours in guest-address order (and not empty: an empty mapping holds
+	// no address, but it would hide the one below it from FindForUnmap).
+	const auto next = m_by_vaddr.lower_bound(b.map_vaddr);
+	bool       ok   = b.map_size != 0 && (next == m_by_vaddr.end() || next->first >= b.map_vaddr + b.map_size);
+	if (ok && next != m_by_vaddr.begin()) {
+		const auto& below = *std::prev(next)->second;
+		ok                = below.map_vaddr + below.map_size <= b.map_vaddr;
+	}
+	if (ok) {
+		m_by_vaddr.emplace_hint(next, b.map_vaddr, it);
+	} else {
+		m_vaddr_disjoint = false;
+		m_by_vaddr.clear();
+		std::fprintf(stderr,
+		             "[unmap-index] mappings overlap in guest addresses (0x%" PRIx64 "+0x%" PRIx64
+		             "): unmaps search every mapping from now on, as before v438zk\n",
+		             b.map_vaddr, b.map_size);
+	}
+}
+
+void PhysicalMemory::IndexRemove(MappingList::iterator it) {
+	const auto& b = *it;
+	// In the class of its size when it was added: its size now, or a larger one (it shrank).
+	// The smaller classes are asked last, only so that a mistake here cannot leave the entry.
+	bool       removed = false;
+	const auto own     = PhysClass(b.size);
+	for (uint32_t n = 0; n < PhysClasses && !removed; n++) {
+		const uint32_t c = (own + n) % PhysClasses;
+		for (auto [at, last] = m_by_phys[c].equal_range(b.start_addr); at != last; ++at) {
+			if (at->second == it) {
+				m_by_phys[c].erase(at);
+				removed = true;
+				break;
+			}
+		}
+	}
+	EXIT_IF(!removed);
+	if (b.host_vaddr != 0 && b.host_size != 0) {
+		if (const auto refs = m_host_refs.find({b.host_vaddr, b.host_size});
+		    refs != m_host_refs.end() && --refs->second == 0) {
+			m_host_refs.erase(refs);
+		}
+	}
+	if (m_vaddr_disjoint) {
+		if (const auto at = m_by_vaddr.find(b.map_vaddr); at != m_by_vaddr.end() && at->second == it) {
+			m_by_vaddr.erase(at);
+		}
+	}
+}
+
+// The first mapping in list order that holds [vaddr, vaddr + size), or end().
+PhysicalMemory::MappingList::iterator PhysicalMemory::FindForUnmap(uint64_t vaddr, uint64_t size) {
+	const auto holds = [vaddr, size](const AllocatedBlock& b) {
+		return !(vaddr < b.map_vaddr || vaddr >= b.map_vaddr + b.map_size || size > b.map_vaddr + b.map_size - vaddr);
+	};
+	const auto search = [&] {
+		return std::find_if(m_mappings.begin(), m_mappings.end(), holds);
+	};
+	const int mode = UnmapIndexMode();
+	if (mode == 0 || !m_vaddr_disjoint) {
+		return search();
+	}
+	// Disjoint mappings: only the one with the highest start at or below vaddr can hold it.
+	auto       found = m_mappings.end();
+	const auto above = m_by_vaddr.upper_bound(vaddr);
+	if (above != m_by_vaddr.begin() && holds(*std::prev(above)->second)) {
+		found = std::prev(above)->second;
+	}
+	if (mode == 2 && found != search()) {
+		EXIT("PhysicalMemory: the unmap index and the search disagree at 0x%016" PRIx64 "+0x%" PRIx64 "\n", vaddr, size);
+	}
+	return found;
+}
+
+bool PhysicalMemory::HostRangeMapped(uint64_t host_vaddr, uint64_t host_size) {
+	const auto search = [&] {
+		return std::any_of(m_mappings.begin(), m_mappings.end(), [host_vaddr, host_size](const auto& block) {
+			return block.host_vaddr == host_vaddr && block.host_size == host_size;
+		});
+	};
+	const int mode = UnmapIndexMode();
+	if (mode == 0) {
+		return search();
+	}
+	const bool mapped = m_host_refs.contains({host_vaddr, host_size});
+	if (mode == 2 && mapped != search()) {
+		EXIT("PhysicalMemory: the host-range count and the search disagree at 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+		     host_vaddr, host_size);
+	}
+	return mapped;
 }
 
 bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64_t* size,
@@ -2308,6 +2621,8 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 	mapping.mode           = mode;
 	mapping.gpu_mode       = gpu_mode;
 	m_mappings.push_back(mapping);
+	IndexAdd(std::prev(m_mappings.end()));
+	ReportSizes();
 	if (has_automatic) {
 		RemoveFreeRange(m_automatic_free, phys_addr, len);
 	}
@@ -2424,27 +2739,22 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 		if (host_vaddr_to_release == nullptr || host_vaddr == 0 || host_size == 0) {
 			return;
 		}
-		const bool still_mapped = std::any_of(
-		    m_mappings.begin(), m_mappings.end(), [host_vaddr, host_size](const auto& block) {
-			    return block.host_vaddr == host_vaddr && block.host_size == host_size;
-		    });
-		if (!still_mapped) {
+		if (!HostRangeMapped(host_vaddr, host_size)) {
 			*host_vaddr_to_release = host_vaddr;
 		}
 	};
 
-	for (size_t index = 0; index < m_mappings.size(); ++index) {
-		auto& b = m_mappings[index];
-		if (vaddr < b.map_vaddr || vaddr >= b.map_vaddr + b.map_size ||
-		    size > b.map_vaddr + b.map_size - vaddr) {
-			continue;
-		}
+	// v438zk: found through the index (FindForUnmap); what is done with it is as before, with the
+	// indexes following every change of a mapping's start or of the list.
+	if (const auto it = FindForUnmap(vaddr, size); it != m_mappings.end()) {
+		auto& b = *it;
 		*gpu_mode             = b.gpu_mode;
 		const auto phys_addr  = b.start_addr + vaddr - b.map_vaddr;
 		const auto host_vaddr = b.host_vaddr;
 		const auto host_size  = b.host_size;
 		if (vaddr == b.map_vaddr && size == b.map_size) {
-			m_mappings.erase(m_mappings.begin() + static_cast<std::ptrdiff_t>(index));
+			IndexRemove(it);
+			m_mappings.erase(it);
 			set_host_release_if_last(host_vaddr, host_size);
 		} else if (vaddr > b.map_vaddr && vaddr + size < b.map_vaddr + b.map_size) {
 			AllocatedBlock right = b;
@@ -2452,16 +2762,19 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 			right.size      = b.map_vaddr + b.map_size - (vaddr + size);
 			right.map_size  = right.size;
 			right.map_vaddr = vaddr + size;
-			b.size     = vaddr - b.map_vaddr;
+			b.size     = vaddr - b.map_vaddr; // shrinks in place: its keys stay
 			b.map_size = b.size;
 			m_mappings.push_back(right);
+			IndexAdd(std::prev(m_mappings.end()));
 		} else if (vaddr == b.map_vaddr) {
+			IndexRemove(it);
 			b.start_addr += size;
 			b.size -= size;
 			b.map_vaddr += size;
 			b.map_size -= size;
+			IndexAdd(it);
 		} else {
-			b.size     = vaddr - b.map_vaddr;
+			b.size     = vaddr - b.map_vaddr; // shrinks in place: its keys stay
 			b.map_size = b.size;
 		}
 		ReclaimAutomatic(phys_addr, size);
@@ -2478,22 +2791,22 @@ void PhysicalMemory::ProtectMapping(uint64_t vaddr, uint64_t size, int prot,
 		return;
 	}
 
-	const auto                  end = vaddr + size;
-	std::vector<AllocatedBlock> updated;
-	updated.reserve(m_mappings.size() + 2);
-	for (const auto& block: m_mappings) {
-		const auto block_end = block.map_vaddr + block.map_size;
-		if (!VirtualRangesOverlap(vaddr, size, block.map_vaddr, block.map_size)) {
-			updated.push_back(block);
-			continue;
-		}
+	// v438zk: in place. Each mapping the range touches becomes its left, middle and right parts
+	// at its own position, the order the rebuilt vector had.
+	const auto end = vaddr + size;
+	// v438zm: the mappings the range touches come from the guest-address index when it can answer;
+	// what happens to each is unchanged, and it happens at the mapping's own place in the list.
+	const auto split = [&](MappingList::iterator it) {
+		const AllocatedBlock block     = *it;
+		const auto           block_end = block.map_vaddr + block.map_size;
+		IndexRemove(it);
 		const auto overlap_start = std::max(vaddr, block.map_vaddr);
 		const auto overlap_end   = std::min(end, block_end);
 		if (block.map_vaddr < overlap_start) {
 			auto left     = block;
 			left.size     = overlap_start - block.map_vaddr;
 			left.map_size = left.size;
-			updated.push_back(left);
+			IndexAdd(m_mappings.insert(it, left));
 		}
 		auto middle       = block;
 		middle.start_addr = block.start_addr + overlap_start - block.map_vaddr;
@@ -2503,17 +2816,28 @@ void PhysicalMemory::ProtectMapping(uint64_t vaddr, uint64_t size, int prot,
 		middle.prot       = prot;
 		middle.mode       = mode;
 		middle.gpu_mode   = gpu_mode;
-		updated.push_back(middle);
+		*it               = middle;
+		IndexAdd(it);
+		++it;
 		if (overlap_end < block_end) {
 			auto right       = block;
 			right.start_addr = block.start_addr + overlap_end - block.map_vaddr;
 			right.size       = block_end - overlap_end;
 			right.map_vaddr  = overlap_end;
 			right.map_size   = right.size;
-			updated.push_back(right);
+			IndexAdd(m_mappings.insert(it, right));
 		}
+	};
+	if (ForEachVaddrOverlap(vaddr, size, split)) {
+		return;
 	}
-	m_mappings = std::move(updated);
+	for (auto it = m_mappings.begin(); it != m_mappings.end();) {
+		const auto next = std::next(it);
+		if (VirtualRangesOverlap(vaddr, size, it->map_vaddr, it->map_size)) {
+			split(it); // its right part, if any, goes in before `next`
+		}
+		it = next;
+	}
 }
 
 bool PhysicalMemory::Find(uint64_t phys_addr, bool next, AllocatedBlock* out) {
@@ -2543,9 +2867,9 @@ std::vector<PhysicalMemory::AllocatedBlock> PhysicalMemory::FindMappings(uint64_
 	Common::LockGuard lock(m_mutex);
 
 	std::vector<AllocatedBlock> mappings;
-	for (const auto& m: m_mappings) {
+	const auto                  add = [&](const AllocatedBlock& m) {
 		if (!VirtualRangesOverlap(phys_addr, len, m.start_addr, m.size)) {
-			continue;
+			return;
 		}
 
 		const uint64_t overlap_start = std::max<uint64_t>(phys_addr, m.start_addr);
@@ -2556,10 +2880,43 @@ std::vector<PhysicalMemory::AllocatedBlock> PhysicalMemory::FindMappings(uint64_
 		part.map_vaddr += overlap_start - m.start_addr;
 		part.map_size = part.size;
 		mappings.push_back(part);
+	};
+	const auto by_vaddr = [](const auto& a, const auto& b) { return a.map_vaddr < b.map_vaddr; };
+	// v438zm: from the physical index while the mappings are disjoint in guest addresses (the
+	// parts then have different map_vaddr, so the sort below has one result whatever the order
+	// they were found in). Otherwise, and for a range that wraps, the walk as before.
+	const int mode = UnmapIndexMode();
+	if (mode != 0 && m_vaddr_disjoint && len != 0 && UINT64_MAX - phys_addr >= len) {
+		ForEachPhysOverlap(phys_addr, phys_addr + len, [&](MappingList::iterator m) { add(*m); });
+		std::sort(mappings.begin(), mappings.end(), by_vaddr);
+		if (mode == 2) {
+			auto found = std::move(mappings);
+			mappings.clear();
+			for (const auto& m: m_mappings) {
+				add(m);
+			}
+			std::sort(mappings.begin(), mappings.end(), by_vaddr);
+			const bool same = found.size() == mappings.size() &&
+			                  std::equal(found.begin(), found.end(), mappings.begin(), [](const auto& a, const auto& b) {
+				                  return a.start_addr == b.start_addr && a.size == b.size && a.map_vaddr == b.map_vaddr &&
+				                         a.map_size == b.map_size && a.host_vaddr == b.host_vaddr &&
+				                         a.host_size == b.host_size && a.prot == b.prot && a.mode == b.mode &&
+				                         a.gpu_mode == b.gpu_mode && a.memory_type == b.memory_type &&
+				                         a.kind == b.kind && std::memcmp(a.name, b.name, sizeof(a.name)) == 0;
+			                  });
+			if (!same) {
+				EXIT("PhysicalMemory: the physical index and the walk find different mappings at 0x%016" PRIx64
+				     "+0x%zx\n",
+				     phys_addr, len);
+			}
+		}
+		return mappings;
+	}
+	for (const auto& m: m_mappings) {
+		add(m);
 	}
 
-	std::sort(mappings.begin(), mappings.end(),
-	          [](const auto& a, const auto& b) { return a.map_vaddr < b.map_vaddr; });
+	std::sort(mappings.begin(), mappings.end(), by_vaddr);
 	return mappings;
 }
 
@@ -2595,6 +2952,9 @@ bool PhysicalMemory::Find(uint64_t vaddr, uint64_t* base_addr, size_t* len, int*
 void PhysicalMemory::SetVirtualRangeName(uint64_t vaddr, uint64_t len, const char* name) {
 	Common::LockGuard lock(m_mutex);
 
+	if (ForEachVaddrOverlap(vaddr, len, [&](MappingList::iterator b) { CopyVirtualRangeName(b->name, name); })) {
+		return;
+	}
 	for (auto& b: m_mappings) {
 		if (VirtualRangesOverlap(vaddr, len, b.map_vaddr, b.map_size)) {
 			CopyVirtualRangeName(b.name, name);
@@ -2937,6 +3297,9 @@ void FlexibleMemory::SetVirtualRangeName(uint64_t vaddr, uint64_t len, const cha
 void PhysicalMemory::SetVirtualRangeMemoryType(uint64_t vaddr, uint64_t len, int memory_type) {
 	Common::LockGuard lock(m_mutex);
 
+	if (ForEachVaddrOverlap(vaddr, len, [&](MappingList::iterator b) { b->memory_type = memory_type; })) {
+		return;
+	}
 	for (auto& b: m_mappings) {
 		if (VirtualRangesOverlap(vaddr, len, b.map_vaddr, b.map_size)) {
 			b.memory_type = memory_type;

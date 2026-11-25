@@ -13,6 +13,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/timeline.h"
+#include "kernel/guestWait.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -559,6 +560,7 @@ static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& 
 }
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
+	const GuestWait::Scope guest_wait(GuestWait::Prim::Sleep);
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
@@ -573,6 +575,7 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 }
 
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
+	const GuestWait::Scope guest_wait(GuestWait::Prim::Sleep);
 	if (nanoseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
@@ -1321,6 +1324,12 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			return ETIMEDOUT;
 		}
 		return EDEADLK;
+	}
+
+	// KYTY_GUEST_WAIT_STATS: only a lock that finds the mutex held is timed.
+	GuestWait::Scope guest_wait;
+	if (mutex->owner != nullptr && (timeout_us == nullptr || *timeout_us != 0)) {
+		guest_wait.Begin(GuestWait::Prim::Mutex, mutex, mutex->name.c_str());
 	}
 
 	if (timeout_us == nullptr) {
@@ -2402,6 +2411,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 	    (has_timeout ? std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us)
 	                 : std::chrono::steady_clock::time_point {});
 	bool writer_wait_registered = false;
+	GuestWait::Scope guest_wait; // KYTY_GUEST_WAIT_STATS: started when the lock has to wait
 
 	for (;;) {
 		{
@@ -2451,8 +2461,10 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 				                       ? remaining
 				                       : std::chrono::steady_clock::duration(
 				                             std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+				guest_wait.Begin(GuestWait::Prim::Rwlock, rwlock, rwlock->name.c_str());
 				rwlock->cv.wait_for(lock, poll);
 			} else {
+				guest_wait.Begin(GuestWait::Prim::Rwlock, rwlock, rwlock->name.c_str());
 				rwlock->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 			}
 		}
@@ -2928,6 +2940,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	const GuestWait::Scope guest_wait(GuestWait::Prim::Cond, cond_value, cond_value->name.c_str());
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
@@ -2998,6 +3011,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	const GuestWait::Scope guest_wait(GuestWait::Prim::Cond, cond_value, cond_value->name.c_str());
 
 	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
@@ -3056,6 +3070,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	const GuestWait::Scope guest_wait(GuestWait::Prim::Cond, cond_value, cond_value->name.c_str());
 
 	while (!ready()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
@@ -3630,6 +3645,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	const GuestWait::Scope guest_wait(GuestWait::Prim::Yield);
 	SchedulerBackoffOnce();
 }
 

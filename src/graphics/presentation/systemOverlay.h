@@ -31,6 +31,10 @@ bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);
+// v0.5 FG (Mac 11-24): "Frame generation: ON/OFF - F8" in a corner for `seconds`. It also stays by
+// itself on the title screen (the startup preparation done) until the player loads a save or starts
+// a new game (Common::GameStarted), when frame generation can run.
+void                     ShowFrameGenerationHint(bool on, int seconds);
 
 class SystemOverlay final {
 public:

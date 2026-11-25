@@ -16,7 +16,9 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/renderer/faultBench.h"
 #include "kernel/fileSystem.h"
+#include "kernel/guestWait.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
@@ -36,6 +38,8 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -230,6 +234,45 @@ constexpr uint64_t CODE_BASE_OFFSET = 0x100000000u;
 constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 
 static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+
+// v446l: the loaded programs' address ranges, for naming code addresses in a fault report
+// without taking the linker's lock (append only).
+struct LoadedModuleRange {
+	uint64_t base = 0;
+	uint64_t size = 0;
+	char     name[64] {};
+};
+static LoadedModuleRange     g_module_ranges[128];
+static std::atomic<uint32_t> g_module_range_count {0};
+
+static void NoteModuleRange(uint64_t base, uint64_t size, const std::string& name) {
+	const auto index = g_module_range_count.load(std::memory_order_relaxed);
+	if (index >= std::size(g_module_ranges)) {
+		return;
+	}
+	auto& range = g_module_ranges[index];
+	range.base  = base;
+	range.size  = size;
+	std::snprintf(range.name, sizeof(range.name), "%s", name.c_str());
+	g_module_range_count.store(index + 1, std::memory_order_release);
+	std::printf("[module] %s at 0x%016llx size 0x%llx\n", range.name, static_cast<unsigned long long>(base),
+	            static_cast<unsigned long long>(size));
+}
+
+// "name+0xoffset" for an address inside a loaded program, or an empty string.
+static std::string DescribeCodeAddress(uint64_t address) {
+	const auto count = g_module_range_count.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < count; i++) {
+		const auto& range = g_module_ranges[i];
+		if (address >= range.base && address < range.base + range.size) {
+			char text[96];
+			std::snprintf(text, sizeof(text), "%s+0x%llx", range.name,
+			              static_cast<unsigned long long>(address - range.base));
+			return text;
+		}
+	}
+	return {};
+}
 static uint64_t g_invalid_memory    = 0;
 
 static Program*              g_tls_main_program        = nullptr;
@@ -769,6 +812,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// KYTY_FAULT_BENCH: the handler's entry and exit times for the bench's page.
+		const Libs::Graphics::FaultBench::HandlerScope fault_bench(info->access_violation_vaddr);
+		// KYTY_GUEST_WAIT_STATS: this thread's time in the handler, by outcome (a readback inside
+		// it is counted under its own steps).
+		Libs::LibKernel::GuestWait::Scope guest_wait(Libs::LibKernel::GuestWait::Prim::FaultOther);
 		const auto started = std::chrono::steady_clock::now();
 		const auto elapsed = [started] {
 			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -782,19 +830,37 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// A page left no-access by a lazy release: it gets its real protection and the access
 		// runs again (before the emulation below, which would leave it faulting every read).
 		if (Libs::LibKernel::Memory::ResolveGpuStaleFault(access, info->access_violation_vaddr)) {
+			guest_wait.SetPrim(Libs::LibKernel::GuestWait::Prim::FaultStale);
 			return true;
 		}
 		static const bool emulate_clean_reads =
 		    std::getenv("KYTY_NO_CLEAN_READ_EMULATION") == nullptr;
-		if (access == GpuAccess::Read && emulate_clean_reads &&
+		// v445s (KYTY_FAST_FINISH_CLEANREAD / toggle mode "ffclean", with fastfinish on): a page
+		// with no GPU-written bytes left is lifted instead of serving this one read from the
+		// backing and leaving it to fault at the next one. 2 (KYTY_FAST_FINISH_VERIFY): not
+		// lifted; the ordinary readback below does it and is compared with the predicate.
+		int clean_lift = 0;
+		if (access == GpuAccess::Read && emulate_clean_reads) {
+			clean_lift = Libs::LibKernel::Memory::TryLiftCleanFaultingPage(info->access_violation_vaddr);
+			if (clean_lift == 1) {
+				RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
+				                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), false);
+				guest_wait.SetPrim(Libs::LibKernel::GuestWait::Prim::FaultCleanLift);
+				return true;
+			}
+		}
+		if (clean_lift == 0 && access == GpuAccess::Read && emulate_clean_reads &&
 		    Loader::X64InstructionEmulator::TryEmulateLoad(
 		        info->native_context, info->access_violation_vaddr,
 		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
 			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
+			guest_wait.SetPrim(Libs::LibKernel::GuestWait::Prim::FaultCleanRead);
 			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			guest_wait.SetPrim(access == GpuAccess::Read ? Libs::LibKernel::GuestWait::Prim::FaultRead
+			                                             : Libs::LibKernel::GuestWait::Prim::FaultWrite);
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
 			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread(),
 			                   elapsed(), false);
@@ -840,6 +906,40 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			std::printf("\n");
+		}
+		// v446l: which program the code is in, the code addresses found on the stack (return
+		// addresses among them), and the memory the registers point at.
+		std::printf("pc: %s\n", DescribeCodeAddress(info->exception_address).c_str());
+		if (IsReadableRange(info->rsp, 1024 * sizeof(uint64_t))) {
+			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			int         shown = 0;
+			for (int i = 0; i < 1024 && shown < 48; i++) {
+				const auto where = DescribeCodeAddress(stack[i]);
+				if (!where.empty()) {
+					std::printf("stack[rsp+0x%x] = %016" PRIx64 " %s\n", i * 8, stack[i], where.c_str());
+					shown++;
+				}
+			}
+		}
+		if (IsReadableRange(info->exception_address - 1024, 1024 + 64)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 1024);
+			std::printf("code (pc-1024 .. pc+64):");
+			for (int i = 0; i < 1024 + 64; i++) {
+				std::printf("%s%02x", (i % 32 == 0) ? "\n " : "", code[i]);
+			}
+			std::printf("\n");
+		}
+		const std::pair<const char*, uint64_t> regs[] = {{"rbx", info->rbx}, {"rsi", info->rsi}, {"rdi", info->rdi},
+		                                                 {"r14", info->r14}, {"r15", info->r15}, {"rbp", info->rbp}};
+		for (const auto& [name, value]: regs) {
+			if (value > 0x10000 && IsReadableRange(value - 64, 256)) {
+				const auto* bytes = reinterpret_cast<const uint64_t*>(value - 64);
+				std::printf("[%s-64 .. +192]:", name);
+				for (int i = 0; i < 32; i++) {
+					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", bytes[i]);
+				}
+				std::printf("\n");
+			}
 		}
 		std::fflush(stdout);
 	}
@@ -1836,6 +1936,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
+	NoteModuleRange(program->base_vaddr, program->base_size_aligned,
+	                Common::PathToString(program->file_name.filename()));
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;

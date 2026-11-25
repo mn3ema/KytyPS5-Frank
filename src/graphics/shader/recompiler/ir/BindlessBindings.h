@@ -32,6 +32,61 @@ inline bool BindlessStorageImagesEnabled() {
 	}();
 	return allowed && g_bindless_storage_supported.load(std::memory_order_relaxed);
 }
+// v439 (address-keyed bindless images): a shader that reads its T# from a GPU-computed address
+// (the ray-tracing shaders' material T#s, found by following pointers through instance and
+// geometry records) looks the texture up by that address. The address space is cut into blocks of
+// BindlessAddressBlockBytes; a block holds BindlessAddressBlockBytes / 32 T# records at one 32-byte
+// phase (address & 31) and is an ordinary heap (BindlessTable::Heap, base = block, table_offset =
+// phase), found through a directory the host keeps in the translation buffer: open addressing,
+// BindlessAddressDirectoryEntries entries of four words (block low, block high, tag, region) at
+// translation index BindlessAddressDirectoryBase, probed BindlessAddressProbes times from
+// BindlessAddressHash. A block the directory does not know is requested in the feedback buffer at
+// the same words (block low, block high, tag | resource << 8) and samples slot 0 meanwhile; the
+// host then creates the heap and the directory entry, and its keys resolve as any heap's do.
+inline constexpr uint32_t BindlessAddressBlockBits         = 14u;
+inline constexpr uint32_t BindlessAddressBlockBytes        = 1u << BindlessAddressBlockBits;
+inline constexpr uint32_t BindlessAddressKeysPerBlock      = BindlessAddressBlockBytes / 32u;
+inline constexpr uint32_t BindlessAddressDirectoryBase     = 1u;
+inline constexpr uint32_t BindlessAddressDirectoryEntries  = 4096u; // a power of two
+inline constexpr uint32_t BindlessAddressDirectoryWords    = BindlessAddressDirectoryEntries * 4u;
+inline constexpr uint32_t BindlessAddressProbes            = 4u;
+inline constexpr uint32_t BindlessAddressTagValid          = 0x80000000u;
+// The tag of a block at one phase as one view binding samples it: valid | binding << 24 | phase.
+// A request adds the resource index the host registered for the shader's image (bits 8-23).
+inline constexpr uint32_t BindlessAddressTag(uint32_t binding, uint32_t phase) {
+	return BindlessAddressTagValid | ((binding & 0x7fu) << 24u) | (phase & 31u);
+}
+// The first directory entry probed for a block (the shader computes the same in SPIR-V).
+inline constexpr uint32_t BindlessAddressHash(uint32_t block_low, uint32_t block_high, uint32_t tag) {
+	uint32_t h = (block_low >> BindlessAddressBlockBits) ^ (block_high * 0x9e3779b1u) ^ (tag * 0x85ebca6bu);
+	h ^= h >> 16u;
+	h *= 0x7feb352du;
+	h ^= h >> 15u;
+	return h & (BindlessAddressDirectoryEntries - 1u);
+}
+// v439b (value-keyed bindless images): a sampled image whose T# the shader builds in a way no
+// address explains (a descriptor Phi web that also carries other data) looks the texture up by
+// the T#'s eight words. Per sampled view binding, a directory of BindlessValueEntries entries of
+// eight words (the T#) at BindlessValueDirectoryBase + binding * BindlessValueWords (translation
+// buffer), probed BindlessAddressProbes times from BindlessValueHash; entry e's translation is at
+// BindlessValueRegionBase + binding * BindlessValueEntries + e. An unknown T# is requested in the
+// feedback words of its first probed entry (its eight words) and samples slot 0 meanwhile.
+inline constexpr uint32_t BindlessValueEntries        = 4096u; // a power of two
+inline constexpr uint32_t BindlessValueWords          = BindlessValueEntries * 8u;
+inline constexpr uint32_t BindlessValueBindings       = 5u;    // the sampled view bindings and Storage2D
+inline constexpr uint32_t BindlessValueDirectoryBase  = BindlessAddressDirectoryBase + BindlessAddressDirectoryWords;
+inline constexpr uint32_t BindlessValueRegionBase     = BindlessValueDirectoryBase + BindlessValueBindings * BindlessValueWords;
+inline constexpr uint32_t BindlessReservedEntries     = BindlessValueRegionBase + BindlessValueBindings * BindlessValueEntries;
+inline constexpr uint32_t BindlessValueHash(const uint32_t* words) {
+	uint32_t h = 0x811c9dc5u;
+	for (uint32_t i = 0; i < 8u; i++) {
+		h = (h ^ words[i]) * 0x01000193u;
+	}
+	h ^= h >> 16u;
+	h *= 0x7feb352du;
+	h ^= h >> 15u;
+	return h & (BindlessValueEntries - 1u);
+}
 // A translation entry for a key whose texture is not resident yet; the shader samples slot 0.
 inline constexpr uint32_t BindlessPending        = 0xffffffffu;
 // In a 3D binding's region: the key's T# is a 2D or 2D-array texture, held in the 2D-array

@@ -6,9 +6,11 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderStats.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,20 @@ constexpr uint32_t BlockCount   = 32;
 constexpr uint32_t QueueSlots = 4;
 
 thread_local uint32_t t_queue = 0;
+// The thread that times guest commands (BeforeSlow ran on it): only it may add to a block.
+thread_local bool t_timed_thread = false;
+
+constexpr const char* WorkNames[Work::WorkCount] = {"copy-buf", "copy-img", "buf-to-img",
+                                                    "img-to-buf", "fill", "dispatch"};
+constexpr const char* WorkUnits[Work::WorkCount] = {"B", "texels", "texels", "texels", "B", "groups"};
+
+struct WorkSite {
+	std::string name; // kind and file:line
+	uint32_t    work    = 0;
+	uint64_t    count   = 0;
+	uint64_t    amount  = 0;
+	uint64_t    inside  = 0; // of count: recorded inside a timed guest draw or dispatch
+};
 
 struct Pair {
 	uint32_t before = 0;
@@ -55,6 +71,19 @@ struct Stat {
 	uint32_t kind  = 0;
 };
 
+// v445m, the whole window ("GpuWindow", "GpuGapPair", "GpuKey" lines when it closes): every
+// gap of 2 us or more between two timed commands goes to the pair (command before, command
+// after), within a command buffer and across command buffers; and every key's time over the
+// window, not only each frame's heaviest.
+struct GapPair {
+	uint64_t prev = 0, next = 0;
+	uint32_t prev_kind = 0, next_kind = 0;
+	bool     cross = false; // across two command buffers
+	double   ms    = 0.0;
+	uint64_t count = 0;
+	uint32_t masks = 0; // GapNote bits recorded in any of its gaps
+};
+
 struct State {
 	vk::Device                           device;
 	vk::QueryPool                        pool;
@@ -73,7 +102,46 @@ struct State {
 	std::array<double, 4>                  gap_len_ms {}; // <2 us, 2-20 us, 20-200 us, >=200 us
 	std::array<uint64_t, 4>                gap_len_n {};
 	uint64_t                               gap_barriers = 0;
+	// Across command buffers ("GpuCross"): from the last timed command of one buffer to the first
+	// timed command of a later one. Not part of the span or of "between" (both are per buffer).
+	// [0]: nothing was recorded in between (the GPU waited for the submit, or ran another
+	// thread's buffer); [1]: something was (GapNote bits), so work and waiting are mixed.
+	uint64_t                               cross_tick = 0;
+	uint64_t                               cross_last = 0;
+	std::array<double, 2>                  cross_ms {};
+	std::array<uint64_t, 2>                cross_n {};
+	// The work census (gpuTiming.h, Work): by site, and its report window.
+	std::unordered_map<uint64_t, WorkSite> work;
+	uint64_t                               work_frames = 0;
+	std::chrono::steady_clock::time_point  work_last {};
+	// The window's summary (GapPair).
+	std::unordered_map<uint64_t, GapPair>  window_pairs;
+	std::unordered_map<uint64_t, Stat>     window_stats; // by key; key 0: all gaps inside command buffers
+	double                                 window_span_ms    = 0.0;
+	double                                 window_short_ms   = 0.0; // gaps under 2 us: not attributed
+	uint64_t                               window_short_n    = 0;
+	double                                 window_cross_ms   = 0.0;
+	uint64_t                               window_cross_n    = 0;
+	uint64_t                               cross_last_key    = 0;
+	uint32_t                               cross_last_kind   = 0;
+	uint64_t                               window_frames     = 0;
+	bool                                   window_printed    = false;
 };
+
+void AddGapPair(State& state, uint64_t prev, uint32_t prev_kind, uint64_t next, uint32_t next_kind, bool cross,
+                double ms, uint32_t mask) {
+	const uint64_t id = (prev * 0x9e3779b97f4a7c15ull) ^ (next * 0xc2b2ae3d27d4eb4full) ^
+	                    (uint64_t {prev_kind} << 1u) ^ (uint64_t {next_kind} << 9u) ^ (cross ? 1u : 0u);
+	auto& pair     = state.window_pairs[id];
+	pair.prev      = prev;
+	pair.next      = next;
+	pair.prev_kind = prev_kind;
+	pair.next_kind = next_kind;
+	pair.cross     = cross;
+	pair.ms += ms;
+	pair.count++;
+	pair.masks |= mask;
+}
 
 State& GetState() {
 	static State state;
@@ -109,6 +177,7 @@ void ReadBlock(State& state, Block& block) {
 		if (result == vk::Result::eSuccess) {
 			std::lock_guard lock(state.stats_mutex);
 			uint64_t        previous_after = 0;
+			const Pair*     previous_pair  = nullptr;
 			for (const auto& pair: block.pairs) {
 				const auto before = values[pair.before];
 				const auto after  = values[pair.after];
@@ -117,9 +186,15 @@ void ReadBlock(State& state, Block& block) {
 					stat.ms += static_cast<double>(after - before) * state.period_ns / 1e6;
 					stat.count++;
 					stat.kind = pair.kind;
-					const auto q = (std::min)(pair.queue, QueueSlots - 1);
-					state.queue_ms[q] += static_cast<double>(after - before) * state.period_ns / 1e6;
-					state.queue_n[q]++;
+					auto& window = state.window_stats[pair.key];
+					window.ms += static_cast<double>(after - before) * state.period_ns / 1e6;
+					window.count++;
+					window.kind = pair.kind;
+					if (pair.kind < WorkKindBase) {
+						const auto q = (std::min)(pair.queue, QueueSlots - 1);
+						state.queue_ms[q] += static_cast<double>(after - before) * state.period_ns / 1e6;
+						state.queue_n[q]++;
+					}
 				}
 				if (previous_after != 0 && before >= previous_after) {
 					auto&      gap = state.stats[0];
@@ -133,14 +208,44 @@ void ReadBlock(State& state, Block& block) {
 					state.gap_len_ms[len] += ms;
 					state.gap_len_n[len]++;
 					state.gap_barriers += pair.gap_barriers;
+					auto& window = state.window_stats[0];
+					window.ms += ms;
+					window.count++;
+					if (ms >= 0.002 && previous_pair != nullptr) {
+						AddGapPair(state, previous_pair->key, previous_pair->kind, pair.key, pair.kind, false, ms,
+						           pair.gap_mask);
+					} else {
+						state.window_short_ms += ms;
+						state.window_short_n++;
+					}
 				}
 				previous_after = after;
+				previous_pair  = &pair;
 			}
 			if (!block.pairs.empty()) {
 				const auto first = values[block.pairs.front().before];
 				const auto last  = values[block.pairs.back().after];
 				if (last >= first) {
 					state.total_ms += static_cast<double>(last - first) * state.period_ns / 1e6;
+					state.window_span_ms += static_cast<double>(last - first) * state.period_ns / 1e6;
+				}
+				if (state.cross_last != 0 && block.tick > state.cross_tick && first >= state.cross_last) {
+					const size_t kind = block.pairs.front().gap_mask == 0 ? 0 : 1;
+					const double ms   = static_cast<double>(first - state.cross_last) * state.period_ns / 1e6;
+					state.cross_ms[kind] += ms;
+					state.cross_n[kind]++;
+					state.window_cross_ms += ms;
+					state.window_cross_n++;
+					if (ms >= 0.002) {
+						AddGapPair(state, state.cross_last_key, state.cross_last_kind, block.pairs.front().key,
+						           block.pairs.front().kind, true, ms, block.pairs.front().gap_mask);
+					}
+				}
+				if (block.tick >= state.cross_tick) {
+					state.cross_tick      = block.tick;
+					state.cross_last      = last;
+					state.cross_last_key  = block.pairs.back().key;
+					state.cross_last_kind = block.pairs.back().kind;
 				}
 			}
 		}
@@ -197,7 +302,54 @@ Block* CurrentBlock(RenderContext& context, CommandBuffer& buffer) {
 
 namespace Detail {
 
+// Counts one internal command at its site. When it can be timed, reserves its two timestamp
+// queries in the current block and returns the first one's index in `pool` (the caller records
+// timestamp, command, timestamp); -1 otherwise.
+int64_t WorkBegin(uint32_t work, uint32_t gap_bit, uint64_t amount, const std::source_location& site,
+                  uint64_t tick, vk::QueryPool& pool) {
+	const bool inside = t_inside;
+	if (inside && work == WorkDispatch) {
+		return -1; // the guest's own dispatch
+	}
+	auto& state = GetState();
+	// The site's key: the file name's address (a literal), the line and the kind.
+	const uint64_t key = ((reinterpret_cast<uint64_t>(site.file_name()) * 0x9e3779b97f4a7c15ull) ^
+	                      (uint64_t {site.line()} << 8u) ^ work) | (uint64_t {1} << 63u);
+	{
+		std::lock_guard lock(state.stats_mutex);
+		auto&           entry = state.work[key];
+		if (entry.name.empty()) {
+			std::string file = site.file_name();
+			if (const auto slash = file.find_last_of("/\\"); slash != std::string::npos) {
+				file.erase(0, slash + 1);
+			}
+			entry.name = std::string(WorkNames[work]) + " " + file + ":" + std::to_string(site.line());
+			entry.work = work;
+		}
+		entry.count++;
+		entry.amount += amount;
+		entry.inside += inside ? 1u : 0u;
+	}
+	if (inside) {
+		return -1; // part of the timed guest command around it
+	}
+	auto* block = state.current;
+	if (!g_active.load(std::memory_order_relaxed) || !t_timed_thread || tick == 0 || block == nullptr ||
+	    block->tick != tick || block->open >= 0 || block->used + 2 > BlockQueries) {
+		Note(gap_bit);
+		return -1;
+	}
+	const auto base  = static_cast<uint32_t>(block - state.blocks.data()) * BlockQueries;
+	const auto first = block->used;
+	block->used += 2;
+	block->pairs.push_back({first, first + 1u, key, WorkKindBase + work, t_queue,
+	                        std::exchange(t_gap_mask, 0u), std::exchange(t_gap_barriers, 0u)});
+	pool = state.pool;
+	return static_cast<int64_t>(base) + first;
+}
+
 void BeforeSlow(RenderContext& context, CommandBuffer& buffer) {
+	t_timed_thread = true;
 	auto* block = CurrentBlock(context, buffer);
 	if (block == nullptr) {
 		return;
@@ -237,8 +389,209 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 
 } // namespace Detail
 
+// v445m: the window's totals, its gaps by (command before, command after) and every key.
+// KYTY_GPU_GAP_PAIRS_TOP=<n>: the pairs printed of each list (default 60; the key table is always whole).
+static void ReportWindow(State& state, uint64_t first_frame, uint64_t frames) {
+	static constexpr const char* names[GapNoteCount] = {"barrier", "guest-barrier", "copy-buf", "copy-img", "clear",
+	                                                    "fill",    "rendering",     "dispatch", "draw"};
+	std::vector<GapPair>                      pairs;
+	std::vector<std::pair<uint64_t, Stat>>    keys;
+	std::unordered_map<uint64_t, std::string> work_names;
+	std::unordered_map<uint64_t, uint32_t>    lanes;
+	double                                    span = 0.0, short_ms = 0.0, cross_ms = 0.0;
+	uint64_t                                  short_n = 0, cross_n = 0;
+	{
+		std::lock_guard lock(state.stats_mutex);
+		pairs.reserve(state.window_pairs.size());
+		for (const auto& entry: state.window_pairs) {
+			pairs.push_back(entry.second);
+		}
+		keys.assign(state.window_stats.begin(), state.window_stats.end());
+		for (const auto& [key, site]: state.work) {
+			work_names[key] = site.name;
+		}
+		lanes    = state.lanes;
+		span     = state.window_span_ms;
+		short_ms = state.window_short_ms;
+		short_n  = state.window_short_n;
+		cross_ms = state.window_cross_ms;
+		cross_n  = state.window_cross_n;
+		state.window_pairs.clear();
+		state.window_stats.clear();
+	}
+	const auto name_of = [&](uint64_t key, uint32_t kind) -> std::string {
+		char text[96];
+		if (kind >= WorkKindBase) {
+			const auto it = work_names.find(key);
+			return "internal " + (it != work_names.end() ? it->second : std::string("?"));
+		}
+		const auto it    = lanes.find(key);
+		const bool split = kind != Draw && it != lanes.end() && it->second == 2u;
+		std::snprintf(text, sizeof(text), "%s 0x%016" PRIx64, kind == Draw ? "draw" : (split ? "cs_split" : "cs_nativ"),
+		              key);
+		return text;
+	};
+	const double per = frames != 0 ? 1.0 / static_cast<double>(frames) : 0.0;
+	double       commands = 0.0, internal = 0.0, between = 0.0, attributed = 0.0;
+	uint64_t     between_n = 0, attributed_n = 0;
+	for (const auto& [key, stat]: keys) {
+		if (key == 0) {
+			between   = stat.ms;
+			between_n = stat.count;
+		} else if (stat.kind >= WorkKindBase) {
+			internal += stat.ms;
+		} else {
+			commands += stat.ms;
+		}
+	}
+	for (const auto& pair: pairs) {
+		if (!pair.cross) {
+			attributed += pair.ms;
+			attributed_n += pair.count;
+		}
+	}
+	std::string out;
+	char        line[512];
+	std::snprintf(line, sizeof(line),
+	              "GpuWindow frames %" PRIu64 "..%" PRIu64 " (%" PRIu64 " frames), ms per frame: span=%.2f commands=%.2f "
+	              "internal=%.2f between=%.2f/%.0f (gaps >=2us, attributed below: %.2f/%.0f; shorter: %.2f/%.0f) | across "
+	              "command buffers (not in the span): %.2f/%.0f\n",
+	              first_frame, first_frame + frames - 1u, frames, span * per, commands * per, internal * per,
+	              between * per, static_cast<double>(between_n) * per, attributed * per,
+	              static_cast<double>(attributed_n) * per, short_ms * per, static_cast<double>(short_n) * per,
+	              cross_ms * per, static_cast<double>(cross_n) * per);
+	out += line;
+	static const size_t top = [] {
+		const char* value = std::getenv("KYTY_GPU_GAP_PAIRS_TOP");
+		return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : size_t {60};
+	}();
+	std::sort(pairs.begin(), pairs.end(), [](const GapPair& a, const GapPair& b) { return a.ms > b.ms; });
+	// v445n: two lists, the top <n> of each. The gaps inside a command buffer are the GPU's own
+	// time (the window's "between"); the ones across command buffers are mostly the GPU waiting
+	// for the thread while the window is on, and in one list they crowded the others out (g450b).
+	for (int cross = 0; cross < 2; cross++) {
+		size_t total = 0;
+		for (const auto& pair: pairs) {
+			total += (pair.cross ? 1 : 0) == cross ? 1u : 0u;
+		}
+		std::snprintf(line, sizeof(line),
+		              "GpuGapPairs %s: %zu pairs with a gap of 2 us or more, the top %zu by total ms (ms per frame, "
+		              "gaps per frame, average us; after -> before; what was recorded in such gaps)\n",
+		              cross != 0 ? "across command buffers" : "inside a command buffer", total, (std::min)(top, total));
+		out += line;
+		size_t printed = 0;
+		for (size_t i = 0; i < pairs.size() && printed < top; i++) {
+			const auto& pair = pairs[i];
+			if ((pair.cross ? 1 : 0) != cross) {
+				continue;
+			}
+			printed++;
+			std::string recorded;
+			for (uint32_t bit = 0; bit < GapNoteCount; bit++) {
+				if ((pair.masks & (1u << bit)) != 0) {
+					recorded += recorded.empty() ? "" : "+";
+					recorded += names[bit];
+				}
+			}
+			std::snprintf(line, sizeof(line), "GpuGapPair  %7.3fms/f %7.1f/f avg %7.1fus | %s -> %s%s | %s\n",
+			              pair.ms * per, static_cast<double>(pair.count) * per,
+			              pair.ms * 1e3 / static_cast<double>(pair.count), name_of(pair.prev, pair.prev_kind).c_str(),
+			              name_of(pair.next, pair.next_kind).c_str(), pair.cross ? " (across command buffers)" : "",
+			              recorded.empty() ? "nothing" : recorded.c_str());
+			out += line;
+			if (out.size() > (1u << 16u)) {
+				std::fputs(out.c_str(), stderr);
+				out.clear();
+			}
+		}
+	}
+	std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+	std::snprintf(line, sizeof(line), "GpuKeys: all %zu keys of the window (ms per frame, count per frame, average us)\n",
+	              keys.size());
+	out += line;
+	for (const auto& [key, stat]: keys) {
+		std::snprintf(line, sizeof(line), "GpuKey  %8.3fms/f %8.1f/f avg %8.1fus | %s\n", stat.ms * per,
+		              static_cast<double>(stat.count) * per,
+		              stat.count != 0 ? stat.ms * 1e3 / static_cast<double>(stat.count) : 0.0,
+		              key == 0 ? "between (all gaps inside command buffers)" : name_of(key, stat.kind).c_str());
+		out += line;
+		if (out.size() > (1u << 16u)) {
+			std::fputs(out.c_str(), stderr);
+			out.clear();
+		}
+	}
+	std::fputs(out.c_str(), stderr);
+	std::fflush(stderr);
+}
+
+// [gpu-work]: the census of the last 5 s, per presented frame, the largest sites first.
+static void ReportWork(State& state) {
+	std::vector<WorkSite> sites;
+	uint64_t              frames = 0;
+	{
+		std::lock_guard lock(state.stats_mutex);
+		const auto      now = std::chrono::steady_clock::now();
+		state.work_frames++;
+		if (state.work_last == std::chrono::steady_clock::time_point {}) {
+			state.work_last = now;
+		}
+		if (now - state.work_last < std::chrono::seconds(5)) {
+			return;
+		}
+		state.work_last = now;
+		frames          = std::exchange(state.work_frames, 0);
+		for (auto& [key, site]: state.work) {
+			if (site.count != 0) {
+				sites.push_back(site);
+				site.count = site.amount = site.inside = 0;
+			}
+		}
+	}
+	std::array<uint64_t, Work::WorkCount> count {}, amount {};
+	for (const auto& site: sites) {
+		count[site.work] += site.count;
+		amount[site.work] += site.amount;
+	}
+	const double per = frames != 0 ? 1.0 / static_cast<double>(frames) : 0.0;
+	std::string  out = "[gpu-work] 5 s, " + std::to_string(frames) + " frames, per frame:";
+	for (uint32_t work = 0; work < Work::WorkCount; work++) {
+		char text[96];
+		std::snprintf(text, sizeof(text), " %s %.1f (%.0f %s)", WorkNames[work],
+		              static_cast<double>(count[work]) * per, static_cast<double>(amount[work]) * per,
+		              WorkUnits[work]);
+		out += text;
+	}
+	out += "\n";
+	std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) {
+		return a.work != b.work ? a.work < b.work : (a.amount != b.amount ? a.amount > b.amount : a.count > b.count);
+	});
+	std::array<uint32_t, Work::WorkCount> listed {};
+	for (const auto& site: sites) {
+		if (listed[site.work]++ >= 10u) {
+			continue; // ten sites a kind
+		}
+		char text[256];
+		std::snprintf(text, sizeof(text), "[gpu-work]   %-40s %8.1f a frame, %12.0f %s, %.1f inside a timed command\n",
+		              site.name.c_str(), static_cast<double>(site.count) * per,
+		              static_cast<double>(site.amount) * per, WorkUnits[site.work],
+		              static_cast<double>(site.inside) * per);
+		out += text;
+	}
+	std::fputs(out.c_str(), stderr);
+	std::fflush(stderr);
+}
+
 void Present(uint64_t frame) {
+	BarrierReason::NoteFrame(); // KYTY_BARRIER_REASON_STATS
 	const auto& window = GetWindow();
+	static const bool census = [&window] {
+		const bool on = window.count != 0 || RenderStats::Enabled();
+		Detail::g_census.store(on, std::memory_order_relaxed);
+		return on;
+	}();
+	if (census) {
+		ReportWork(GetState());
+	}
 	if (window.count == 0) {
 		return;
 	}
@@ -248,8 +601,9 @@ void Present(uint64_t frame) {
 		double                                 timed = 0.0;
 		double                                 total = 0.0;
 		// Buckets: draws, native compute, two-lane (64 on 32) compute, gaps.
-		double   bucket_ms[4] {};
-		uint64_t bucket_n[4] {};
+		double   bucket_ms[5] {}; // [4]: the renderer's own copies, fills and dispatches, timed
+		uint64_t bucket_n[5] {};
+		std::unordered_map<uint64_t, std::string> work_names;
 		std::vector<uint64_t> split_keys;
 		std::array<double, QueueSlots>   queue_ms {};
 		std::array<uint64_t, QueueSlots> queue_n {};
@@ -257,8 +611,12 @@ void Present(uint64_t frame) {
 		std::array<double, 4>                  gap_len_ms {};
 		std::array<uint64_t, 4>                gap_len_n {};
 		uint64_t                               gap_barriers = 0;
+		std::array<double, 2>                  cross_ms {};
+		std::array<uint64_t, 2>                cross_n {};
 		{
 			std::lock_guard lock(state.stats_mutex);
+			cross_ms = std::exchange(state.cross_ms, {});
+			cross_n  = std::exchange(state.cross_n, {});
 			sorted.assign(state.stats.begin(), state.stats.end());
 			state.stats.clear();
 			total          = state.total_ms;
@@ -273,7 +631,12 @@ void Present(uint64_t frame) {
 			for (const auto& [key, stat]: sorted) {
 				size_t b = 3;
 				if (key != 0) {
-					if (stat.kind == Draw) {
+					if (stat.kind >= WorkKindBase) {
+						b = 4;
+						if (const auto it = state.work.find(key); it != state.work.end()) {
+							work_names[key] = it->second.name;
+						}
+					} else if (stat.kind == Draw) {
 						b = 0;
 					} else {
 						const auto it = state.lanes.find(key);
@@ -289,9 +652,10 @@ void Present(uint64_t frame) {
 		}
 		std::fprintf(stderr,
 		             "GpuBuckets frame %" PRIu64 ": span=%.1f draws=%.2f/%" PRIu64
-		             " cs_native=%.2f/%" PRIu64 " cs_split=%.2f/%" PRIu64 " gaps=%.2f/%" PRIu64 "\n",
+		             " cs_native=%.2f/%" PRIu64 " cs_split=%.2f/%" PRIu64 " gaps=%.2f/%" PRIu64
+		             " internal=%.2f/%" PRIu64 "\n",
 		             frame, total, bucket_ms[0], bucket_n[0], bucket_ms[1], bucket_n[1], bucket_ms[2],
-		             bucket_n[2], bucket_ms[3], bucket_n[3]);
+		             bucket_n[2], bucket_ms[3], bucket_n[3], bucket_ms[4], bucket_n[4]);
 		std::fprintf(stderr,
 		             "GpuQueues frame %" PRIu64 ": q0=%.2f/%" PRIu64 " q1=%.2f/%" PRIu64
 		             " q2=%.2f/%" PRIu64 " other=%.2f/%" PRIu64 "\n",
@@ -342,12 +706,17 @@ void Present(uint64_t frame) {
 				top_text += item;
 			}
 			std::fprintf(stderr, "GpuGaps frame %" PRIu64 ": top:%s\n", frame, top_text.c_str());
+			// Across command buffers; neither the span nor "between" holds this time.
+			std::fprintf(stderr,
+			             "GpuCross frame %" PRIu64 ": nothing recorded=%.2f/%" PRIu64
+			             " something recorded=%.2f/%" PRIu64 "\n",
+			             frame, cross_ms[0], cross_n[0], cross_ms[1], cross_n[1]);
 		}
 		std::sort(sorted.begin(), sorted.end(),
 		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
 		for (const auto& [key, stat]: sorted) {
-			if (key != 0) {
-				timed += stat.ms;
+			if (key != 0 && stat.kind < WorkKindBase) {
+				timed += stat.ms; // the guest's commands, as before; the internal ones are their own bucket
 			}
 		}
 		// stderr: test runs keep the log silent.
@@ -360,6 +729,12 @@ void Present(uint64_t frame) {
 		for (size_t i = 0; i < sorted.size() && i < top; i++) {
 			const auto& [key, stat] = sorted[i];
 			const bool split = std::find(split_keys.begin(), split_keys.end(), key) != split_keys.end();
+			if (stat.kind >= WorkKindBase && key != 0) {
+				const auto name = work_names.find(key);
+				std::fprintf(stderr, "GpuTiming   internal %-40s %7.2fms x%" PRIu64 "\n",
+				             name != work_names.end() ? name->second.c_str() : "?", stat.ms, stat.count);
+				continue;
+			}
 			std::fprintf(stderr, "GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
 			             key == 0 ? "between " : (stat.kind == Draw ? "draw    " : (split ? "cs_split" : "cs_nativ")),
 			             key, stat.ms, stat.count);
@@ -368,6 +743,14 @@ void Present(uint64_t frame) {
 	}
 	const bool active = frame >= window.first && frame - window.first < window.count;
 	Detail::g_active.store(active, std::memory_order_relaxed);
+	if (active) {
+		state.window_frames++;
+	}
+	// The window's summary, a few frames after its last one so that their blocks have been read.
+	if (!state.window_printed && frame >= window.first + window.count + 8u && state.window_frames != 0) {
+		state.window_printed = true;
+		ReportWindow(state, window.first, state.window_frames);
+	}
 }
 
 void SetQueue(uint32_t queue) {

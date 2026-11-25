@@ -18,6 +18,7 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/passes/RtMerge.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
@@ -529,7 +530,129 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
+namespace {
+
+// v440: the payload's VGPR count for a callable split: the highest VGPR the code names (wide
+// operands counted generously), + 1, at most 256.
+uint32_t RtPayloadVgprs(std::span<const uint32_t> code) {
+	Decoder::Program decoded;
+	Decoder::DecodeProgram(code, decoded);
+	uint32_t top = 0;
+	const auto see = [&](const Decoder::Operand& operand, uint32_t count) {
+		if (operand.kind == Decoder::OperandKind::Vgpr) {
+			top = std::max(top, operand.reg + std::max(count, 1u));
+		}
+	};
+	for (const auto& inst: decoded.instructions) {
+		const uint32_t count = std::max(inst.data_dwords, 2u);
+		see(inst.dst, count);
+		see(inst.dst2, count);
+		see(inst.src0, count);
+		see(inst.src1, count);
+		see(inst.src2, count);
+		for (const auto reg: inst.image_nsa_addr) {
+			if (reg != 0) {
+				top = std::max(top, reg + 1u);
+			}
+		}
+	}
+	return std::min(top, 256u);
+}
+
+// v440 M3: a whole callable split (CompileOptions::rt_split): the main code as the ray-generation
+// shader, each target as a callable, merged into one program (MergeRtCallables).
+TranslateResult TranslateRtSplit(std::span<const uint32_t> main_code, const CompileOptions& options) {
+	const auto&    split = *options.rt_split;
+	IR::RtCallInfo raygen;
+	raygen.role       = IR::RtRole::Raygen;
+	raygen.call_pc    = split.call_pc;
+	raygen.source_reg = split.source_reg;
+	raygen.return_reg = split.return_reg;
+	// The payload carries the VGPRs the ray-generation code names: a callee's other VGPRs are its
+	// own temporaries (what it leaves there the caller never reads), so the payload, and with it
+	// the ray-generation module, does not depend on the call targets.
+	raygen.vgpr_count = RtPayloadVgprs(main_code);
+	for (const auto& target: split.targets) {
+		raygen.targets.push_back(target.address);
+	}
+	IR::RtCallInfo callable = raygen;
+	callable.role           = IR::RtRole::Callable;
+	callable.targets.clear();
+	// v443 (shared callables, IR/RtCallable.h): the payload is the whole register file in every
+	// split, and a callable moves every VGPR it uses, so its module does not depend on which
+	// ray-generation shader calls it.
+	if (IR::RtSharedCallables()) {
+		raygen.payload_vgprs   = IR::RtSharedPayloadVgprs;
+		callable.payload_vgprs = IR::RtSharedPayloadVgprs;
+		callable.vgpr_count    = IR::RtSharedPayloadVgprs;
+	}
+
+	CompileOptions main_options = options;
+	main_options.rt_split       = nullptr;
+	main_options.rt_call        = &raygen;
+	auto result                 = TranslateProgram(main_code, main_options);
+	if (result.unsupported) {
+		std::fprintf(stderr, "[rt-callables] %016llx: the ray-generation half did not translate\n",
+		             static_cast<unsigned long long>(options.shader_hash));
+		return result;
+	}
+	std::vector<IR::Program> callees;
+	callees.reserve(split.targets.size());
+	for (size_t index = 0; index < split.targets.size(); index++) {
+		CompileOptions callee_options = options;
+		callee_options.rt_split       = nullptr;
+		IR::RtCallInfo callee_info    = callable;
+		callee_info.code_address      = split.targets[index].address;
+		callee_info.code_hash         = IR::RtCodeHash(split.targets[index].code);
+		callee_options.rt_call        = &callee_info;
+		callee_options.shader_hash    = options.shader_hash ^ (split.targets[index].address * 0x9e3779b97f4a7c15ull);
+		auto callee                   = TranslateProgram(split.targets[index].code, callee_options);
+		if (callee.unsupported) {
+			std::fprintf(stderr, "[rt-callables] %016llx: callable %zu (0x%llx) did not translate\n",
+			             static_cast<unsigned long long>(options.shader_hash), index,
+			             static_cast<unsigned long long>(split.targets[index].address));
+			return callee;
+		}
+		callees.push_back(std::move(callee.program));
+	}
+	uint32_t callee_scratch = 0;
+	for (const auto& callee: callees) {
+		callee_scratch = std::max(callee_scratch, callee.scratch_dwords);
+	}
+	const uint32_t raygen_scratch = result.program.scratch_dwords;
+	// v440t: KYTY_RT_PAYLOAD_CUT=0 keeps the whole register file in the payload traffic.
+	static const bool payload_cut = [] {
+		const char* value = std::getenv("KYTY_RT_PAYLOAD_CUT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (payload_cut) {
+		std::string cut_stats;
+		IR::CutRtPayload(result.program, callees, cut_stats);
+		std::fprintf(stderr, "[rt-callables] %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash),
+		             cut_stats.c_str());
+	}
+	std::string    reason;
+	if (!IR::MergeRtCallables(result.program, callees, reason)) {
+		std::fprintf(stderr, "[rt-callables] %016llx: not merged: %s\n",
+		             static_cast<unsigned long long>(options.shader_hash), reason.c_str());
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
+	// Scratch is per module (function-local): a callee's spills stay its own, as within one call.
+	std::fprintf(stderr, "[rt-callables] %016llx: ray generation + %zu callables merged, payload %u VGPRs, "
+	             "scratch dwords %u / %u (callables)\n",
+	             static_cast<unsigned long long>(options.shader_hash), split.targets.size(), raygen.vgpr_count,
+	             raygen_scratch, callee_scratch);
+	return result;
+}
+
+} // namespace
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+	if (options.rt_split != nullptr) {
+		return TranslateRtSplit(code, options);
+	}
 	const Frontend::TranslationNonFatalScope non_fatal_scope(options.non_fatal);
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
@@ -674,6 +797,26 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 
 	const auto& cfg = *selected_cfg;
+	// A memory bound: each IR block carries the SSA rewrite's register tables (about 9 KB) and
+	// the rewrite records goto flags per block, so a structured graph of hundreds of thousands
+	// of blocks (every call target of a ray-tracing shader inlined: 485,521 blocks) took the
+	// translation past 70 GB. Such a program gives up instead. KYTY_MAX_IR_BLOCKS overrides.
+	static const uint64_t max_ir_blocks = [] {
+		const char* value = std::getenv("KYTY_MAX_IR_BLOCKS");
+		return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {100000};
+	}();
+	if (options.non_fatal && cfg.blocks.size() > max_ir_blocks) {
+		const auto reason = fmt::format("structured CFG has {} blocks, above the {}-block bound (KYTY_MAX_IR_BLOCKS)",
+		                                cfg.blocks.size(), max_ir_blocks);
+		std::fprintf(stderr, "[gave-up-reason] %016llx %s\n", static_cast<unsigned long long>(options.shader_hash),
+		             reason.c_str());
+		DumpGaveUpCode(options, code);
+		ReportGaveUp(options, phases, reason.c_str());
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported             = true;
+		unsupported_result.input_dependent_refusal = true;
+		return unsupported_result;
+	}
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
@@ -693,11 +836,34 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .rt_call          = options.rt_call,
 	};
 	KYTY_PROFILER_PHASE(phases, "Shader: IR translate", profiler::colors::Green300);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	// v446h: the A/B translation variant rides on the program (ShaderInfo::translation_variant).
+	// ShaderStageInputInfo is a union: read the member of this stage only.
+	uint32_t variant_bits = 0;
+	if (options.stage == ShaderType::Compute) {
+		variant_bits = options.input_info.compute != nullptr ? options.input_info.compute->translation_variant : 0u;
+	} else if (options.stage == ShaderType::Pixel) {
+		variant_bits = options.input_info.pixel != nullptr ? options.input_info.pixel->translation_variant : 0u;
+	} else {
+		variant_bits = options.input_info.vertex != nullptr ? options.input_info.vertex->translation_variant : 0u;
+	}
+	const auto translation_variant = static_cast<uint8_t>(variant_bits);
+	ir.info.translation_variant = translation_variant;
+	// v446j: compute programs keep static buffer formats by default. In-run A/B (g454a, top 30
+	// compute shaders): frame -0.5 to -0.7 ms, GPU -1.5 ms a frame. Draws do not (g454c: GPU -0.7 ms
+	// but the GPU thread +0.6 ms, frame no better). KYTY_COMPUTE_STATIC_FORMATS=0 turns it off.
+	// v446s: off by default again (KYTY_COMPUTE_STATIC_FORMATS=1 turns it on): with it, v446r drew
+	// the text of the game's notes with blocks over letters (Mac 11-22).
+	static const bool compute_static_formats = [] {
+		const char* value = std::getenv("KYTY_COMPUTE_STATIC_FORMATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	ir.info.static_buffer_formats = options.stage == ShaderType::Compute && compute_static_formats ? 1u : 0u;
 	if (options.non_fatal && Frontend::TranslationUnsupported()) {
 		DumpGaveUpCode(options, code);
 		ReportGaveUp(options, phases, "no IR translation for an instruction");
@@ -717,40 +883,82 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                 std::chrono::steady_clock::now() - begin)
 		                                 .count());
 	};
+	// KYTY_PASS_TIMES=1: per-pass milliseconds of the IR passes before resource tracking, printed
+	// with the phase line when they add up to a second or more (large programs).
+	static const bool pass_times_enabled = std::getenv("KYTY_PASS_TIMES") != nullptr;
+	std::map<std::string, uint64_t> pass_times;
+#define KYTY_PASS_TIME(name, call)                                                                 \
+	([&]() -> decltype(auto) {                                                                     \
+		const auto pass_begin_ = std::chrono::steady_clock::now();                                 \
+		struct PassTimer_ {                                                                        \
+			std::map<std::string, uint64_t>&      times;                                            \
+			std::chrono::steady_clock::time_point begin;                                            \
+			~PassTimer_() {                                                                         \
+				if (pass_times_enabled) {                                                           \
+					times[#name] += static_cast<uint64_t>(                                          \
+					    std::chrono::duration_cast<std::chrono::milliseconds>(                       \
+					        std::chrono::steady_clock::now() - begin)                               \
+					        .count());                                                              \
+				}                                                                                   \
+			}                                                                                       \
+		} pass_timer_ {pass_times, pass_begin_};                                                   \
+		return call;                                                                               \
+	}())
 	KYTY_PROFILER_PHASE(phases, "Shader: IR passes", profiler::colors::Green400);
-	IR::RewriteToSsa(ir.blocks);
-	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
-	IR::ResolveControlFlowIdentities(ir);
-	IR::RemoveIdentities(ir.blocks);
-	IR::EliminateDeadCode(ir.blocks);
+	const auto count_ir = [&](const char* when) {
+		if (!pass_times_enabled || ir.blocks.size() < 4096u) {
+			return;
+		}
+		size_t total = 0, phis = 0, identities = 0, phi_operands = 0;
+		for (auto* block: ir.blocks) {
+			for (const auto& inst: *block) {
+				total++;
+				if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
+					phis++;
+					phi_operands += inst.NumArgs();
+				}
+				identities += inst.GetOpcode() == IR::ValueOpcode::Identity ? 1u : 0u;
+			}
+		}
+		std::fprintf(stderr, "[pass-times] %016llx %s: blocks=%zu insts=%zu phis=%zu phi_operands=%zu identities=%zu\n",
+		             static_cast<unsigned long long>(options.shader_hash), when, ir.blocks.size(), total,
+		             phis, phi_operands, identities);
+	};
+	count_ir("before ssa");
+	KYTY_PASS_TIME(RewriteToSsa, IR::RewriteToSsa(ir.blocks));
+	count_ir("after ssa");
+	KYTY_PASS_TIME(ConstantPropagationPass, IR::ConstantPropagationPass(ir.blocks, ir.wave_size));
+	KYTY_PASS_TIME(ResolveControlFlowIdentities, IR::ResolveControlFlowIdentities(ir));
+	KYTY_PASS_TIME(RemoveIdentities, IR::RemoveIdentities(ir.blocks));
+	KYTY_PASS_TIME(EliminateDeadCode, IR::EliminateDeadCode(ir.blocks));
 	// Mask reads that fold can make select conditions and phis identical: fold until stable.
-	for (int round = 0; round < 4 && IR::FoldLaneMasks(ir) != 0; round++) {
-		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
-		IR::ResolveControlFlowIdentities(ir);
-		IR::RemoveIdentities(ir.blocks);
-		IR::EliminateDeadCode(ir.blocks);
+	for (int round = 0; round < 4 && KYTY_PASS_TIME(FoldLaneMasks, IR::FoldLaneMasks(ir)) != 0; round++) {
+		KYTY_PASS_TIME(ConstantPropagationPass, IR::ConstantPropagationPass(ir.blocks, ir.wave_size));
+		KYTY_PASS_TIME(ResolveControlFlowIdentities, IR::ResolveControlFlowIdentities(ir));
+		KYTY_PASS_TIME(RemoveIdentities, IR::RemoveIdentities(ir.blocks));
+		KYTY_PASS_TIME(EliminateDeadCode, IR::EliminateDeadCode(ir.blocks));
 	}
-	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
+	if (const auto folded = KYTY_PASS_TIME(SimplifyBoundedLoopRegisters, IR::SimplifyBoundedLoopRegisters(ir)); folded != 0) {
 		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
 		     GetDumpLabel(options), options.shader_hash, folded);
-		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
-		IR::ResolveControlFlowIdentities(ir);
-		IR::RemoveIdentities(ir.blocks);
-		IR::EliminateDeadCode(ir.blocks);
+		KYTY_PASS_TIME(ConstantPropagationPass, IR::ConstantPropagationPass(ir.blocks, ir.wave_size));
+		KYTY_PASS_TIME(ResolveControlFlowIdentities, IR::ResolveControlFlowIdentities(ir));
+		KYTY_PASS_TIME(RemoveIdentities, IR::RemoveIdentities(ir.blocks));
+		KYTY_PASS_TIME(EliminateDeadCode, IR::EliminateDeadCode(ir.blocks));
 	}
-	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	const auto read_lane_stats = KYTY_PASS_TIME(EliminateReadLane, IR::EliminateReadLane(ir, ir.wave_size));
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
-		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
-		IR::ResolveControlFlowIdentities(ir);
-		IR::RemoveIdentities(ir.blocks);
-		IR::EliminateDeadCode(ir.blocks);
+		KYTY_PASS_TIME(ConstantPropagationPass, IR::ConstantPropagationPass(ir.blocks, ir.wave_size));
+		KYTY_PASS_TIME(ResolveControlFlowIdentities, IR::ResolveControlFlowIdentities(ir));
+		KYTY_PASS_TIME(RemoveIdentities, IR::RemoveIdentities(ir.blocks));
+		KYTY_PASS_TIME(EliminateDeadCode, IR::EliminateDeadCode(ir.blocks));
 	}
-	if (const auto removed = IR::SimplifyLocalAddressStores(ir); removed != 0) {
+	if (const auto removed = KYTY_PASS_TIME(SimplifyLocalAddressStores, IR::SimplifyLocalAddressStores(ir)); removed != 0) {
 		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u\n",
 		     GetDumpLabel(options), options.shader_hash, removed);
-		IR::EliminateDeadCode(ir.blocks);
+		KYTY_PASS_TIME(EliminateDeadCode, IR::EliminateDeadCode(ir.blocks));
 	}
 	if (!LowerTessellationMemory(ir, options)) {
 		if (!options.non_fatal) {
@@ -842,6 +1050,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     " passes_ms=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, tracking_ms,
 	     ms_since(passes_begin), phase_ms());
+	if (pass_times_enabled && ms_since(passes_begin) >= 1000u) {
+		std::string list;
+		for (const auto& [name, ms]: pass_times) {
+			list += fmt::format(" {}={}", name, ms);
+		}
+		std::fprintf(stderr, "[pass-times] %016llx%s\n", static_cast<unsigned long long>(options.shader_hash),
+		             list.c_str());
+	}
+#undef KYTY_PASS_TIME
 	if (!tracked && options.non_fatal) {
 		DumpGaveUpCode(options, code);
 		ReportGaveUp(options, phases, "resource tracking failed");
@@ -878,6 +1095,35 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			TranslateResult unsupported_result;
 			unsupported_result.unsupported = true;
 			return unsupported_result;
+		}
+	}
+	// A bound on what the driver is given: a ray-tracing shader with every hit shader inlined
+	// (e6d76d24, 50,000 to 130,000 words) becomes millions of SPIR-V instructions, and the NVIDIA
+	// driver took more than 30 GB compiling one before the test closed it. The largest of the
+	// game's other shaders is under 700,000 SPIR-V words (14 to 21 per IR instruction).
+	// KYTY_MAX_IR_INSTRUCTIONS (default 200000, a few million SPIR-V words); 0: no bound.
+	if (options.non_fatal) {
+		static const uint64_t max_instructions = [] {
+			const char* value = std::getenv("KYTY_MAX_IR_INSTRUCTIONS");
+			return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {200000};
+		}();
+		if (max_instructions != 0) {
+			uint64_t instructions = 0;
+			for (const auto* block: ir.blocks) {
+				instructions += block->Instructions().size();
+			}
+			if (instructions > max_instructions) {
+				const auto reason = fmt::format("{} IR instructions, above the {}-instruction bound (KYTY_MAX_IR_INSTRUCTIONS)",
+				                                instructions, max_instructions);
+				std::fprintf(stderr, "[gave-up-reason] %016llx %s\n",
+				             static_cast<unsigned long long>(options.shader_hash), reason.c_str());
+				DumpGaveUpCode(options, code);
+				ReportGaveUp(options, phases, reason.c_str());
+				TranslateResult unsupported_result;
+				unsupported_result.unsupported             = true;
+				unsupported_result.input_dependent_refusal = true;
+				return unsupported_result;
+			}
 		}
 	}
 	TranslateResult result;
@@ -949,7 +1195,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 
+	const auto translation_variant   = ir.info.translation_variant; // v446h: kept across the collection
+	const auto static_buffer_formats = ir.info.static_buffer_formats;
 	IR::CollectShaderInfo(ir, options.input_info);
+	ir.info.translation_variant   = translation_variant;
+	ir.info.static_buffer_formats = static_buffer_formats;
 	IR::AllocateBindings(ir, push_data_start_dword,
 	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
 	                         options.input_info.compute->lds_storage,
@@ -967,7 +1217,43 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V emit", profiler::colors::CyanA700);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+	std::vector<uint32_t>              spirv;
+	std::vector<std::vector<uint32_t>> rt_callable_spirv;
+	std::vector<std::vector<uint32_t>> rt_callable_records;
+	if (ir.rt_modules.empty()) {
+		spirv = Spirv::EmitProgram(ir, options.input_info);
+	} else {
+		// A merged callable split: each module from its range of the blocks, with the program's one
+		// set of resources and bindings.
+		auto all_blocks = std::move(ir.blocks);
+		auto all_info   = std::move(ir.block_info);
+		ir.layout_blocks = &all_blocks;
+		const auto merged_scratch = ir.scratch_dwords;
+		for (const auto& module: ir.rt_modules) {
+			ir.blocks.assign(all_blocks.begin() + module.first_block,
+			                 all_blocks.begin() + module.first_block + module.block_count);
+			ir.block_info.assign(all_info.begin() + module.first_block,
+			                     all_info.begin() + module.first_block + module.block_count);
+			ir.rt_role  = module.role;
+			ir.rt_code_hash = module.code_hash;
+			// v442: a module's scratch is its own (function-local).
+			ir.scratch_dwords = ir.bindings.rt_fixed ? module.scratch_dwords : merged_scratch;
+			// v443: a shared callable's shader record (IR/RtCallable.h) comes back with its module.
+			std::vector<uint32_t> record;
+			auto module_spirv = Spirv::EmitProgram(ir, options.input_info, &record);
+			if (module.role == IR::RtRole::Raygen) {
+				spirv = std::move(module_spirv);
+			} else {
+				rt_callable_spirv.push_back(std::move(module_spirv));
+				rt_callable_records.push_back(std::move(record));
+			}
+		}
+		ir.layout_blocks  = nullptr;
+		ir.scratch_dwords = merged_scratch;
+		ir.blocks  = std::move(all_blocks);
+		ir.block_info = std::move(all_info);
+		ir.rt_role = IR::RtRole::Raygen;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
@@ -977,6 +1263,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               .count()));
 	CompileResult result;
 	result.spirv   = std::move(spirv);
+	result.rt_callable_spirv = std::move(rt_callable_spirv);
+	result.rt_callable_records = std::move(rt_callable_records);
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(translated.decoded_dump);

@@ -47,10 +47,19 @@ public:
 	const_iterator end() const;
 	bool           empty() const;
 
-	std::array<Value, NumScalarRegs> ssa_sreg_values {};
-	std::array<Value, NumScalarRegs> ssa_thread_bit_sreg_values {};
-	std::array<Value, NumScalarRegs> ssa_sreg_mask_tags {};
-	std::array<Value, NumVectorRegs> ssa_vreg_values {};
+	// SsaRewrite: sealed while filling, once every predecessor was filled (every cycle through
+	// the block passes a block sealed later); and a read collecting this block's operands.
+	bool ssa_sealed_early = false;
+	bool ssa_collecting   = false;
+	// SsaRewrite: position in the block list.
+	uint32_t ssa_index = 0;
+	// Set by translation on a structured construct's merge block: the construct's header. The
+	// construct's blocks lie between the two in block order, so a read at the merge of a variable
+	// no block in between defines takes the header's value without walking every branch.
+	Block* ssa_construct_header = nullptr;
+	// v446a: translation wrote EXEC in this block in a way that can turn lanes on
+	// (IR::Program::exec_widens_lanes); the emitter keeps wave-uniform branches around it.
+	bool exec_widens = false;
 
 private:
 	InstructionList     instructions;

@@ -7,6 +7,7 @@
 
 #include "graphics/host_gpu/renderer/image/imageHistory.h"
 #include "graphics/host_gpu/timeline.h"
+#include "common/floorStats.h"
 #include "common/fpsLog.h"
 
 #include "common/alignment.h"
@@ -255,8 +256,14 @@ static const bool g_bounded_buffer_writes = [] {
 
 // Diagnostics: names the shader whose bindings are prepared, for KYTY_WATCH_GPU_WRITE.
 struct DiagShaderScope {
-	explicit DiagShaderScope(uint64_t hash) { BufferCache::s_diag_shader_hash = hash; }
-	~DiagShaderScope() { BufferCache::s_diag_shader_hash = 0; }
+	explicit DiagShaderScope(uint64_t hash, ShaderType stage = ShaderType::Unknown) {
+		BufferCache::s_diag_shader_hash  = hash;
+		BufferCache::s_diag_shader_stage = static_cast<uint8_t>(stage);
+	}
+	~DiagShaderScope() {
+		BufferCache::s_diag_shader_hash  = 0;
+		BufferCache::s_diag_shader_stage = 0;
+	}
 	KYTY_CLASS_NO_COPY(DiagShaderScope);
 };
 
@@ -1164,6 +1171,8 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
                                                    vk::Format view_format, uint32_t size) {
 	auto&      texture_cache       = m_context.GetTextureCache();
 	const bool storage             = resource.written;
+	// v438zr (KYTY_TEX_SPARSE): a texture read without filtering, or written, keeps every level.
+	desc.whole_chain               = resource.unfiltered || resource.written;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -1634,8 +1643,14 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
 	heap.settled[key]  = 1;
 	heap.stale[key]    = 0;
-	heap.descriptors[key] = {};
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+	if (heap.value) {
+		// v439b: the T# the shader asked for (the key's value directory entry), not guest memory.
+		std::copy_n(heap.descriptors[key].begin(), 8, value.dwords.begin());
+	}
+	if (!heap.value) {
+		heap.descriptors[key] = {};
+	}
+	if (!heap.value && !Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
 		BindlessStat(StatNoBacking);
 		LogBindlessKey(heap, key, "no-backing", nullptr);
 		table.SetTranslation(heap, key, 0u);
@@ -2257,6 +2272,7 @@ static void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 
 void RenderExecutor::ResolveBindlessRequests() {
 	KYTY_PROFILER_FUNCTION();
+	const CpuCost::Phase cpu_phase_("Bindless::ResolveRequests");
 	// v384: queued translation entries whose earlier submissions have completed.
 	m_context.GetBindlessTable().PublishSafe();
 	// KYTY_BINDLESS_NONE=1 (v373, Crash B bisection, diagnostics only): no bindless key is ever
@@ -2514,6 +2530,35 @@ void RenderExecutor::ResolveBindlessRequests() {
 			}
 		}
 	}
+	// v439: blocks address-keyed images asked for become heaps first; their keys are requested
+	// from the next snapshot on.
+	m_context.GetBindlessTable().ProcessAddressRequests();
+	// v439b: T#s value-keyed images asked for get directory entries, resolved right away; then
+	// the value heaps' own pending keys (a texture that was not resolvable yet).
+	{
+		auto& table_ref = m_context.GetBindlessTable();
+		table_ref.ProcessValueRequests(m_bindless_value_created);
+		for (const auto& [heap, key]: m_bindless_value_created) {
+			if (resolved < Budget) {
+				resolved += ResolveBindlessKey(*heap, key) ? 1u : 0u;
+			}
+		}
+		for (uint32_t binding = 0; binding < ShaderRecompiler::IR::BindlessValueBindings; binding++) {
+			auto* heap = table_ref.ValueHeap(binding);
+			if (heap == nullptr) {
+				continue;
+			}
+			m_bindless_requests.clear();
+			table_ref.TakeRequests(*heap, m_bindless_requests);
+			requested += static_cast<uint32_t>(m_bindless_requests.size());
+			for (const auto key: m_bindless_requests) {
+				if (heap->settled[key] != 0 || heap->descriptors[key][0] == 0u || resolved >= Budget) {
+					continue;
+				}
+				resolved += ResolveBindlessKey(*heap, key) ? 1u : 0u;
+			}
+		}
+	}
 	for (auto& heap: m_context.GetBindlessTable().Heaps()) {
 		m_bindless_requests.clear();
 		m_context.GetBindlessTable().TakeRequests(heap, m_bindless_requests);
@@ -2534,6 +2579,9 @@ void RenderExecutor::ResolveBindlessRequests() {
 		}
 	}
 	Profiler::Add(Profiler::Counter::BindlessResolved, resolved);
+	if (Common::FloorStats::Enabled()) {
+		Common::FloorStats::Add(Common::FloorStats::Get().heap_keys, resolved);
+	}
 	g_bindless_engine_stats.requested.fetch_add(requested, std::memory_order_relaxed);
 	static std::atomic<uint32_t> logged = 0;
 	if (requested != 0 && logged.fetch_add(1) < 64) {
@@ -2747,11 +2795,43 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		return;
 	}
 	ResolveBindlessRequests();
+	uint32_t address_bindings = 0; // v439: the bindings whose address heaps this draw took
+	uint32_t value_bindings   = 0; // v439b: the bindings whose value heap this draw took
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (use.image >= program.info.images.size()) {
 			continue;
 		}
 		const auto& resource = program.info.images[use.image];
+		if (use.value) {
+			// v439b: a value-keyed image: the value heap of its binding, whose textures the
+			// shader may reach.
+			const auto binding = BindlessBindingFor(resource);
+			prepared.bindless_patches.push_back({use.mapping_offset, 0u, 0u});
+			if (binding < 32u && (value_bindings & (1u << binding)) == 0u) {
+				value_bindings |= 1u << binding;
+				if (auto* heap = table.ValueHeap(binding); heap != nullptr) {
+					prepared.bindless_heaps.push_back(heap);
+				}
+			}
+			continue;
+		}
+		if (use.address) {
+			// v439: an address-keyed image: its resource index for requests, and every address
+			// heap of its binding, whose textures the shader may reach.
+			const auto binding = BindlessBindingFor(resource);
+			prepared.bindless_patches.push_back(
+			    {use.mapping_offset, table.RegisterAddressResource(resource), 0u});
+			if (binding < 32u && (address_bindings & (1u << binding)) == 0u) {
+				address_bindings |= 1u << binding;
+				for (auto* heap: table.AddressHeaps(binding)) {
+					if (BindlessEngineEnabled() && table.NeedsWatch(*heap)) {
+						table.WatchHeap(*heap);
+					}
+					prepared.bindless_heaps.push_back(heap);
+				}
+			}
+			continue;
+		}
 		const uint64_t span  = use.size > use.table_offset ? use.size - use.table_offset : 0;
 		const auto entries   = static_cast<uint32_t>(std::min<uint64_t>(span / 32u, 1u << 18u));
 		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
@@ -2775,7 +2855,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
-	const DiagShaderScope diag_shader_scope(program.shader_hash);
+	const DiagShaderScope diag_shader_scope(program.shader_hash, program.stage);
 	// Diagnostics: KYTY_WATCH_SHADER=<hash> logs the buffer and texture descriptors a shader is
 	// bound with (first few uses; KYTY_WATCH_SHADER_EVERY=<n> adds every n-th use, up to 8 more).
 	const uint64_t        watch_shader = WatchedShaderHash();
@@ -3333,6 +3413,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
 	}
 	for (const auto& use: snapshot.bindless_heaps) {
+		if (use.address) {
+			continue; // v439: no table to survey
+		}
 		if (m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))
 		        .second) {
 			SurveyBindlessHeap(use);
@@ -3446,6 +3529,25 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
+		// v0.5b: a range that crosses a host zone's edge is not looked up here (the lookup would
+		// end the zone): a read gets a snapshot in ObtainBuffer, the zone stays.
+		if (cache.CrossesHostZone(address, size)) {
+			const auto& info = program.info.buffers[resource];
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 8) {
+				std::fprintf(stderr,
+				             "[host-zone] crossing binding 0x%llx+0x%llx: shader %016llx stage=%s resource %u "
+				             "written=%d formatted=%d table_read=%d\n",
+				             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+				             static_cast<unsigned long long>(program.shader_hash),
+				             ShaderStageResourceName(program.stage), resource, info.written ? 1 : 0,
+				             info.formatted ? 1 : 0, info.table_read ? 1 : 0);
+			}
+			if (!info.written && !info.formatted && !info.table_read) {
+				prepared.buffer_sources.push_back({address, size, BufferId {}});
+				continue;
+			}
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
@@ -3461,9 +3563,33 @@ static void NoteRepeat(uint64_t shader_hash, uint32_t stage,
 		return;
 	}
 	uint64_t h = XXH3_64bits_withSeed(flat.data(), flat.size() * sizeof(uint32_t), shader_hash);
+	// v438zk (next-phase plan, C2): the same without the flattened SRT words (the constants).
+	uint64_t resources = shader_hash;
 	for (const auto& src: sources) {
 		const uint64_t words[2] = {src.address, src.size};
-		h = XXH3_64bits_withSeed(words, sizeof(words), h);
+		h         = XXH3_64bits_withSeed(words, sizeof(words), h);
+		resources = XXH3_64bits_withSeed(words, sizeof(words), resources);
+	}
+	// [repeat-stage]: per stage type, how many calls have the program and buffer ranges of the
+	// previous call of that stage type (the previous draw's vertex stage, the previous draw's
+	// pixel stage, the previous dispatch), and how many of those also the same constants. A stage
+	// that repeats could keep its descriptor set bound and push only its constants (plan C2).
+	// Buffers only: images go through the bindless table.
+	struct StageRepeat {
+		uint64_t calls = 0, same_resources = 0, same_all = 0, previous_resources = 0, previous_all = 0;
+	};
+	static StageRepeat stage_repeat[16];
+	{
+		auto& r = stage_repeat[stage & 15u];
+		r.calls++;
+		if (r.calls > 1 && r.previous_resources == resources) {
+			r.same_resources++;
+			if (r.previous_all == h) {
+				r.same_all++;
+			}
+		}
+		r.previous_resources = resources;
+		r.previous_all       = h;
 	}
 	struct State {
 		uint64_t                     frame = 0;
@@ -3498,6 +3624,17 @@ static void NoteRepeat(uint64_t shader_hash, uint32_t stage,
 		             pct(st.dup[0], st.calls[0]), static_cast<unsigned long long>(st.calls[1]),
 		             st.frames ? double(st.calls[1]) / double(st.frames) : 0.0, pct(st.prev_hits[1], st.calls[1]),
 		             pct(st.dup[1], st.calls[1]));
+		std::string line = "[repeat-stage] 5 s, same program and buffers as the previous call of the stage type (and also the same constants):";
+		for (uint32_t type = 0; type < 16; type++) {
+			auto& r = stage_repeat[type];
+			if (r.calls == 0) {
+				continue;
+			}
+			line += fmt::format(" | {} {} calls: {:.1f} % ({:.1f} %)", ShaderStageResourceName(static_cast<ShaderType>(type)),
+			                    r.calls, pct(r.same_resources, r.calls), pct(r.same_all, r.calls));
+			r.calls = r.same_resources = r.same_all = 0; // the previous hashes stay
+		}
+		std::fprintf(stderr, "%s\n", line.c_str());
 		st.calls[0] = st.calls[1] = st.prev_hits[0] = st.prev_hits[1] = st.dup[0] = st.dup[1] = 0;
 		st.frames = 0;
 		st.last   = now;
@@ -3512,7 +3649,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != layout.memory_offset_count);
-	const DiagShaderScope diag_shader_scope(program.shader_hash);
+	const DiagShaderScope diag_shader_scope(program.shader_hash, program.stage);
 
 	prepared.buffers.clear();
 	prepared.buffers.reserve(layout.memory_offset_count);
@@ -3558,12 +3695,33 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.shader_data[layout.BufferLengthDword() + i] = 0;
 			continue;
 		}
+		if (m_delta_reuse != nullptr &&
+		    DeltaSlotReusable(i, prepared.buffer_sources[i], program.info.buffers[resource].written,
+		                      program.info.buffers[resource].table_read, program.info.buffers[resource].formatted,
+		                      layout.memory_offset_dword)) {
+			// v445b (KYTY_DISPATCH_DELTA): the previous dispatch's binding of the same read-only,
+			// CPU-clean range; tracked_base stays 0 (only written bindings are write-tracked).
+			prepared.buffers.push_back(m_delta_reuse->buffers[i]);
+			buffer_offset =
+			    (m_delta_reuse->shader_data[layout.memory_offset_dword + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
+			m_delta_reused++;
+		} else {
 		prepared.buffers.push_back(NativeStorageBuffer(
 		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
 		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
 		                                                    : nullptr,
 		    buffer_offset, write_tracking && program.info.buffers[resource].write_tracked,
 		    tracked_base));
+		}
+		// KYTY_VERTEX_VERIFY: a read-only range of a checked draw is compared with guest memory.
+		if (auto& verify = m_context.GetBufferCache();
+		    verify.VertexVerifyArmed() && !program.info.buffers[resource].written) {
+			const auto& bound = prepared.buffers.back();
+			verify.VertexVerifyRange("storage buffer", i, program.shader_hash,
+			                         prepared.buffer_sources[i].address,
+			                         prepared.buffer_sources[i].size, bound.buffer,
+			                         bound.offset + buffer_offset);
+		}
 		if (write_tracking) {
 			const auto dword                     = layout.WriteTrackDword() + 2u + 2u * i;
 			prepared.shader_data[dword]          = static_cast<uint32_t>(tracked_base);
@@ -3573,10 +3731,56 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
 		// buffer still has no accessible elements. In particular, never let a null store
 		// modify the shared fallback and affect subsequent null reads.
+		// v443m: a callable split's modules check the length themselves (spirvEmitterMemoryHelpers.cpp):
+		// a null descriptor (an address below the first page) has none, so they never read through it.
 		prepared.shader_data[layout.BufferLengthDword() + i] =
-		    prepared.buffer_sources[i].size == 0
+		    prepared.buffer_sources[i].size == 0 || (layout.rt_fixed && !prepared.buffers.back().buffer)
 		        ? 0u
 		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
+	}
+	// KYTY_WATCH_BINDINGS=1 with KYTY_FRAME_SKIPS=1 (11-25, the opening-cinematic hang): for a watched
+	// shader, the guest address each binding slot really points the shader at (host buffer's guest
+	// base + descriptor offset + the offset byte the shader adds), against the guest range of its V#.
+	// "MISMATCH" when they differ. A slot bound to a ring (stream/upload) prints "ring".
+	if (static const bool watch_bindings = [] {
+		    const char* value = std::getenv("KYTY_WATCH_BINDINGS");
+		    return value != nullptr && value[0] == '1';
+	    }();
+	    watch_bindings && Common::FrameSkips::Enabled() && Common::FrameSkips::Watched(program.shader_hash)) {
+		static std::atomic<uint32_t> lines {0};
+		auto&                        cache = m_context.GetBufferCache();
+		std::string                  text;
+		bool                         mismatch = false;
+		for (uint32_t i = 0; i < layout.memory_offset_count && i < prepared.buffers.size(); i++) {
+			const auto& src   = prepared.buffer_sources[i];
+			const auto& bound = prepared.buffers[i];
+			const auto  adj   = (prepared.shader_data[layout.memory_offset_dword + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
+			text += fmt::format(" [{} res={} {:x}:{:x}", i, layout.descriptors.front().resources[i], src.address, src.size);
+			if (src.size == 0) {
+				text += " null]";
+				continue;
+			}
+			const auto* host = src.id ? &cache.GetBuffer(src.id) : nullptr;
+			if (host != nullptr && host->Handle() == bound.buffer) {
+				const auto seen = host->CpuAddress() + bound.offset + adj;
+				text += fmt::format(" seen={:x} off={:x} adj={} range={:x}", seen, bound.offset, adj, bound.range);
+				if (seen != src.address) {
+					text += " MISMATCH";
+					mismatch = true;
+				}
+			} else {
+				text += fmt::format(" ring off={:x} adj={} range={:x}", bound.offset, adj, bound.range);
+			}
+			text += "]";
+		}
+		if (mismatch || lines.load(std::memory_order_relaxed) < 200) {
+			if (lines.fetch_add(1) < 20000) {
+				std::fprintf(stderr, "[watch-bind] flip=%llu sh=%016llx stage=%s%s\n",
+				             static_cast<unsigned long long>(Common::FrameSkips::g_flip.load(std::memory_order_relaxed)),
+				             static_cast<unsigned long long>(program.shader_hash),
+				             ShaderStageResourceName(program.stage), text.c_str());
+			}
+		}
 	}
 	NoteRepeat(program.shader_hash, static_cast<uint32_t>(program.stage), prepared.buffer_sources,
 	           snapshot.flattened_srt);
@@ -3787,6 +3991,67 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		             static_cast<unsigned long long>(hash_words(snapshot.flattened_srt)),
 		             static_cast<unsigned long long>(hash_words(snapshot.user_data)),
 		             static_cast<unsigned long long>(hash_words(prepared.shader_data)), bufs.c_str());
+		// KYTY_WATCH_COUNTS=1 (11-25, the opening-cinematic hang): the loop bounds a watched shader
+		// reads, as guest memory holds them when the draw takes its copy (or, for a host zone, shortly
+		// before the GPU reads them): per bound buffer, dword 127 (byte 508) and dword 151 (byte 604)
+		// when in range, and for a buffer of 128-byte records the largest (dword 27 >> 16) (f9a169937ee2eacf's
+		// per-light inner count at record byte 108) and how many records exceed 4096. Printed when it
+		// differs from the previous line for the shader, at most KYTY_WATCH_COUNTS_MAX (3000) lines.
+		static const bool watch_counts = [] {
+			const char* value = std::getenv("KYTY_WATCH_COUNTS");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (watch_counts) {
+			static const uint64_t max_lines = [] {
+				const char* value = std::getenv("KYTY_WATCH_COUNTS_MAX");
+				return value != nullptr ? std::strtoull(value, nullptr, 10) : 3000ull;
+			}();
+			static std::mutex                             counts_mutex;
+			static std::unordered_map<uint64_t, std::string> last_line;
+			static uint64_t                               lines = 0;
+			std::string                                   text;
+			for (const auto& src: prepared.buffer_sources) {
+				if (src.size == 0) {
+					continue;
+				}
+				text += fmt::format(" {:x}:{:x}", src.address, src.size);
+				uint32_t word = 0;
+				// dword 0 (a count at the head of a list, b9f49649da3973b7's volume loop) and whether
+				// the GPU wrote the range (then guest memory may not hold the GPU's bytes yet).
+				if (Libs::LibKernel::Memory::TryReadBacking(src.address, &word, 4)) {
+					text += fmt::format(" @0={}", word);
+				}
+				text += m_context.GetBufferCache().IsRegionGpuModified(src.address, src.size) ? " gpu" : "";
+				if (src.size >= 512 && Libs::LibKernel::Memory::TryReadBacking(src.address + 508, &word, 4)) {
+					text += fmt::format(" @508={}", word);
+				}
+				if (src.size >= 608 && Libs::LibKernel::Memory::TryReadBacking(src.address + 604, &word, 4)) {
+					text += fmt::format(" @604={}", word);
+				}
+				if (src.size >= 128 && src.size % 128 == 0 && src.size <= (1u << 20u)) {
+					static thread_local std::vector<uint32_t> records;
+					records.resize(src.size / 4);
+					if (Libs::LibKernel::Memory::TryReadBacking(src.address, records.data(), src.size)) {
+						uint32_t largest = 0, above = 0;
+						for (size_t i = 27; i < records.size(); i += 32) {
+							const auto count = records[i] >> 16u;
+							largest          = std::max(largest, count);
+							above += count > 4096 ? 1u : 0u;
+						}
+						text += fmt::format(" rec_max={} rec_over4k={}", largest, above);
+					}
+				}
+			}
+			std::lock_guard lock(counts_mutex);
+			auto&           last = last_line[program.shader_hash];
+			if (text != last && lines < max_lines) {
+				lines++;
+				last = text;
+				std::fprintf(stderr, "[watch-counts] flip=%llu sh=%016llx%s\n",
+				             static_cast<unsigned long long>(Common::FrameSkips::g_flip.load(std::memory_order_relaxed)),
+				             static_cast<unsigned long long>(program.shader_hash), text.c_str());
+			}
+		}
 		// KYTY_DECAL_CHK=1: the guest bytes of each bound buffer of at most KYTY_DECAL_CHK_MAX_KB
 		// (default 16384) are hashed now, when the draw takes its copy of them, and again at a later
 		// watched draw once the GPU has finished this one's command buffer (on this thread: a
@@ -4267,6 +4532,144 @@ void RenderExecutor::CaptureBuffers(const PreparedBindings& prepared) {
 	}
 }
 
+// KYTY_RENDER_STATS, [draw-delta] (11-20): would the dispatch delta path's buffer take-over pay
+// for draws? For a draw stage that runs the program the stage at the same position of the
+// previous draw ran, in the same command buffer, the buffer slots by class and by whether their
+// source (address, size, cache buffer) is the previous draw's:
+// - read-only: bound from the cache buffer;
+// - written: the program writes it (never taken over);
+// - ring copy: the previous draw bound a record-time copy in the stream or upload buffer (a
+//   small CPU-written range; never taken over);
+// - table: read through the GPU address table (no binding).
+// "take-over" is RenderExecutor::DeltaSlotReusable itself, asked before the stage's
+// RebindBuffers with the previous draw's stage as the base: the slots a draw delta path would
+// not resolve again. "unchanged read-only refused" are read-only slots with the same source it
+// still refuses (CPU-dirty pages in the range, a formatted buffer, another host buffer).
+// Counted only with the stats on; nothing is bound from the census.
+namespace {
+struct DrawDeltaStats {
+	std::atomic<uint64_t> draws {0}, stages {0}, slots {0}, same {0}, same_slots {0};
+	std::atomic<uint64_t> ro_same {0}, ro_changed {0}, written_same {0}, written_changed {0};
+	std::atomic<uint64_t> ring_same {0}, ring_changed {0}, table {0}, takeover {0}, ro_refused {0};
+	std::array<std::atomic<uint64_t>, 6> histogram {}; // slots left to resolve: 0, 1, 2, 3, 4, 5+
+	std::atomic<int64_t> last_report {0};
+};
+DrawDeltaStats g_draw_delta;
+
+void ReportDrawDelta() {
+	auto&      g    = g_draw_delta;
+	const auto now  = std::chrono::steady_clock::now().time_since_epoch();
+	const auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+	auto       last = g.last_report.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g.last_report.compare_exchange_strong(last, ms);
+		return;
+	}
+	if (ms - last < 5000 || !g.last_report.compare_exchange_strong(last, ms)) {
+		return;
+	}
+	const double seconds = static_cast<double>(ms - last) / 1000.0;
+	const auto   stages  = g.stages.exchange(0);
+	const auto   same    = g.same.exchange(0);
+	const auto   slots   = g.slots.exchange(0);
+	const auto   same_slots = g.same_slots.exchange(0);
+	const double per     = same != 0 ? 1.0 / static_cast<double>(same) : 0.0;
+	std::array<double, 6> h {};
+	for (size_t k = 0; k < h.size(); k++) {
+		h[k] = 100.0 * static_cast<double>(g.histogram[k].exchange(0)) * per;
+	}
+	const auto take = [&](std::atomic<uint64_t>& v) { return static_cast<double>(v.exchange(0)) * per; };
+	const double ro_same = take(g.ro_same), ro_changed = take(g.ro_changed);
+	const double wr_same = take(g.written_same), wr_changed = take(g.written_changed);
+	const double ring_same = take(g.ring_same), ring_changed = take(g.ring_changed);
+	const double table = take(g.table), ro_refused = take(g.ro_refused);
+	const auto   takeover = g.takeover.exchange(0);
+	std::fprintf(stderr,
+	             "[draw-delta] %.0f draws/s, %.0f stages/s (%.1f buffer slots each), %.0f/s same program as "
+	             "the previous draw's stage: per such stage %.1f slots = read-only %.2f same + %.2f changed, "
+	             "written %.2f same + %.2f changed, ring copy %.2f same + %.2f changed, table %.2f | take-over "
+	             "%.2f a stage (%.0f%% of their slots, %.0f%% of all slots), unchanged read-only refused %.2f | "
+	             "slots left to resolve 0 %.0f%% 1 %.0f%% 2 %.0f%% 3 %.0f%% 4 %.0f%% 5+ %.0f%%\n",
+	             static_cast<double>(g.draws.exchange(0)) / seconds, static_cast<double>(stages) / seconds,
+	             stages != 0 ? static_cast<double>(slots) / static_cast<double>(stages) : 0.0,
+	             static_cast<double>(same) / seconds, static_cast<double>(same_slots) * per, ro_same, ro_changed,
+	             wr_same, wr_changed, ring_same, ring_changed, table, static_cast<double>(takeover) * per,
+	             same_slots != 0 ? 100.0 * static_cast<double>(takeover) / static_cast<double>(same_slots) : 0.0,
+	             slots != 0 ? 100.0 * static_cast<double>(takeover) / static_cast<double>(slots) : 0.0, ro_refused,
+	             h[0], h[1], h[2], h[3], h[4], h[5]);
+}
+} // namespace
+
+void RenderExecutor::NoteDrawDeltaBefore(uint32_t stage, const PreparedBindings& prepared) {
+	if (stage >= m_draw_census.size() || prepared.runtime == nullptr || !*prepared.runtime) {
+		return;
+	}
+	auto&       g       = g_draw_delta;
+	const auto& program = *prepared.runtime->program;
+	const auto& layout  = program.bindings;
+	auto&       base    = m_draw_census[stage];
+	auto&       cache   = m_context.GetBufferCache();
+	const auto  count   = layout.memory_offset_count;
+	g.stages.fetch_add(1, std::memory_order_relaxed);
+	g.slots.fetch_add(count, std::memory_order_relaxed);
+	const bool same = base.valid && base.program == static_cast<const void*>(&program) &&
+	                  base.tick == m_context.GetCommandScheduler().CurrentTick() &&
+	                  base.sources.size() == count && base.buffers.size() == count &&
+	                  prepared.buffer_sources.size() == count;
+	base.valid = false;
+	if (!same) {
+		return;
+	}
+	g.same.fetch_add(1, std::memory_order_relaxed);
+	g.same_slots.fetch_add(count, std::memory_order_relaxed);
+	const auto stream   = cache.GetUtilityBuffer(MemoryUsage::Stream).Handle();
+	const auto upload   = cache.GetUtilityBuffer(MemoryUsage::Upload).Handle();
+	const auto* reuse   = std::exchange(m_delta_reuse, &base);
+	uint32_t   resolved = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto  resource  = layout.descriptors.front().resources[i];
+		const auto& info      = program.info.buffers[resource];
+		const auto& source    = prepared.buffer_sources[i];
+		const auto& old       = base.sources[i];
+		const bool  unchanged = old.address == source.address && old.size == source.size && old.id == source.id;
+		const bool  ring      = base.buffers[i].buffer == stream || base.buffers[i].buffer == upload;
+		const bool  read_only = !info.table_read && !info.written && !ring;
+		if (info.table_read) {
+			g.table.fetch_add(1, std::memory_order_relaxed);
+		} else if (info.written) {
+			(unchanged ? g.written_same : g.written_changed).fetch_add(1, std::memory_order_relaxed);
+		} else if (ring) {
+			(unchanged ? g.ring_same : g.ring_changed).fetch_add(1, std::memory_order_relaxed);
+		} else {
+			(unchanged ? g.ro_same : g.ro_changed).fetch_add(1, std::memory_order_relaxed);
+		}
+		if (DeltaSlotReusable(i, source, info.written, info.table_read, info.formatted, layout.memory_offset_dword)) {
+			g.takeover.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			resolved++;
+			if (read_only && unchanged) {
+				g.ro_refused.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+	m_delta_reuse = reuse;
+	g.histogram[std::min(resolved, 5u)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void RenderExecutor::NoteDrawDeltaAfter(uint32_t stage, const PreparedBindings& prepared) {
+	if (stage >= m_draw_census.size() || prepared.runtime == nullptr || !*prepared.runtime) {
+		return;
+	}
+	auto& base            = m_draw_census[stage];
+	base.program          = static_cast<const void*>(&*prepared.runtime->program);
+	base.tick             = m_context.GetCommandScheduler().CurrentTick();
+	base.unregister_epoch = m_context.GetBufferCache().UnregisterEpoch();
+	base.sources          = prepared.buffer_sources;
+	base.buffers          = prepared.buffers;
+	base.shader_data      = prepared.shader_data;
+	base.valid            = true;
+}
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
@@ -4306,6 +4709,20 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	m_rebind_epoch = m_context.GetBufferCache().UnregisterEpoch();
+	if (RenderStats::Enabled()) {
+		// [draw-delta]: the census asks before each stage's rebind (a rebind uploads and cleans
+		// the range) and keeps what the rebind resolved for the next draw.
+		g_draw_delta.draws.fetch_add(1, std::memory_order_relaxed);
+		uint32_t position = 0;
+		for (auto* stage: stages) {
+			NoteDrawDeltaBefore(position, *stage);
+			RebindBuffers(*stage);
+			NoteDrawDeltaAfter(position, *stage);
+			position++;
+		}
+		ReportDrawDelta();
+		return;
+	}
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}
@@ -4908,6 +5325,65 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			EXIT_IF(m_image_occurrences[i] != expected);
 		}
 
+		// v443i: the slots of a callable split's fixed set layout that the program does not fill
+		// (its arrays have capacities, and it has every non-array binding) are written too, as null
+		// descriptors: a read through one gives zero. They were left as the set's memory had them,
+		// which in a pool used before is whatever another set had there, views of images destroyed
+		// since included. Nothing should read them; three device losses (g443e, g443g, g443h) were a
+		// read inside a destroyed image none of the dispatch's own views named.
+		// KYTY_RT_NULL_SLOTS=0: left unwritten, as before.
+		static const bool null_slots = [] {
+			const char* value = std::getenv("KYTY_RT_NULL_SLOTS");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (null_slots && pipeline.ray_tracing && program.bindings.rt_fixed &&
+		    ShaderRecompiler::Spirv::GetRobustBufferAccess()) {
+			thread_local std::vector<vk::DescriptorImageInfo>  null_images, spare_samplers;
+			thread_local std::vector<vk::DescriptorBufferInfo> null_buffers;
+			thread_local std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+			const auto fixed = ShaderRecompiler::IR::RtFixedSetLayout(program.bindings);
+			uint32_t   most  = 1;
+			for (const auto& slot: fixed) {
+				most = std::max(most, slot.count);
+			}
+			const vk::Sampler spare = descriptors.samplers.empty() ? vk::Sampler {} : descriptors.samplers.front();
+			null_images.assign(most, vk::DescriptorImageInfo {nullptr, nullptr, vk::ImageLayout::eGeneral});
+			spare_samplers.assign(most, vk::DescriptorImageInfo {spare, nullptr, vk::ImageLayout::eUndefined});
+			null_buffers.assign(most, vk::DescriptorBufferInfo {nullptr, 0, VK_WHOLE_SIZE});
+			for (const auto& slot: fixed) {
+				const auto*    binding = ShaderRecompiler::IR::FindBinding(program.bindings, slot.kind);
+				const uint32_t written = binding != nullptr ? NativeDescriptorCount(*binding) : 0u;
+				if (written >= slot.count) {
+					continue;
+				}
+				vk::WriteDescriptorSet write {};
+				write.dstBinding      = ShaderRecompiler::IR::NativeBinding(program.stage, slot.kind);
+				write.dstArrayElement = written;
+				write.descriptorType  = NativeDescriptorType(slot.kind);
+				write.descriptorCount = slot.count - written;
+				if (ShaderRecompiler::IR::ImageBindingResourceClass(slot.kind) !=
+				    ShaderRecompiler::IR::ImageResourceClass::None) {
+					write.pImageInfo = null_images.data();
+				} else if (slot.kind == BindingKind::Samplers) {
+					if (!spare) {
+						continue; // a sampler cannot be null, and the program has none to stand in
+					}
+					write.pImageInfo = spare_samplers.data();
+				} else if (slot.kind == BindingKind::BdaPagetable || slot.kind == BindingKind::FaultBuffer) {
+					// Every module of the split can translate an address: the real tables.
+					auto&       cache  = m_context.GetBufferCache();
+					const auto* buffer = slot.kind == BindingKind::BdaPagetable ? cache.GetBdaPageTableBuffer()
+					                                                            : cache.GetFaultBuffer();
+					auto& info = address_buffers[slot.kind == BindingKind::BdaPagetable ? 0u : 1u];
+					info       = vk::DescriptorBufferInfo {buffer->Handle(), 0, buffer->Size()};
+					write.pBufferInfo = &info;
+				} else {
+					write.pBufferInfo = null_buffers.data();
+				}
+				m_descriptor_writes.push_back(write);
+			}
+		}
+
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
 		if (program.bindings.UsesPushData()) {
@@ -4929,7 +5405,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
-	if (pipeline_bind_point == vk::PipelineBindPoint::eGraphics && pipeline.push_stages) {
+	if ((pipeline_bind_point == vk::PipelineBindPoint::eGraphics ||
+	     pipeline_bind_point == vk::PipelineBindPoint::eRayTracingKHR) &&
+	    pipeline.push_stages) {
+		// v440 M3: a callable split's ray-tracing pipeline pushes to its ray-generation and
+		// callable stages.
 		push_stages = pipeline.push_stages;
 	}
 	if (has_push_data) {
@@ -4993,11 +5473,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                std::span(m_descriptor_writes.data() + m_last_commit.pre_writes,
 			                          m_descriptor_writes.size() - m_last_commit.pre_writes));
 		} else if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
+			PushDescriptorsDelta(vk_buffer, pipeline_bind_point, pipeline.pipeline_layout);
 		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			if (pipeline_bind_point != vk::PipelineBindPoint::eGraphics) {
+				m_dispatch_delta.writes_valid = false; // a bound set, not pushed descriptors
+			}
+			// v442: a callable split's fixed set layout holds hundreds of descriptors (capacities,
+			// IR/RtCallable.h) and is used a few times a frame: few sets are allocated ahead.
+			const auto set = m_context.GetDescriptorHeap().Commit(
+			    pipeline.descriptor_set_layout, pipeline.ray_tracing ? 4u : DescriptorHeap::DescriptorSetBatch);
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
@@ -5036,6 +5520,132 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 }
 
+// v445b (KYTY_DISPATCH_DELTA). A slot of the dispatch being rebound may take the base's binding when
+// - the shader only reads it, not through the address table, and not as a formatted (texel) buffer,
+//   which an obtain may refresh from an image the GPU wrote over the same memory;
+// - its source (guest range and cache buffer) is the base's, and no buffer was unregistered or
+//   joined since (the epoch RebindAfterJoin and multi-draw replay use);
+// - the base bound the cache's own buffer, not a copy of the guest's bytes made at record time
+//   (the stream and upload buffers: such ranges are not tracked, their bytes may have changed),
+//   and the cache buffer's host buffer is still that one;
+// - no page of it is CPU-modified now: a guest write since the base faulted and marked it.
+// GPU writes to the range land in the same cache buffer, so they need no new binding.
+bool RenderExecutor::DeltaSlotReusable(uint32_t slot, const PreparedBindings::BufferSource& source, bool written,
+                                       bool table_read, bool formatted, uint32_t offset_dword) const {
+	const auto& base  = *m_delta_reuse;
+	auto&       cache = m_context.GetBufferCache();
+	if (written || table_read || formatted || slot >= base.sources.size() || slot >= base.buffers.size() ||
+	    static_cast<size_t>(offset_dword) + slot / 4u >= base.shader_data.size() ||
+	    source.address < BufferCache::CACHING_PAGESIZE || source.size == 0 ||
+	    cache.UnregisterEpoch() != base.unregister_epoch || SyncToggle::ForceUpload()) {
+		return false;
+	}
+	const auto& old   = base.sources[slot];
+	const auto  bound = base.buffers[slot].buffer;
+	if (old.address != source.address || old.size != source.size || !source.id || !(old.id == source.id) ||
+	    !bound || bound == cache.GetUtilityBuffer(MemoryUsage::Stream).Handle() ||
+	    bound == cache.GetUtilityBuffer(MemoryUsage::Upload).Handle() ||
+	    // The cache buffer still has the host buffer the base bound (sharing replaces it in place).
+	    cache.GetBuffer(source.id).Handle() != bound) {
+		return false;
+	}
+	return !cache.IsRegionCpuModified(source.address, source.size);
+}
+
+// v445b (KYTY_DISPATCH_DELTA). Pushes m_descriptor_writes to set 0. At the compute bind point the
+// writes are also kept, flattened to values; when the dispatch says the bind point still holds
+// what the previous push left (m_delta_push: same pipeline, same command buffer, nothing bound or
+// recorded raw since), only the writes whose values differ are pushed: a push descriptor stays as
+// it is until it is pushed again or the bind point is disturbed with another layout.
+void RenderExecutor::PushDescriptorsDelta(const CommandRecorder& recorder, vk::PipelineBindPoint bind_point,
+                                          vk::PipelineLayout layout) {
+	const bool delta = std::exchange(m_delta_push, false);
+	const auto count = static_cast<uint32_t>(m_descriptor_writes.size());
+	m_delta_writes   = count;
+	m_delta_pushed   = count;
+	if (bind_point != vk::PipelineBindPoint::eCompute || !DispatchDeltaEnabled()) {
+		if (bind_point != vk::PipelineBindPoint::eGraphics) {
+			m_dispatch_delta.writes_valid = false;
+		}
+		recorder.pushDescriptorSetKHR(bind_point, layout, 0, count, m_descriptor_writes.data());
+		return;
+	}
+	// binding << 32 | element, count << 32 | type, then three words per descriptor.
+	auto& flat = m_delta_flat;
+	flat.clear();
+	bool comparable = true;
+	for (const auto& write: m_descriptor_writes) {
+		flat.push_back((uint64_t {write.dstBinding} << 32u) | write.dstArrayElement);
+		flat.push_back((uint64_t {write.descriptorCount} << 32u) | static_cast<uint32_t>(write.descriptorType));
+		comparable = comparable && write.pNext == nullptr;
+		for (uint32_t i = 0; i < write.descriptorCount; i++) {
+			switch (write.descriptorType) {
+				case vk::DescriptorType::eSampler:
+				case vk::DescriptorType::eCombinedImageSampler:
+				case vk::DescriptorType::eSampledImage:
+				case vk::DescriptorType::eStorageImage:
+				case vk::DescriptorType::eInputAttachment: {
+					const auto& info = write.pImageInfo[i];
+					flat.push_back(reinterpret_cast<uint64_t>(static_cast<VkSampler>(info.sampler)));
+					flat.push_back(reinterpret_cast<uint64_t>(static_cast<VkImageView>(info.imageView)));
+					flat.push_back(static_cast<uint64_t>(info.imageLayout));
+					break;
+				}
+				case vk::DescriptorType::eUniformBuffer:
+				case vk::DescriptorType::eStorageBuffer:
+				case vk::DescriptorType::eUniformBufferDynamic:
+				case vk::DescriptorType::eStorageBufferDynamic: {
+					const auto& info = write.pBufferInfo[i];
+					flat.push_back(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(info.buffer)));
+					flat.push_back(info.offset);
+					flat.push_back(info.range);
+					break;
+				}
+				case vk::DescriptorType::eUniformTexelBuffer:
+				case vk::DescriptorType::eStorageTexelBuffer:
+					flat.push_back(reinterpret_cast<uint64_t>(static_cast<VkBufferView>(write.pTexelBufferView[i])));
+					flat.push_back(0);
+					flat.push_back(0);
+					break;
+				default: comparable = false; break; // values in an extension structure: always pushed
+			}
+		}
+	}
+	auto& base   = m_dispatch_delta;
+	bool  pushed = false;
+	if (delta && comparable && base.writes_valid && base.layout == layout && base.write_count == count &&
+	    base.writes.size() == flat.size()) {
+		m_delta_changed.clear();
+		size_t at     = 0;
+		bool   shaped = true; // the same bindings, elements, counts and types in the same order
+		for (uint32_t i = 0; i < count && shaped; i++) {
+			const size_t words = 2u + 3u * static_cast<size_t>(m_descriptor_writes[i].descriptorCount);
+			shaped = at + words <= flat.size() && flat[at] == base.writes[at] && flat[at + 1u] == base.writes[at + 1u];
+			if (shaped && !std::equal(flat.begin() + static_cast<std::ptrdiff_t>(at + 2u),
+			                          flat.begin() + static_cast<std::ptrdiff_t>(at + words),
+			                          base.writes.begin() + static_cast<std::ptrdiff_t>(at + 2u))) {
+				m_delta_changed.push_back(m_descriptor_writes[i]);
+			}
+			at += words;
+		}
+		if (shaped) {
+			if (!m_delta_changed.empty()) {
+				recorder.pushDescriptorSetKHR(bind_point, layout, 0, static_cast<uint32_t>(m_delta_changed.size()),
+				                              m_delta_changed.data());
+			}
+			m_delta_pushed = static_cast<uint32_t>(m_delta_changed.size());
+			pushed         = true;
+		}
+	}
+	if (!pushed) {
+		recorder.pushDescriptorSetKHR(bind_point, layout, 0, count, m_descriptor_writes.data());
+	}
+	base.writes.swap(flat);
+	base.layout       = layout;
+	base.write_count  = count;
+	base.writes_valid = comparable;
+}
+
 bool RenderExecutor::RecommitShaderData(CommandBuffer& buffer, std::span<const uint32_t> data) {
 	const auto& commit = m_last_commit;
 	if (commit.stage0_data_slot < 0 && commit.stage0_push_start < 0) {
@@ -5065,14 +5675,36 @@ bool RenderExecutor::RecommitShaderData(CommandBuffer& buffer, std::span<const u
 		// The writes point into m_descriptor_buffers; the recorder copies them when it records.
 		m_descriptor_buffers[static_cast<size_t>(commit.stage0_data_slot)] = uploaded;
 		if (commit.ps_set_layout != nullptr) {
+			// v438z: only the set that holds the changed slot. The first stage's shader data is in
+			// set 0; the pixel shader's set (set 2) was committed with this layout and nothing of it
+			// changed, so it stays bound: binding set 0 again with the same pipeline layout does not
+			// disturb a higher set. Before, every replayed sub-draw whose shader data lives in a
+			// buffer allocated, wrote and bound the pixel shader's set again as well.
+			// KYTY_RECOMMIT_PS_SET=1 restores that.
+			static const bool both_sets = [] {
+				const char* value = std::getenv("KYTY_RECOMMIT_PS_SET");
+				return value != nullptr && value[0] == '1';
+			}();
+			const auto* changed = &m_descriptor_buffers[static_cast<size_t>(commit.stage0_data_slot)];
+			bool        in_pre  = false;
+			for (size_t i = 0; i < commit.pre_writes && i < m_descriptor_writes.size(); i++) {
+				const auto& write = m_descriptor_writes[i];
+				if (write.pBufferInfo != nullptr && write.pBufferInfo <= changed &&
+				    changed < write.pBufferInfo + write.descriptorCount) {
+					in_pre = true;
+					break;
+				}
+			}
 			CommitSetWrites(m_context, vk_buffer, commit.bind_point, commit.layout, 0, commit.set_layout,
 			                commit.uses_push_descriptors,
 			                std::span(m_descriptor_writes.data(), commit.pre_writes));
-			CommitSetWrites(m_context, vk_buffer, commit.bind_point, commit.layout,
-			                ShaderRecompiler::IR::PixelDescriptorSet, commit.ps_set_layout,
-			                commit.ps_uses_push,
-			                std::span(m_descriptor_writes.data() + commit.pre_writes,
-			                          m_descriptor_writes.size() - commit.pre_writes));
+			if (both_sets || !in_pre) {
+				CommitSetWrites(m_context, vk_buffer, commit.bind_point, commit.layout,
+				                ShaderRecompiler::IR::PixelDescriptorSet, commit.ps_set_layout,
+				                commit.ps_uses_push,
+				                std::span(m_descriptor_writes.data() + commit.pre_writes,
+				                          m_descriptor_writes.size() - commit.pre_writes));
+			}
 		} else if (commit.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(commit.bind_point, commit.layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),

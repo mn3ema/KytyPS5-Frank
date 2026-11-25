@@ -24,8 +24,19 @@ void DrainProtectionHelperBeforeToggleOff() noexcept;
 // "indirectreplay": fast-launch GPU-argument draw replay (KYTY_INDIRECT_REPLAY) while on;
 // "gfxprio": the graphics queue goes first on the GPU thread (KYTY_GFX_PRIORITY) while on;
 // "async": the compute queues run on the async-compute thread (KYTY_ASYNC_THREAD) while on;
+// "coalesce": back-to-back barriers recorded as one (KYTY_BARRIER_COALESCE, barrierMerge.h);
 // "fastfinish": game-thread readbacks lift a copied clean page without a second GPU-thread step;
 // "helper": GPU-thread GPU-dirty/gpu-clean page protections run on the protection helper.
+// "rbsubmit" (v445q): copy-queue readbacks are submitted by a worker thread (ReadbackSubmitThread).
+// "ffclean" (v445s): with fastfinish on, a clean-read fault on a page with no GPU-written bytes
+// left lifts the page instead of emulating the load (FfCleanWindow).
+// "exactrange" (v445t): a game thread's readback is copied on the copy queue when no unfinished
+// GPU write reaches its pages, by the writes' own ranges (ExactRangeWindow).
+// "bitmapclean" (v445t): a readback step of a page with no GPU-written bytes does not wait for
+// the write bitmap's region tick (BitmapCleanWindow).
+// "gpupad" (v445m): a MEASUREMENT ONLY: one extra internal compute dispatch per guest flip while
+// on, a fixed amount of GPU work (KYTY_GPU_PAD_US, default 3000; gpuPad.h). It measures how much
+// GPU time a frame has to spare.
 // An A/B inside one run: the dropout rate of a run varies far more between runs than between
 // settings.
 namespace Libs::Graphics::SyncToggle {
@@ -38,7 +49,7 @@ inline uint32_t PeriodSeconds() {
 	return period;
 }
 
-enum Mode : uint32_t {
+enum Mode : uint64_t {
 	ModeLabels      = 1,
 	ModeIdle        = 2,
 	ModeUpload      = 4,
@@ -70,15 +81,32 @@ enum Mode : uint32_t {
 	ModeHotPath        = 268435456,
 	ModeObtainMemo     = 536870912,
 	ModeComputeMemo    = 1073741824,
-	ModeBarrierMerge   = 2147483648u
+	ModeBarrierMerge   = 2147483648u,
+	ModeBarrierCoalesce = 4294967296ull,
+	ModeProtectGap      = 8589934592ull,
+	ModeDispatchBarrier = 17179869184ull,
+	ModeUploadProtect   = 34359738368ull,
+	ModeGpuPad          = 68719476736ull,
+	ModeLazyReadback    = 137438953472ull,
+	ModeWindowScan      = 274877906944ull,
+	ModeSetReuse        = 549755813888ull,
+	ModeSyncStats       = 1099511627776ull,
+	ModeAllocCount      = 2199023255552ull,
+	ModeTimers          = 4398046511104ull,
+	ModeReadbackSubmit  = 8796093022208ull,
+	ModeFfClean         = 17592186044416ull,
+	ModeExactRange      = 35184372088832ull,
+	ModeBitmapClean     = 70368744177664ull,
+	ModeRunOverlap      = 140737488355328ull,
+	ModeVariant         = 281474976710656ull
 };
 
 // KYTY_SYNC_TOGGLE_MODE: one name, or several separated by commas (v304), toggled together.
-inline uint32_t ModeMask() {
-	static const uint32_t mask = [] {
+inline uint64_t ModeMask() {
+	static const uint64_t mask = [] {
 		const char* value = std::getenv("KYTY_SYNC_TOGGLE_MODE");
-		if (value == nullptr || std::strcmp(value, "all") == 0) return ModeLabels | ModeIdle;
-		const auto one = [](std::string_view name) -> uint32_t {
+		if (value == nullptr || std::strcmp(value, "all") == 0) return static_cast<uint64_t>(ModeLabels | ModeIdle);
+		const auto one = [](std::string_view name) -> uint64_t {
 			if (name == "labels") return ModeLabels;
 			if (name == "idle") return ModeIdle;
 			if (name == "upload") return ModeUpload;
@@ -110,10 +138,27 @@ inline uint32_t ModeMask() {
 			if (name == "obtainmemo") return ModeObtainMemo;
 			if (name == "computememo") return ModeComputeMemo;
 			if (name == "barriermerge") return ModeBarrierMerge;
+			if (name == "coalesce") return ModeBarrierCoalesce;
 			if (name == "protectdefer") return ModeProtectDefer;
+			if (name == "protectgap") return ModeProtectGap;
+			if (name == "dispatchbarrier") return ModeDispatchBarrier;
+			if (name == "uploadprotect") return ModeUploadProtect;
+			if (name == "gpupad") return ModeGpuPad;
+			if (name == "lazyreadback") return ModeLazyReadback;
+			if (name == "windowscan") return ModeWindowScan;
+			if (name == "setreuse") return ModeSetReuse;
+			if (name == "syncstats") return ModeSyncStats;
+			if (name == "alloccount") return ModeAllocCount;
+			if (name == "timers") return ModeTimers;
+			if (name == "rbsubmit") return ModeReadbackSubmit;
+			if (name == "ffclean") return ModeFfClean;
+			if (name == "exactrange") return ModeExactRange;
+			if (name == "bitmapclean") return ModeBitmapClean;
+			if (name == "runoverlap") return ModeRunOverlap;
+			if (name == "variant") return ModeVariant;
 			return 0;
 		};
-		uint32_t         result = 0;
+		uint64_t         result = 0;
 		std::string_view list(value);
 		while (!list.empty()) {
 			const auto comma = list.find(',');
@@ -123,7 +168,7 @@ inline uint32_t ModeMask() {
 			}
 			list.remove_prefix(comma + 1);
 		}
-		return result != 0 ? result : static_cast<uint32_t>(ModeLabels | ModeIdle);
+		return result != 0 ? result : static_cast<uint64_t>(ModeLabels | ModeIdle);
 	}();
 	return mask;
 }
@@ -208,6 +253,171 @@ inline bool ForceUpload() {
 	       State().load(std::memory_order_relaxed);
 }
 
+// "dispatchbarrier": a MEASUREMENT ONLY (v445g): no write-hazard barrier before or after dispatches
+// while on, races included. It gives the upper bound of what removing them could save on the GPU.
+inline bool SkipDispatchBarrier() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeDispatchBarrier) != 0 &&
+	       State().load(std::memory_order_relaxed);
+}
+
+// "uploadprotect" (v445j): KYTY_UPLOAD_PROTECT_BATCH's one protection pass per tracker region
+// after a batched upload, instead of one per uploaded span (MemoryTracker::ForEachUploadRanges).
+inline bool UploadProtectToggled() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeUploadProtect) != 0;
+}
+inline bool UploadProtectWindow() {
+	return State().load(std::memory_order_relaxed);
+}
+
+// "gpupad" (v445m, MEASUREMENT ONLY): GpuPad's extra dispatch per guest flip in the on windows.
+inline bool GpuPadConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeGpuPad) != 0;
+}
+inline bool GpuPadWindow() {
+	return GpuPadConfigured() && State().load(std::memory_order_relaxed);
+}
+
+// "lazyreadback" (v445n): KYTY_LAZY_READBACK_RELEASE's lazy release of a readback window in the
+// on windows only (bufferCache.cpp LazyReadbackRelease). Pages it leaves no-access are resolved by
+// the fault handler or taken over by the next GPU write, whichever window that happens in.
+inline bool LazyReadbackConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeLazyReadback) != 0;
+}
+inline bool LazyReadbackWindow() {
+	return State().load(std::memory_order_relaxed);
+}
+
+// v445o (2): proof that each cut is taken. Counted where a cut's path runs, with a load and a
+// store (no lock prefix: a lost count between threads does not matter here), and printed by
+// sync.cpp at every change of the toggle's state for the window that just ended ([cut-hits]).
+struct alignas(64) CutHits {
+	std::atomic<uint64_t> window_scans {0};   // readback windows scanned with the bitmap
+	std::atomic<uint64_t> window_by_page {0}; //   and page by page
+	std::atomic<uint64_t> set_reused {0};     // DescriptorHeap::Commit: a finished set again
+	std::atomic<uint64_t> set_busy {0};       //   the oldest noted set was not finished yet
+	std::atomic<uint64_t> set_fresh {0};      //   a set from the pool
+	std::atomic<uint64_t> sync_local {0};     // syncs counted thread-locally (at their fold)
+	std::atomic<uint64_t> loop_untimed {0};   // GPU-thread loop iterations without the srt clocks
+	std::atomic<uint64_t> loop_timed {0};
+	std::atomic<uint64_t> program_untimed {0}; // queued dispatches without the program clock
+	std::atomic<uint64_t> pair_memo {0};      // NoteGoodPair calls the last-key memo answered
+	std::atomic<uint64_t> pair_set {0};       //   and the set lookup
+	std::atomic<uint64_t> rb_thread {0};      // v445q: copy-queue readbacks submitted by the worker
+	std::atomic<uint64_t> rb_inline {0};      //   and by the GPU thread itself
+	std::atomic<uint64_t> rb_handoff_ns {0};  //   the worker's: from the hand-over to vkQueueSubmit's return
+};
+inline CutHits& Hits() {
+	static CutHits hits;
+	return hits;
+}
+inline void Bump(std::atomic<uint64_t>& counter, uint64_t by = 1) noexcept {
+	counter.store(counter.load(std::memory_order_relaxed) + by, std::memory_order_relaxed);
+}
+inline bool CutsConfigured() {
+	return PeriodSeconds() != 0 &&
+	       (ModeMask() & (ModeWindowScan | ModeSetReuse | ModeSyncStats | ModeAllocCount | ModeTimers |
+	                      ModeReadbackSubmit)) != 0;
+}
+
+// "rbsubmit" (v445q, KYTY_READBACK_SUBMIT_THREAD, default off): the vkQueueSubmit of a copy-queue
+// readback (BufferCache::TryCopyQueueReadback) is made by a worker thread instead of the GPU
+// thread; whoever waits for the copy waits for that submit first (bufferCache.cpp). =1: always;
+// a toggled mode decides by window.
+inline bool ReadbackSubmitConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeReadbackSubmit) != 0;
+}
+inline bool ReadbackSubmitAlways() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_SUBMIT_THREAD");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+inline bool ReadbackSubmitThread() {
+	return ReadbackSubmitConfigured() ? State().load(std::memory_order_relaxed) : ReadbackSubmitAlways();
+}
+
+// v445o: five cuts of GPU-thread CPU work that change no output (g450g's 1 kHz profile of the GPU
+// thread in a fight). Each has its own environment switch and a toggle mode. Configured(): the
+// mode is being toggled; Window(): the toggle's state.
+// v445p: on by default (g450j, in-run A/B of the five over 893 s of a fight: GPU thread -1.0 ms a
+// frame without its waits, frame -0.8 ms; [cut-hits] showed every cut taken in the on windows
+// only). The switch set to 0 turns a cut off. A toggled mode overrides both: the cut is on in the
+// on windows and off in the off windows, whatever the switch says.
+//
+// "windowscan" (KYTY_WINDOW_SCAN): ReadMemoryStep finds the clean pages of a readback window with
+// one walk of each range set instead of two map lookups per page (bufferCache.cpp).
+// KYTY_WINDOW_SCAN_VERIFY=1 computes both and stops the emulator on a difference.
+inline bool WindowScanConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeWindowScan) != 0;
+}
+inline bool WindowScanWindow() {
+	return WindowScanConfigured() && State().load(std::memory_order_relaxed);
+}
+inline bool WindowScan() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WINDOW_SCAN");
+		return value == nullptr || value[0] != '0';
+	}();
+	return WindowScanConfigured() ? State().load(std::memory_order_relaxed) : enabled;
+}
+
+// "setreuse" (KYTY_DESC_SET_REUSE): DescriptorHeap::Commit hands out a set of the layout whose
+// last command buffer the host GPU has finished, instead of allocating one (descriptorHeap.cpp).
+inline bool SetReuseConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeSetReuse) != 0;
+}
+inline bool SetReuseWindow() {
+	return SetReuseConfigured() && State().load(std::memory_order_relaxed);
+}
+inline bool SetReuse() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DESC_SET_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return SetReuseConfigured() ? State().load(std::memory_order_relaxed) : enabled;
+}
+
+// "syncstats" (KYTY_SYNC_STATS_LOCAL): the per-sync [floor] counters are counted in plain
+// thread-local numbers and added to the shared ones once per guest flip (bufferCache.cpp
+// RecordSync, FoldSyncCounters).
+inline bool SyncStatsLocalConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeSyncStats) != 0;
+}
+inline bool SyncStatsLocalWindow() {
+	return SyncStatsLocalConfigured() && State().load(std::memory_order_relaxed);
+}
+inline bool SyncStatsLocal() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SYNC_STATS_LOCAL");
+		return value == nullptr || value[0] != '0';
+	}();
+	return SyncStatsLocalConfigured() ? State().load(std::memory_order_relaxed) : enabled;
+}
+
+// "alloccount" (KYTY_ALLOC_COUNT_LOCAL): operator new counts into a block its thread owns
+// (allocStats.cpp). That file reads the mask and the state itself: it runs before main, so its
+// default is in its InitAllocMode, not in main.cpp's table of defaults (applied later).
+inline bool AllocCountConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeAllocCount) != 0;
+}
+
+// "timers" (KYTY_TIMERS_CUT): no clock reads on the GPU thread for statistics nothing prints, a
+// one-load test for CpuCost::Phase with KYTY_CPU_COST off, DrawPrep::NoteGoodPair's last-key memo.
+inline bool TimersCutConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeTimers) != 0;
+}
+inline bool TimersCutWindow() {
+	return TimersCutConfigured() && State().load(std::memory_order_relaxed);
+}
+inline bool TimersCut() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TIMERS_CUT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return TimersCutConfigured() ? State().load(std::memory_order_relaxed) : enabled;
+}
+
 inline bool SkipDrawWriteBarrier() {
 	return PeriodSeconds() != 0 && (ModeMask() & ModeDrawBarrier) != 0 &&
 	       State().load(std::memory_order_relaxed);
@@ -272,6 +482,16 @@ inline bool ComputeMemo() {
 	}();
 	return always || (PeriodSeconds() != 0 && (ModeMask() & ModeComputeMemo) != 0 &&
 	                  State().load(std::memory_order_relaxed));
+}
+
+// "protectgap" (v445e): KYTY_PROTECT_GAP's split of page-protection calls (pageManager.cpp), in
+// the on windows only; in the off windows calls span their unchanged pages as with
+// KYTY_PROTECT_GAP=0. Each protection pass reads the setting once and is complete by itself.
+inline bool ProtectGapToggled() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeProtectGap) != 0;
+}
+inline bool ProtectGapWindow() {
+	return State().load(std::memory_order_relaxed);
 }
 
 // "tbatch": KYTY_TRACKED_BATCH's one-pass sync + mark of a tracked binding's predicted ranges.
@@ -383,6 +603,56 @@ inline bool Flush4Window() {
 // "fastfinish" (v318, Codex): lift the faulting clean page after its copy readback is published.
 inline bool FastFinishWindow() {
 	return PeriodSeconds() != 0 && (ModeMask() & ModeFastFinish) != 0 &&
+	       State().load(std::memory_order_relaxed);
+}
+
+// "ffclean" (v445s, KYTY_FAST_FINISH_CLEANREAD): the fault handler lifts a clean page it would
+// otherwise serve by emulating the load, in the on windows. It only acts while fastfinish is on
+// (KYTY_FAST_FINISH=1, or "fastfinish" in the same mode list). All listed modes share the one
+// on/off state: "fastfinish,ffclean" toggles both together; ffclean alone against fastfinish
+// always on is KYTY_FAST_FINISH=1 with mode "ffclean".
+inline bool FfCleanConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeFfClean) != 0;
+}
+inline bool FfCleanWindow() {
+	return FfCleanConfigured() && State().load(std::memory_order_relaxed);
+}
+
+// "exactrange" (v445t, KYTY_EXACT_WRITE_RANGES): a readback whose 4 MiB window has a running
+// writer is copied on the copy queue all the same when no unfinished write's own range reaches the
+// faulting pages: the part of the window around them that no such range reaches (BufferCache::
+// ExactReadbackWindow). The log of unfinished writes is kept in both windows of a toggled run.
+inline bool ExactRangeConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeExactRange) != 0;
+}
+inline bool ExactRangeWindow() {
+	return ExactRangeConfigured() && State().load(std::memory_order_relaxed);
+}
+
+// "bitmapclean" (v445t, KYTY_BITMAP_CLEAN_LIFT): a game thread's readback step of a page with no
+// GPU-written bytes and no download in flight does not wait for the write bitmap's region tick;
+// it lifts the page as the step after that wait would.
+inline bool BitmapCleanConfigured() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeBitmapClean) != 0;
+}
+inline bool BitmapCleanWindow() {
+	return BitmapCleanConfigured() && State().load(std::memory_order_relaxed);
+}
+
+// "runoverlap" (v445w): in the on windows the dispatch-run exclusion list (KYTY_DISPATCH_RUN_EXCLUDE,
+// default 06544f382c6b0850 and 3378b4a64461d6ca) is ignored, so those dispatches overlap inside
+// their runs like every other; off windows keep their barriers. Scene-matched A/B of the overlap.
+// "variant" (v446h): in the on windows compute dispatches use the translation variant
+// KYTY_TRANSLATION_VARIANT names (ShaderComputeInputInfo::translation_variant: 1 static buffer
+// formats, 2 wave-uniform branches everywhere), as separate programs; off windows the default
+// translation. Scene-matched A/B of translation choices (pipelineCache.cpp TranslationVariantFor).
+inline bool VariantWindow() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeVariant) != 0 &&
+	       State().load(std::memory_order_relaxed);
+}
+
+inline bool RunOverlapWindow() {
+	return PeriodSeconds() != 0 && (ModeMask() & ModeRunOverlap) != 0 &&
 	       State().load(std::memory_order_relaxed);
 }
 

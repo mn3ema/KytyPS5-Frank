@@ -230,6 +230,11 @@ uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
 uint32_t              EmitReadClockRealtime64(ValueEmitContext& ctx);
+// v440 callable split (spirvEmitterRt.cpp).
+uint32_t              EmitPayloadLoad(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitPayloadStore(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitExecuteCallable(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRtCallableIndex(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
 inline constexpr auto EmitGetAddressResource = EmitGetSrtResource;

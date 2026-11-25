@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/guestWait.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -124,6 +125,7 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 	if (m_single_thread && m_waiting_threads > 0) {
 		return Result::AlreadyWaiting;
 	}
+	GuestWait::Scope guest_wait; // KYTY_GUEST_WAIT_STATS: started when the call has to wait
 
 	while (!((wait_mode == WaitMode::And && (m_bits & bits) == bits) ||
 	         (wait_mode == WaitMode::Or && (m_bits & bits) != 0))) {
@@ -136,6 +138,7 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 		}
 
 		m_waiting_threads++;
+		guest_wait.Begin(GuestWait::Prim::EventFlag, this, m_name.c_str());
 
 		if (infinitely) {
 			m_cond_var.Wait(&m_mutex);

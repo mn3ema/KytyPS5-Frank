@@ -143,6 +143,18 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 		    address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerFault) {
 			DescribeDeviceAddress(address.reportedAddress, address.addressPrecision, 0);
 			AddressBindings::Describe(address.reportedAddress, address.addressPrecision, stderr);
+			if ((static_cast<uint64_t>(address.reportedAddress) >> 48u) != 0) {
+				// v443n: with a crash-dump library loaded the driver gives the fault as one word with
+				// something in its top bits (g443p: 0x0200000001f00048, type None), and nothing was
+				// found at that. The low 48 bits are looked up as well.
+				const uint64_t low = static_cast<uint64_t>(address.reportedAddress) & 0x0000ffffffffffffull;
+				std::fprintf(stderr,
+				             "[device-fault] address[%u] has bits above 48 set, so it is no device address as given; "
+				             "its low 48 bits, 0x%016" PRIx64 ":\n",
+				             i, low);
+				DescribeDeviceAddress(low, 0x1000, 0);
+				AddressBindings::Describe(low, 0x1000, stderr);
+			}
 			// v375: which bindless heap keys point at the images that were freed there (Crash B:
 			// the stale read goes through a bindless slot, C8).
 			if (g_device_fault_guest_scan != nullptr && ImageHistory::Enabled()) {
@@ -444,9 +456,20 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics) {
 			hang_dumped         = true;
 			const auto progress = g_gpu_progress_tick.load();
 			uint64_t   first    = UINT64_MAX;
+			uint64_t   oldest   = UINT64_MAX;
 			for (const auto& slot: g_tick_work) {
 				const auto tick = slot.tick.load(std::memory_order_acquire);
 				if (tick > progress && tick < first) first = tick;
+				if (tick != 0 && tick < oldest) oldest = tick;
+			}
+			// v438zx: the ring keeps the last TickWorkSize draws/dispatches; work recorded while
+			// the GPU was already stuck can push the stuck tick out of it.
+			if (first != UINT64_MAX && oldest > progress + 1) {
+				std::fprintf(stderr,
+				             "[device-fault] the work record starts at tick %" PRIu64
+				             ", after the first unfinished tick %" PRIu64
+				             ": the work named below came later\n",
+				             oldest, progress + 1);
 			}
 			if (first != UINT64_MAX) {
 				std::fprintf(stderr, "[device-fault] GPU completed tick %" PRIu64

@@ -45,6 +45,21 @@ public:
 	                             const std::array<uint32_t, 3>& local_size, bool pre_barrier = true,
 	                             bool post_barrier = true, uint64_t shader_hash = 0);
 
+	// v440p, a callable split (ray-tracing pipeline) launch: the thread extents per axis the
+	// ray-generation shader reads by address, and the {width, 1, 1} vkCmdTraceRaysIndirectKHR
+	// command. ConvertRt converts the guest's indirect group counts at `group_counts` on the GPU
+	// (binds compute state and push constants: call it before committing the dispatch's
+	// bindings; it orders its writes before the shader and indirect reads). WriteRtExtents writes
+	// a direct dispatch's extents with vkCmdUpdateBuffer (the caller orders the transfer write
+	// before the trace).
+	struct RtLaunch {
+		vk::DeviceAddress extents = 0;
+		vk::DeviceAddress command = 0;
+	};
+	[[nodiscard]] RtLaunch ConvertRt(const CommandRecorder& command, vk::DeviceAddress group_counts,
+	                                 const std::array<uint32_t, 3>& local_size, uint64_t shader_hash);
+	[[nodiscard]] RtLaunch WriteRtExtents(const CommandRecorder& command, const std::array<uint32_t, 3>& extents);
+
 	// Diagnostics: the ring of converted counts (entry n at n * 32 bytes: groups, then threads).
 	[[nodiscard]] vk::Buffer           RingHandle() const { return m_groups.Handle(); }
 	[[nodiscard]] static constexpr uint64_t RingBytes() { return uint64_t {Entries} * EntryDwords * 4u; }
@@ -56,6 +71,7 @@ private:
 	static constexpr uint32_t EntryDwords  = 8; // groups at 0, thread counts at 4
 
 	void Report();
+	[[nodiscard]] uint32_t NextEntry();
 
 	GraphicContext&         m_graphics;
 	Buffer                  m_groups;

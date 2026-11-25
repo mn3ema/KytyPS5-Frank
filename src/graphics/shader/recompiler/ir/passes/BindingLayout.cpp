@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -43,10 +45,17 @@ void CollectShaderData(const Program& program, BindingLayout& layout) {
 			layout.user_data_registers.push_back(index);
 		}
 	}
-	layout.memory_offset_dword = static_cast<uint32_t>(layout.user_data_registers.size());
+	if (layout.rt_shared && layout.user_data_registers.size() > RtUserDataDwords) {
+		BindingFail("a callable split reads more user-data registers than its shader data has room for");
+	}
+	layout.memory_offset_dword = layout.UserDataDwords();
+	// v440: a ray-tracing launch is one-dimensional (2D launches pack subgroups as tiles); both
+	// halves of a callable split take the workgroup counts from the dispatch's thread extents.
+	uses_dispatch_threads |= program.rt_role != RtRole::None;
 	if (uses_dispatch_threads) {
 		layout.dispatch_thread_dword = layout.memory_offset_dword;
-		layout.memory_offset_dword += 3u;
+		// A callable split also has its target table's address there (IR/RtCallable.h).
+		layout.memory_offset_dword += program.rt_role != RtRole::None ? RtShaderDataDwords : 3u;
 	}
 }
 
@@ -58,9 +67,15 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 } // namespace
 
 SharedMemoryResources CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
+	return CollectMemoryResources(program, program.layout_blocks != nullptr ? *program.layout_blocks : program.blocks,
+	                              buffers);
+}
+
+SharedMemoryResources CollectMemoryResources(const Program& program, const BlockList& blocks,
+                                             std::vector<uint32_t>& buffers) {
 	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
 	SharedMemoryResources shared;
-	for (const auto* block: program.blocks) {
+	for (const auto* block: blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
 			if (BufferAccessOf(op) == BufferAccess::None &&
@@ -106,7 +121,8 @@ bool UsesFlattenedSrt(const Program& program) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_search_iterations != 0u;
 	};
-	return std::ranges::any_of(program.blocks, [](const Block* block) {
+	return std::ranges::any_of(program.layout_blocks != nullptr ? *program.layout_blocks : program.blocks,
+	                           [](const Block* block) {
 		return std::ranges::any_of(*block, [](const Inst& inst) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
 		});
@@ -118,6 +134,63 @@ bool UsesFlattenedSrt(const Program& program) {
 	       std::ranges::any_of(program.info.buffers, [](const BufferResource& buffer) {
 		       return buffer.gpu_records_flat != BufferResource::NoGpuRecords;
 	       });
+}
+
+namespace {
+std::atomic<bool> g_rt_fixed_layout_supported {true};
+} // namespace
+
+void SetRtFixedLayoutSupported(bool supported) {
+	g_rt_fixed_layout_supported.store(supported, std::memory_order_relaxed);
+}
+
+bool RtFixedLayout() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_FIXED_LAYOUT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && g_rt_fixed_layout_supported.load(std::memory_order_relaxed);
+}
+
+bool RtSharedCallables() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_SHARED_CALLABLES");
+		return value == nullptr || value[0] != '0';
+	}();
+	// The shader record is addressed like the ShaderData storage buffer (dynamic dword indices).
+	return enabled && RtFixedLayout() && !ShaderDataUniform();
+}
+
+namespace {
+std::atomic<uint64_t> g_rt_image_kinds {0};
+} // namespace
+
+uint64_t RtImageKinds(uint64_t add) {
+	return g_rt_image_kinds.fetch_or(add, std::memory_order_relaxed) | add;
+}
+
+uint32_t RtCallableLoopLimit() {
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_RT_CALLABLE_LOOP_LIMIT");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 2048u;
+	}();
+	return limit;
+}
+
+bool RtAddressTrapReport() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_TRAP_REPORT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled && RtAddressTrap();
+}
+
+bool RtAddressTrap() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_TRAP_ADDR");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
 }
 
 bool ClipSpaceData() {
@@ -181,6 +254,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	BindingLayout next;
 	std::vector<uint32_t> buffers;
 	const auto shared = CollectMemoryResources(program, buffers);
+	// v442: a callable split's layout does not depend on its resource counts (BindingLayout::rt_fixed);
+	// its shader data is larger than the push constants and lives in the ShaderData buffer.
+	next.rt_fixed  = program.rt_role != RtRole::None && RtFixedLayout();
+	next.rt_shared = next.rt_fixed && RtSharedCallables();
 	CollectShaderData(program, next);
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
 	next.write_tracking            = std::ranges::any_of(buffers, [&](uint32_t resource) {
@@ -204,8 +281,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		                    (image.dynamic_3d ? BindingLayout::ImageDim3DFlags : 0u);
 	}
 	next.push_data_start_dword =
-	    PushDataEnabled() ? PushData::StartFor(push_data_start_dword, next.ShaderDataDwords())
-	                      : PushData::NoStart;
+	    PushDataEnabled() && !next.rt_fixed ? PushData::StartFor(push_data_start_dword, next.ShaderDataDwords())
+	                                        : PushData::NoStart;
 
 	if (!buffers.empty()) {
 		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
@@ -258,6 +335,17 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		}
 	}
 
+	if (next.rt_shared) {
+		// v443: the set layout has every image kind a callable split has had so far.
+		uint64_t kinds = 0;
+		for (const auto& binding: next.descriptors) {
+			if (ImageBindingResourceClass(binding.kind) != ImageResourceClass::None) {
+				kinds |= uint64_t {1} << ImageBindingIndex(binding.kind);
+			}
+		}
+		next.rt_image_kinds = RtImageKinds(kinds);
+	}
+
 	if (!program.info.samplers.empty()) {
 		std::vector<uint32_t> resources(program.info.samplers.size());
 		for (uint32_t i = 0; i < resources.size(); i++) {
@@ -285,6 +373,27 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 
 	program.bindings                = std::move(next);
 	program.binding_layout_complete = true;
+}
+
+std::vector<RtFixedBinding> RtFixedSetLayout(const BindingLayout& layout) {
+	std::vector<RtFixedBinding> result;
+	const auto add = [&](DescriptorBindingKind kind, bool always) {
+		const auto* binding = FindBinding(layout, kind);
+		if (binding != nullptr || always) {
+			const auto count = binding != nullptr ? static_cast<uint32_t>(binding->resources.size()) : 0u;
+			result.push_back({kind, RtFixedDescriptorCount(kind, count)});
+		}
+	};
+	add(DescriptorBindingKind::Buffers, true);
+	for (uint32_t image = 0; image < ImageBindingCount; image++) {
+		add(static_cast<DescriptorBindingKind>(FirstImageBinding + image),
+		    ((layout.rt_image_kinds >> image) & 1u) != 0);
+	}
+	for (auto kind = DescriptorBindingKind::Samplers; kind != DescriptorBindingKind::Count;
+	     kind      = static_cast<DescriptorBindingKind>(static_cast<uint32_t>(kind) + 1u)) {
+		add(kind, true);
+	}
+	return result;
 }
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind) {

@@ -264,7 +264,11 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	const vk::ShaderStageFlags stages =
 	    few_stages ? (vk::ShaderStageFlagBits::eAllGraphics | vk::ShaderStageFlagBits::eCompute |
 	                  (graphics.mesh_shader_enabled ? vk::ShaderStageFlagBits::eMeshEXT
-	                                                : vk::ShaderStageFlags {}))
+	                                                : vk::ShaderStageFlags {}) |
+	                  // v440 M3: callable splits (KYTY_RT_CALLABLES) sample through it too.
+	                  (graphics.ray_tracing_pipeline_enabled
+	                       ? vk::ShaderStageFlagBits::eRaygenKHR | vk::ShaderStageFlagBits::eCallableKHR
+	                       : vk::ShaderStageFlags {}))
 	               : vk::ShaderStageFlagBits::eAll;
 	const auto image_flags = no_uab ? vk::DescriptorBindingFlags {vk::DescriptorBindingFlagBits::ePartiallyBound}
 	                                : vk::DescriptorBindingFlagBits::ePartiallyBound |
@@ -348,6 +352,54 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	std::fill(m_feedback_snapshot->Mapped().begin(), m_feedback_snapshot->Mapped().end(),
 	          uint8_t {0});
 	m_feedback_snapshot->Flush(0, m_feedback_snapshot->Size());
+	// v439: the address directory (translation words) and its request words (feedback) start
+	// empty; heap regions come after them.
+	{
+		using namespace ShaderRecompiler::IR;
+		auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+		auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+		std::fill_n(translation + BindlessAddressDirectoryBase, BindlessAddressDirectoryWords, 0u);
+		std::fill_n(feedback + BindlessAddressDirectoryBase, BindlessAddressDirectoryWords, 0u);
+		m_translation->Flush(BindlessAddressDirectoryBase * sizeof(uint32_t),
+		                     BindlessAddressDirectoryWords * sizeof(uint32_t));
+		m_feedback->Flush(BindlessAddressDirectoryBase * sizeof(uint32_t),
+		                  BindlessAddressDirectoryWords * sizeof(uint32_t));
+		m_next_region = std::max(m_next_region, BindlessAddressDirectoryBase + BindlessAddressDirectoryWords);
+		// v439b: the value directories (empty) and the value heaps' fixed regions (pending).
+		std::fill_n(translation + BindlessValueDirectoryBase, BindlessValueBindings * BindlessValueWords, 0u);
+		std::fill_n(feedback + BindlessValueDirectoryBase, BindlessValueBindings * BindlessValueWords, 0u);
+		for (uint32_t binding = 0; binding < BindlessValueBindings; binding++) {
+			auto& heap        = m_value_heaps[binding];
+			heap.value        = true;
+			heap.binding      = binding;
+			heap.region       = BindlessValueRegionBase + binding * BindlessValueEntries;
+			heap.entries      = BindlessValueEntries;
+			heap.guest_entries = BindlessValueEntries;
+			heap.slots.assign(BindlessValueEntries, 0u);
+			heap.settled.assign(BindlessValueEntries, 0u);
+			heap.eager_count.assign(BindlessValueEntries, 0u);
+			heap.stale.assign(BindlessValueEntries, 0u);
+			heap.descriptors.assign(BindlessValueEntries, {});
+			heap.images.assign(BindlessValueEntries, {});
+			heap.resource.resource_class =
+			    binding == BindlessStorage2D ? ImageResourceClass::Storage : ImageResourceClass::Sampled;
+			heap.resource.numeric_class  = Prospero::TextureNumericClass::Float;
+			heap.resource.dimension      = binding == BindlessImages3D        ? ShaderRecompiler::Decoder::ImageDimension::Dim3D
+			                               : binding == BindlessImages2DArray ? ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+			                               : binding == BindlessImagesCube    ? ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+			                                                                  : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+			heap.resource.cube = binding == BindlessImagesCube;
+			for (uint32_t key = 0; key < BindlessValueEntries; key++) {
+				translation[heap.region + key] = VisibleSlot(BindlessPending);
+				feedback[heap.region + key]    = 0;
+			}
+		}
+		m_translation->Flush(BindlessValueDirectoryBase * sizeof(uint32_t),
+		                     (BindlessReservedEntries - BindlessValueDirectoryBase) * sizeof(uint32_t));
+		m_feedback->Flush(BindlessValueDirectoryBase * sizeof(uint32_t),
+		                  (BindlessReservedEntries - BindlessValueDirectoryBase) * sizeof(uint32_t));
+		m_next_region = std::max(m_next_region, BindlessReservedEntries);
+	}
 	SetVulkanObjectNameF(graphics.device, m_translation->Handle(), "Bindless Translation");
 	SetVulkanObjectNameF(graphics.device, m_feedback->Handle(), "Bindless Feedback");
 
@@ -773,6 +825,178 @@ BindlessTable::~BindlessTable() {
 	}
 	if (m_layout != nullptr) {
 		m_graphics.device.destroyDescriptorSetLayout(m_layout, nullptr);
+	}
+}
+
+uint32_t BindlessTable::RegisterAddressResource(const ShaderRecompiler::IR::ImageResource& resource) {
+	std::lock_guard lock(m_address_mutex);
+	for (uint32_t i = 0; i < m_address_resources.size(); i++) {
+		if (m_address_resources[i] == resource) {
+			return i;
+		}
+	}
+	if (m_address_resources.size() >= 0xffffu) {
+		return 0; // the first resource stands in (its heaps resolve by its class and dimension)
+	}
+	m_address_resources.push_back(resource);
+	return static_cast<uint32_t>(m_address_resources.size() - 1u);
+}
+
+bool BindlessTable::InsertAddressDirectory(uint64_t block, uint32_t phase, uint32_t binding,
+                                           uint32_t region) {
+	using namespace ShaderRecompiler::IR;
+	const auto low  = static_cast<uint32_t>(block);
+	const auto high = static_cast<uint32_t>(block >> 32u);
+	const auto tag  = BindlessAddressTag(binding, phase);
+	const auto hash = BindlessAddressHash(low, high, tag);
+	auto*      translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	for (uint32_t probe = 0; probe < BindlessAddressProbes; probe++) {
+		const auto slot = (hash + probe) & (BindlessAddressDirectoryEntries - 1u);
+		const auto word = BindlessAddressDirectoryBase + slot * 4u;
+		if (translation[word + 2u] != 0u) {
+			continue;
+		}
+		translation[word]      = low;
+		translation[word + 1u] = high;
+		translation[word + 3u] = region;
+		// The tag last: a shader that matches it reads the block's words and region too (the
+		// fence orders the write-combined stores, as SetTranslation's does).
+		StoreFence();
+		translation[word + 2u] = tag;
+		if (!m_translation->IsCoherent()) {
+			m_translation->Flush(word * sizeof(uint32_t), 4u * sizeof(uint32_t));
+		}
+		return true;
+	}
+	return false;
+}
+
+void BindlessTable::ProcessAddressRequests() {
+	using namespace ShaderRecompiler::IR;
+	if (!Enabled()) {
+		return;
+	}
+	std::vector<std::pair<uint32_t, uint32_t>> marked;
+	TakeCapture(BindlessAddressDirectoryBase, BindlessAddressDirectoryWords, marked);
+	if (marked.empty()) {
+		return;
+	}
+	std::unordered_map<uint32_t, std::array<uint32_t, 4>> requests;
+	for (const auto& [index, word]: marked) {
+		requests[index / 4u][index % 4u] = word;
+	}
+	uint32_t created = 0;
+	for (const auto& [record, words]: requests) {
+		const auto tag     = words[2];
+		const auto low     = words[0];
+		const auto binding = (tag >> 24u) & 0x7fu;
+		const auto phase   = tag & 31u;
+		const auto res     = (tag >> 8u) & 0xffffu;
+		if ((tag & BindlessAddressTagValid) == 0u || binding >= SampledImageArrays ||
+		    (phase & 3u) != 0u || (low & (BindlessAddressBlockBytes - 1u)) != 0u) {
+			continue; // a request two lanes wrote at once, or no request
+		}
+		const uint64_t block = (static_cast<uint64_t>(words[1]) << 32u) | low;
+		const uint64_t key   = block | (phase >> 2u) | (static_cast<uint64_t>(binding) << 3u);
+		if (m_address_heap_index.contains(key)) {
+			continue; // created after the snapshot was recorded
+		}
+		ImageResource resource;
+		{
+			std::lock_guard lock(m_address_mutex);
+			if (res >= m_address_resources.size()) {
+				continue;
+			}
+			resource = m_address_resources[res];
+		}
+		auto* heap = FindOrCreateHeap(block, phase, binding, BindlessAddressKeysPerBlock, resource);
+		if (heap == nullptr) {
+			continue; // the translation buffer is full: such blocks keep sampling slot 0
+		}
+		heap->address       = true;
+		heap->guest_entries = std::max(heap->guest_entries, BindlessAddressKeysPerBlock);
+		if (!InsertAddressDirectory(block, phase, binding, heap->region)) {
+			if (m_address_directory_full++ < 16u) {
+				std::fprintf(stderr, "[bindless-address] directory full around block 0x%012llx\n",
+				             static_cast<unsigned long long>(block));
+			}
+			continue;
+		}
+		m_address_heap_index.emplace(key, heap);
+		m_address_heaps[binding].push_back(heap);
+		created++;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (created != 0 && logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+		size_t total = 0;
+		for (const auto& list: m_address_heaps) total += list.size();
+		std::fprintf(stderr, "[bindless-address] %u new blocks (%zu in all)\n", created, total);
+	}
+}
+
+void BindlessTable::ProcessValueRequests(std::vector<std::pair<Heap*, uint32_t>>& created) {
+	using namespace ShaderRecompiler::IR;
+	created.clear();
+	if (!Enabled()) {
+		return;
+	}
+	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	for (uint32_t binding = 0; binding < BindlessValueBindings; binding++) {
+		const auto directory = BindlessValueDirectoryBase + binding * BindlessValueWords;
+		std::vector<std::pair<uint32_t, uint32_t>> marked;
+		TakeCapture(directory, BindlessValueWords, marked);
+		if (marked.empty()) {
+			continue;
+		}
+		std::unordered_map<uint32_t, std::array<uint32_t, 8>> requests;
+		for (const auto& [index, word]: marked) {
+			requests[index / 8u][index % 8u] = word; // words left out were 0
+		}
+		auto& heap = m_value_heaps[binding];
+		for (auto& [record, words]: requests) {
+			// Two lanes writing different T#s at once leave a mix: the hash tells it apart.
+			if (BindlessValueHash(words.data()) != record ||
+			    std::ranges::all_of(words, [](uint32_t w) { return w == 0u; })) {
+				continue;
+			}
+			uint32_t free_entry = UINT32_MAX;
+			bool     present    = false;
+			for (uint32_t probe = 0; probe < BindlessAddressProbes && !present; probe++) {
+				const auto entry = (record + probe) & (BindlessValueEntries - 1u);
+				const auto* e    = translation + directory + entry * 8u;
+				if (std::equal(words.begin(), words.end(), e)) {
+					present = true;
+				} else if (free_entry == UINT32_MAX && std::all_of(e, e + 8, [](uint32_t w) { return w == 0u; })) {
+					free_entry = entry;
+				}
+			}
+			if (present) {
+				continue;
+			}
+			if (free_entry == UINT32_MAX) {
+				if (m_value_directory_full++ < 16u) {
+					std::fprintf(stderr, "[bindless-value] directory %u full around entry %u\n", binding, record);
+				}
+				continue;
+			}
+			heap.descriptors[free_entry] = words;
+			heap.settled[free_entry]     = 0;
+			auto* e = translation + directory + free_entry * 8u;
+			for (uint32_t i = 1; i < 8u; i++) {
+				e[i] = words[i];
+			}
+			// Word 0 last (never 0 for a T#: the base address >> 8): a lookup matches whole.
+			StoreFence();
+			e[0] = words[0];
+			if (!m_translation->IsCoherent()) {
+				m_translation->Flush((directory + free_entry * 8u) * sizeof(uint32_t), 8u * sizeof(uint32_t));
+			}
+			created.emplace_back(&heap, free_entry);
+		}
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (!created.empty() && logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+		std::fprintf(stderr, "[bindless-value] %zu new T#s\n", created.size());
 	}
 }
 
@@ -1935,7 +2159,7 @@ void BindlessTable::AuditForFault() const {
 	// v295: a view handle the driver reused passes the liveness check above. The image a slot was
 	// written with (m_slot_images) tells: its view now belongs to another image, or the image itself
 	// is gone (its memory freed), while the descriptor still holds the old view's header.
-	uint64_t replaced = 0, image_gone = 0, printed_slots = 0;
+	uint64_t replaced = 0, image_gone = 0, printed_slots = 0, no_address = 0;
 	for (uint32_t b = 0; b < ImageArrays; b++) {
 		const auto& views  = m_slot_views[b];
 		const auto& images = m_slot_images[b];
@@ -1950,6 +2174,8 @@ void BindlessTable::AuditForFault() const {
 			uint64_t   va = 0, size = 0;
 			const bool live_image = FaultMapImageVa(image, va, size);
 			const bool view_moved = owner != VK_NULL_HANDLE && owner != image;
+			// v443k: a live image the map has no address for (a sparse texture; streamBuffer.cpp).
+			no_address += live_image && size == 0 ? 1 : 0;
 			if (!view_moved && live_image) {
 				continue;
 			}
@@ -1967,8 +2193,9 @@ void BindlessTable::AuditForFault() const {
 	}
 	std::fprintf(stderr,
 	             "[bindless-audit] slots whose view handle was reused: %" PRIu64
-	             ", slots whose image is gone: %" PRIu64 "\n",
-	             replaced, image_gone);
+	             ", slots whose image is gone: %" PRIu64 "; slots of live images without an address in the map "
+	             "(sparse textures): %" PRIu64 "\n",
+	             replaced, image_gone, no_address);
 }
 
 } // namespace Libs::Graphics

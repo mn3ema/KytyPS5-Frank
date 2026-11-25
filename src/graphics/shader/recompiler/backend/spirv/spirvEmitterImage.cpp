@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -1026,13 +1027,22 @@ static bool BindlessFeedbackSparse() {
 // the texture is pending, slot 0 (the placeholder). A pending key is flagged in the feedback
 // buffer for the host to resolve; every lane that reads an entry sees the same translation, so
 // the store never races with a different value.
-static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& image,
+static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& image, uint32_t image_index,
                              IR::Value image_arg) {
 	auto&       state  = ctx.state;
+	// The image's flattened-SRT words: the first one's index (v443: from the shader record in a
+	// shared callable, where it depends on the callable's place in the merged program).
+	const auto MappingWord = [&](uint32_t word) {
+		if (!state.rt_relocate) {
+			return ConstantU32(state, image.indirect_mapping_offset + word);
+		}
+		const auto first = RtPlaced(state, RtRecordSlot::ImageMapping, image_index, image.indirect_mapping_offset);
+		return word == 0u ? first : Binary(state, spv::OpIAdd, TypeU32(state), first, ConstantU32(state, word));
+	};
 	const auto* handle = image_arg.ResolveInstruction();
 	EXIT_IF(handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0 ||
 	        state.bindless_translation_variable == 0);
-	const auto key  = ctx.Def(handle->Arg(0));
+	auto       key  = ctx.Def(handle->Arg(0));
 	const auto Load = [&](uint32_t variable, uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
@@ -1041,15 +1051,205 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	};
-	const auto base     = Load(state.flattened_srt_variable,
-	                           ConstantU32(state, image.indirect_mapping_offset));
-	const auto count    = Load(state.flattened_srt_variable,
-	                           ConstantU32(state, image.indirect_mapping_offset + 1u));
-	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
-	const auto entry    = Binary(state, spv::OpIAdd, TypeU32(state), base, key);
-	const auto index    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), index, in_range, entry,
-	                          ConstantU32(state, 0u));
+	uint32_t base     = 0;
+	uint32_t count    = 0;
+	uint32_t in_range = 0;
+	uint32_t index    = 0;
+	if (image.bindless_value) {
+		// v439b (BindlessValueEntries): the key is the T#'s eight words. Found in the binding's
+		// directory, the entry's translation is read; an unknown T# is requested (its words, in
+		// the feedback words of its first probed entry) and samples slot 0 (entry 0) meanwhile.
+		EXIT_IF(handle->NumArgs() < 8u);
+		const auto u32     = TypeU32(state);
+		const auto boolean = TypeBool(state);
+		std::array<uint32_t, 8> words {};
+		for (uint32_t i = 0; i < 8u; i++) {
+			words[i] = ctx.Def(handle->Arg(i));
+		}
+		uint32_t binding = IR::BindlessImages2D;
+		if (image.resource_class == IR::ImageResourceClass::Storage) {
+			binding = IR::BindlessStorage2D;
+		} else if (image.cube) {
+			binding = IR::BindlessImagesCube;
+		} else if (image.dimension == ImageDimension::Dim3D) {
+			binding = IR::BindlessImages3D;
+		} else if (image.dimension == ImageDimension::Dim2DArray ||
+		           image.dimension == ImageDimension::Dim2DMsaaArray) {
+			binding = IR::BindlessImages2DArray;
+		}
+		// BindlessValueHash, in SPIR-V.
+		auto h = ConstantU32(state, 0x811c9dc5u);
+		for (uint32_t i = 0; i < 8u; i++) {
+			h = Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseXor, u32, h, words[i]),
+			           ConstantU32(state, 0x01000193u));
+		}
+		h = Binary(state, spv::OpBitwiseXor, u32, h,
+		           Binary(state, spv::OpShiftRightLogical, u32, h, ConstantU32(state, 16u)));
+		h = Binary(state, spv::OpIMul, u32, h, ConstantU32(state, 0x7feb352du));
+		h = Binary(state, spv::OpBitwiseXor, u32, h,
+		           Binary(state, spv::OpShiftRightLogical, u32, h, ConstantU32(state, 15u)));
+		const auto mask = ConstantU32(state, IR::BindlessValueEntries - 1u);
+		h               = Binary(state, spv::OpBitwiseAnd, u32, h, mask);
+		const auto directory = IR::BindlessValueDirectoryBase + binding * IR::BindlessValueWords;
+		uint32_t   found     = 0;
+		uint32_t   entry     = ConstantU32(state, 0u);
+		for (uint32_t probe = 0; probe < IR::BindlessAddressProbes; probe++) {
+			const auto slot = Binary(state, spv::OpBitwiseAnd, u32,
+			                         Binary(state, spv::OpIAdd, u32, h, ConstantU32(state, probe)), mask);
+			const auto word = Binary(state, spv::OpIAdd, u32,
+			                         Binary(state, spv::OpShiftLeftLogical, u32, slot, ConstantU32(state, 3u)),
+			                         ConstantU32(state, directory));
+			uint32_t match = 0;
+			for (uint32_t i = 0; i < 8u; i++) {
+				const auto e = Load(state.bindless_translation_variable,
+				                    Binary(state, spv::OpIAdd, u32, word, ConstantU32(state, i)));
+				const auto same = Binary(state, spv::OpIEqual, boolean, e, words[i]);
+				match = match == 0 ? same : Binary(state, spv::OpLogicalAnd, boolean, match, same);
+			}
+			const auto next = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, u32, next, match, slot, entry);
+			entry = next;
+			found = found == 0 ? match : Binary(state, spv::OpLogicalOr, boolean, found, match);
+		}
+		if (state.bindless_feedback_variable != 0) {
+			const auto missing = Unary(state, spv::OpLogicalNot, boolean, found);
+			EmitIfCondition(state, missing, [&]() {
+				const auto request = Binary(state, spv::OpIAdd, u32,
+				                            Binary(state, spv::OpShiftLeftLogical, u32, h, ConstantU32(state, 3u)),
+				                            ConstantU32(state, directory));
+				for (uint32_t i = 0; i < 8u; i++) {
+					const auto pointer = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+					                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
+					                          Binary(state, spv::OpIAdd, u32, request, ConstantU32(state, i)));
+					state.builder.AddFunction(spv::OpStore, pointer, words[i]);
+				}
+			});
+		}
+		base     = ConstantU32(state, IR::BindlessValueRegionBase + binding * IR::BindlessValueEntries);
+		count    = ConstantU32(state, IR::BindlessValueEntries);
+		in_range = found;
+		key      = entry;
+		index    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, index, in_range,
+		                          Binary(state, spv::OpIAdd, u32, base, key), ConstantU32(state, 0u));
+	} else if (image.bindless_address) {
+		// v439 (BindlessAddressBlockBits): the key is the T#'s guest address. Its block (at the
+		// address's 32-byte phase, for this view binding) is found in the directory; a block the
+		// directory does not know is requested and samples slot 0 (entry 0) meanwhile.
+		// Handle arguments (ResourceTracking TryMakeAddressImage): address low, address high (its
+		// low 16 bits: a V#'s base has 48), fixed offset, table key, table stride.
+		EXIT_IF(handle->NumArgs() < 5u);
+		const auto u32      = TypeU32(state);
+		const auto boolean  = TypeBool(state);
+		const auto low_in   = key;
+		const auto high_in  = Binary(state, spv::OpBitwiseAnd, u32, ctx.Def(handle->Arg(1)),
+		                             ConstantU32(state, 0xffffu));
+		const auto offset   = Binary(state, spv::OpIAdd, u32, ctx.Def(handle->Arg(2)),
+		                             Binary(state, spv::OpIMul, u32, ctx.Def(handle->Arg(3)),
+		                                    ctx.Def(handle->Arg(4))));
+		const auto low      = Binary(state, spv::OpIAdd, u32, low_in, offset);
+		const auto carried  = Binary(state, spv::OpULessThan, boolean, low, low_in);
+		const auto carry    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, carry, carried, ConstantU32(state, 1u),
+		                          ConstantU32(state, 0u));
+		const auto high     = Binary(state, spv::OpIAdd, u32, high_in, carry);
+		const auto block    = Binary(state, spv::OpBitwiseAnd, u32, low,
+		                             ConstantU32(state, ~(IR::BindlessAddressBlockBytes - 1u)));
+		const auto phase    = Binary(state, spv::OpBitwiseAnd, u32, low, ConstantU32(state, 31u));
+		const auto within   = Binary(state, spv::OpBitwiseAnd, u32, low,
+		                             ConstantU32(state, IR::BindlessAddressBlockBytes - 1u));
+		const auto record   = Binary(state, spv::OpShiftRightLogical, u32, within, ConstantU32(state, 5u));
+		uint32_t   binding  = IR::BindlessImages2D;
+		if (image.cube) {
+			binding = IR::BindlessImagesCube;
+		} else if (image.dimension == ImageDimension::Dim3D) {
+			binding = IR::BindlessImages3D;
+		} else if (image.dimension == ImageDimension::Dim2DArray ||
+		           image.dimension == ImageDimension::Dim2DMsaaArray) {
+			binding = IR::BindlessImages2DArray;
+		}
+		const auto tag = Binary(state, spv::OpBitwiseOr, u32, phase,
+		                        ConstantU32(state, IR::BindlessAddressTag(binding, 0u)));
+		// BindlessAddressHash, in SPIR-V.
+		auto h = Binary(state, spv::OpShiftRightLogical, u32, block,
+		                ConstantU32(state, IR::BindlessAddressBlockBits));
+		h      = Binary(state, spv::OpBitwiseXor, u32, h,
+		                Binary(state, spv::OpIMul, u32, high, ConstantU32(state, 0x9e3779b1u)));
+		h      = Binary(state, spv::OpBitwiseXor, u32, h,
+		                Binary(state, spv::OpIMul, u32, tag, ConstantU32(state, 0x85ebca6bu)));
+		h      = Binary(state, spv::OpBitwiseXor, u32, h,
+		                Binary(state, spv::OpShiftRightLogical, u32, h, ConstantU32(state, 16u)));
+		h      = Binary(state, spv::OpIMul, u32, h, ConstantU32(state, 0x7feb352du));
+		h      = Binary(state, spv::OpBitwiseXor, u32, h,
+		                Binary(state, spv::OpShiftRightLogical, u32, h, ConstantU32(state, 15u)));
+		const auto mask  = ConstantU32(state, IR::BindlessAddressDirectoryEntries - 1u);
+		h                = Binary(state, spv::OpBitwiseAnd, u32, h, mask);
+		uint32_t found   = 0;
+		uint32_t region  = ConstantU32(state, 0u);
+		for (uint32_t probe = 0; probe < IR::BindlessAddressProbes; probe++) {
+			const auto slot  = Binary(state, spv::OpBitwiseAnd, u32,
+			                          Binary(state, spv::OpIAdd, u32, h, ConstantU32(state, probe)), mask);
+			const auto word  = Binary(state, spv::OpIAdd, u32,
+			                          Binary(state, spv::OpShiftLeftLogical, u32, slot, ConstantU32(state, 2u)),
+			                          ConstantU32(state, IR::BindlessAddressDirectoryBase));
+			const auto e_low  = Load(state.bindless_translation_variable, word);
+			const auto e_high = Load(state.bindless_translation_variable,
+			                         Binary(state, spv::OpIAdd, u32, word, ConstantU32(state, 1u)));
+			const auto e_tag  = Load(state.bindless_translation_variable,
+			                         Binary(state, spv::OpIAdd, u32, word, ConstantU32(state, 2u)));
+			const auto e_reg  = Load(state.bindless_translation_variable,
+			                         Binary(state, spv::OpIAdd, u32, word, ConstantU32(state, 3u)));
+			auto match = Binary(state, spv::OpIEqual, boolean, e_low, block);
+			match      = Binary(state, spv::OpLogicalAnd, boolean, match,
+			                    Binary(state, spv::OpIEqual, boolean, e_high, high));
+			match      = Binary(state, spv::OpLogicalAnd, boolean, match,
+			                    Binary(state, spv::OpIEqual, boolean, e_tag, tag));
+			const auto next = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, u32, next, match, e_reg, region);
+			region = next;
+			found  = found == 0 ? match : Binary(state, spv::OpLogicalOr, boolean, found, match);
+		}
+		// A request for an unknown block: block, high word, tag | resource index << 8 (patched by
+		// the host into the image's first flattened-SRT word), at the block's first directory slot.
+		const auto resource = Load(state.flattened_srt_variable, MappingWord(0u));
+		if (state.bindless_feedback_variable != 0) {
+			const auto missing = Unary(state, spv::OpLogicalNot, boolean, found);
+			EmitIfCondition(state, missing, [&]() {
+				const auto request = Binary(state, spv::OpIAdd, u32,
+				                            Binary(state, spv::OpShiftLeftLogical, u32, h, ConstantU32(state, 2u)),
+				                            ConstantU32(state, IR::BindlessAddressDirectoryBase));
+				const uint32_t values[3] = {
+				    block, high,
+				    Binary(state, spv::OpBitwiseOr, u32, tag,
+				           Binary(state, spv::OpShiftLeftLogical, u32,
+				                  Binary(state, spv::OpBitwiseAnd, u32, resource, ConstantU32(state, 0xffffu)),
+				                  ConstantU32(state, 8u)))};
+				for (uint32_t i = 0; i < 3u; i++) {
+					const auto pointer = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+					                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
+					                          Binary(state, spv::OpIAdd, u32, request, ConstantU32(state, i)));
+					state.builder.AddFunction(spv::OpStore, pointer, values[i]);
+				}
+			});
+		}
+		base     = region;
+		count    = ConstantU32(state, IR::BindlessAddressKeysPerBlock);
+		in_range = found;
+		key      = record;
+		const auto entry = Binary(state, spv::OpIAdd, u32, base, key);
+		index            = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, u32, index, in_range, entry, ConstantU32(state, 0u));
+	} else {
+		base     = Load(state.flattened_srt_variable, MappingWord(0u));
+		count    = Load(state.flattened_srt_variable, MappingWord(1u));
+		in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
+		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), base, key);
+		index            = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), index, in_range, entry,
+		                          ConstantU32(state, 0u));
+	}
 	const auto raw     = Load(state.bindless_translation_variable, index);
 	const auto pending = Binary(state, spv::OpIEqual, TypeBool(state), raw,
 	                            ConstantU32(state, IR::BindlessPending));
@@ -1079,8 +1279,14 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 		// feedback word 0, which belongs to no heap.
 		const auto marked_key = Binary(state, spv::OpBitwiseOr, TypeU32(state), key,
 		                               ConstantU32(state, 0x80000000u));
+		// v439: an address-keyed lookup outside the directory is a request, not a bad key.
+		const auto flag_in_range =
+		    image.bindless_address || image.bindless_value
+		        ? Binary(state, spv::OpLogicalOr, TypeBool(state), in_range,
+		                 Unary(state, spv::OpLogicalNot, TypeBool(state), in_range))
+		        : in_range;
 		const auto key_flag = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), key_flag, in_range, pending_flag,
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), key_flag, flag_in_range, pending_flag,
 		                          marked_key);
 		// v127: the same store, redirected to the out-of-range word with the raw value when the
 		// translation names no slot (no extra store on the common path).
@@ -1180,7 +1386,7 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 // inside the heap's entry count (both from the flattened SRT, patched by the host), otherwise
 // slot 0, the default sampler.
 static uint32_t BindlessSamplerSlot(ValueEmitContext& ctx, const IR::SamplerResource& sampler,
-                                    IR::Value sampler_arg) {
+                                    uint32_t sampler_index, IR::Value sampler_arg) {
 	auto&       state  = ctx.state;
 	const auto* handle = sampler_arg.ResolveInstruction();
 	EXIT_IF(handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0);
@@ -1188,14 +1394,15 @@ static uint32_t BindlessSamplerSlot(ValueEmitContext& ctx, const IR::SamplerReso
 	const auto Load = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
-		                          ConstantU32(state, index));
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0), index);
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	};
-	const auto base     = Load(sampler.bindless_mapping_offset);
-	const auto count    = Load(sampler.bindless_mapping_offset + 1u);
+	const auto first    = RtPlaced(state, RtRecordSlot::SamplerMapping, sampler_index, sampler.bindless_mapping_offset);
+	const auto base     = Load(first);
+	const auto count    = Load(state.rt_relocate ? Binary(state, spv::OpIAdd, TypeU32(state), first, ConstantU32(state, 1u))
+	                                             : ConstantU32(state, sampler.bindless_mapping_offset + 1u));
 	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
 	const auto entry    = Binary(state, spv::OpIAdd, TypeU32(state), base, key);
 	const auto slot     = state.builder.AllocateId();
@@ -1351,13 +1558,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = ImageResourceAt(state, mem.resource);
-	state.bindless_slot = image.bindless ? BindlessSlot(ctx, image, image_arg) : 0u;
+	state.bindless_slot = image.bindless ? BindlessSlot(ctx, image, mem.resource, image_arg) : 0u;
 	state.bindless_sampler_slot = 0u;
 	if (image_info.needs_sampler && inst.NumArgs() > 1u &&
 	    mem.sampler < state.program.info.samplers.size() &&
 	    state.program.info.samplers[mem.sampler].bindless) {
 		state.bindless_sampler_slot =
-		    BindlessSamplerSlot(ctx, state.program.info.samplers[mem.sampler], inst.Arg(1));
+		    BindlessSamplerSlot(ctx, state.program.info.samplers[mem.sampler], mem.sampler, inst.Arg(1));
 	}
 	// Diagnostics: KYTY_KEY_CAPTURE=<hash> marks the keys this shader samples (BindlessCapture*).
 	static const uint64_t capture_hash = [] {

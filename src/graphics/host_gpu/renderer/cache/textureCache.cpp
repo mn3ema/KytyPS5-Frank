@@ -1,7 +1,9 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/timeline.h"
+#include "graphics/host_gpu/renderer/queueShare.h"
 
 #include "common/alignment.h"
+#include "common/floorStats.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -23,6 +25,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <array>
+#include <vector>
+#include <unordered_map>
+#include <chrono>
 #include <atomic>
 #include <bit>
 #include <cinttypes>
@@ -40,6 +45,121 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// v438zk (next-phase plan, S2): KYTY_TEX_UPLOAD_STATS=1. In Mac's play of 11-16 the frames of
+// 100 ms or more uploaded 50-170 textures (105-529 MB) with 0-36 new ones: textures already
+// uploaded are uploaded again, whole. How much of that is bytes that did not change decides what
+// to build (upload only changed levels, or nothing), so every upload's guest bytes are hashed in
+// 64 KB pieces and compared with the pieces of the last upload of the same guest address.
+// [tex-upload] every 5 s:
+//   uploads N (MB) | first M: guest addresses not uploaded before | again K (MB): of them
+//   "same image" (the image object that was uploaded last time) and "another image" (a new image
+//   over the same bytes) | unchanged: the bytes of the "again" uploads whose 64 KB piece hashes
+//   as at the last upload, and their share | GPU-written source: not compared (the bytes come
+//   from a buffer a shader wrote, not from guest memory).
+// The two "again" numbers also go into [long-frame] ("textures again N (MB unchanged)").
+// Costs a read and a hash of every uploaded byte: a measurement switch, off by default.
+bool TexUploadStatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEX_UPLOAD_STATS");
+		return value != nullptr && value[0] != '0' && value[0] != 0;
+	}();
+	return enabled;
+}
+
+struct TexUploadStats {
+	struct Last {
+		uint64_t              size  = 0;
+		uintptr_t             image = 0;
+		std::vector<uint64_t> pieces;
+	};
+	static constexpr uint64_t Piece = 64 * 1024;
+	std::mutex                         mutex;
+	std::unordered_map<uint64_t, Last> last; // by guest address
+	std::vector<uint8_t>               scratch;
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+	uint64_t uploads = 0, bytes = 0, first = 0, first_bytes = 0, again = 0, again_bytes = 0, same_image = 0,
+	         other_image = 0, compared_bytes = 0, same_bytes = 0, gpu_sourced = 0, gpu_sourced_bytes = 0,
+	         unreadable = 0;
+
+	void Note(uint64_t address, uint64_t size, uintptr_t image, bool gpu_sourced_now) {
+		std::lock_guard lock(mutex);
+		uploads++;
+		bytes += size;
+		if (gpu_sourced_now) {
+			gpu_sourced++;
+			gpu_sourced_bytes += size;
+			last.erase(address); // its next upload from guest memory has nothing to compare with
+		} else {
+			std::vector<uint64_t> pieces;
+			pieces.reserve(static_cast<size_t>((size + Piece - 1) / Piece));
+			scratch.resize(static_cast<size_t>(Piece));
+			bool readable = true;
+			for (uint64_t offset = 0; offset < size && readable; offset += Piece) {
+				const auto count = std::min(Piece, size - offset);
+				readable = Libs::LibKernel::Memory::TryReadSparseBacking(address + offset, scratch.data(), count);
+				pieces.push_back(readable ? XXH3_64bits(scratch.data(), static_cast<size_t>(count)) : 0);
+			}
+			if (!readable) {
+				unreadable++;
+				last.erase(address);
+			} else {
+				auto& before = last[address];
+				if (before.pieces.empty()) {
+					first++;
+					first_bytes += size;
+				} else {
+					again++;
+					again_bytes += size;
+					(before.image == image ? same_image : other_image)++;
+					uint64_t same = 0;
+					for (size_t i = 0; i < pieces.size() && i < before.pieces.size(); i++) {
+						const auto offset = static_cast<uint64_t>(i) * Piece;
+						// A last piece of another length is another piece.
+						const auto count        = std::min(Piece, size - offset);
+						const auto count_before = std::min(Piece, before.size - offset);
+						compared_bytes += count;
+						if (count == count_before && pieces[i] == before.pieces[i]) {
+							same += count;
+						}
+					}
+					same_bytes += same;
+					auto& floor = Common::FloorStats::Get();
+					Common::FloorStats::Add(floor.tex_again, 1);
+					Common::FloorStats::Add(floor.tex_same_bytes, same);
+				}
+				before.size   = size;
+				before.image  = image;
+				before.pieces = std::move(pieces);
+			}
+		}
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration<double>(now - window).count();
+		if (elapsed < 5.0) {
+			return;
+		}
+		const auto mb = [](uint64_t value) { return static_cast<double>(value) / (1024.0 * 1024.0); };
+		std::fprintf(stderr,
+		             "[tex-upload] %.1f s: uploads %llu (%.0f MB) | first %llu (%.0f MB) | again %llu (%.0f MB): same "
+		             "image %llu, another image %llu | unchanged %.0f MB of %.0f MB uploaded again (%.0f %%) | "
+		             "GPU-written source %llu (%.0f MB), unreadable %llu | %zu addresses known\n",
+		             elapsed, static_cast<unsigned long long>(uploads), mb(bytes), static_cast<unsigned long long>(first),
+		             mb(first_bytes), static_cast<unsigned long long>(again), mb(again_bytes),
+		             static_cast<unsigned long long>(same_image), static_cast<unsigned long long>(other_image),
+		             mb(same_bytes), mb(compared_bytes),
+		             compared_bytes != 0 ? 100.0 * static_cast<double>(same_bytes) / static_cast<double>(compared_bytes) : 0.0,
+		             static_cast<unsigned long long>(gpu_sourced), mb(gpu_sourced_bytes),
+		             static_cast<unsigned long long>(unreadable), last.size());
+		window  = now;
+		uploads = bytes = first = first_bytes = again = again_bytes = same_image = other_image = compared_bytes =
+		    same_bytes = gpu_sourced = gpu_sourced_bytes = unreadable = 0;
+	}
+};
+
+TexUploadStats& GetTexUploadStats() {
+	static TexUploadStats stats;
+	return stats;
+}
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Overlapping aliases (transient render targets sharing memory) stay registered until unused for
@@ -356,6 +476,11 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
+	if (Common::FloorStats::Enabled()) {
+		auto& floor = Common::FloorStats::Get();
+		Common::FloorStats::Add(floor.tex_created, 1);
+		Common::FloorStats::Add(floor.tex_created_bytes, m_slot_images[id].AccountedSize());
+	}
 	return id;
 }
 
@@ -411,6 +536,9 @@ void TextureCache::UnregisterImage(ImageId id) {
 
 void TextureCache::DeleteImage(ImageId id) {
 	const CpuCost::Phase cpu_phase_("Texture::Delete");
+	if (Common::FloorStats::Enabled()) {
+		Common::FloorStats::Add(Common::FloorStats::Get().tex_deleted, 1);
+	}
 	if (const auto* traced = m_slot_images.try_get(id);
 	    traced != nullptr && ImgTrace::Overlaps(traced->info.data.address, traced->info.data.size)) {
 		ImgTrace::Log("delete id=%u 0x%llx %ux%u gpumod=%d", static_cast<uint32_t>(id.index),
@@ -1232,6 +1360,11 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const CpuCost::Phase cpu_phase_("Texture::Upload");
+	if (Common::FloorStats::Enabled()) {
+		auto& floor = Common::FloorStats::Get();
+		Common::FloorStats::Add(floor.tex_uploads, 1);
+		Common::FloorStats::Add(floor.tex_upload_bytes, image.info.data.size);
+	}
 	MarkTextureOp(m_scheduler, 11u, image, image.depth_id ? m_slot_images[image.depth_id].info.data.address : 0);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
@@ -1342,10 +1475,21 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		Buffer*  source        = nullptr;
+		uint64_t source_offset = 0;
+		{
+			// The guest's bytes into the staging ring (a copy of the whole texture on this thread).
+			const CpuCost::Phase source_phase_("Texture::Source");
+			std::tie(source, source_offset) =
+			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		}
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		if (TexUploadStatsEnabled()) {
+			// As ObtainBufferForImage chose: guest bytes, or a buffer a shader wrote.
+			GetTexUploadStats().Note(image.info.data.address, image.info.data.size, reinterpret_cast<uintptr_t>(&image),
+			                         m_buffer_cache.IsRegionGpuModified(image.info.data.address, image.info.data.size));
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
@@ -1459,6 +1603,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
+		const CpuCost::Phase hash_phase_("Texture::Hash");
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
 			image.SetMaybeCpuHash(hash);
@@ -1990,6 +2135,7 @@ void TextureCache::PollWatchImageDumps() {
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	QueueShare::NoteImage(id.index, false); // KYTY_QUEUE_STATS, [queue-share]: sampled or read storage
 	std::scoped_lock lock {m_lock};
 	DumpTextureNote(id);
 	auto&            image = m_slot_images[id];
@@ -2001,6 +2147,15 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
+	}
+	// v438zr (KYTY_TEX_SPARSE=2): the levels this view can reach get memory before the refresh
+	// below uploads them: from its base level plus the whole part of its minimum LOD, or all of
+	// them for a view that is read without filtering.
+	if (image.sparse.sparse) {
+		const auto reach = desc.whole_chain || desc.type == BindingType::Storage
+		                       ? 0u
+		                       : desc.view_info.base_level + (desc.view_info.min_lod >> 8u);
+		(void)image.EnsureSparseLevels(reach);
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
@@ -2035,6 +2190,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
+	QueueShare::NoteImage(id.index, true); // KYTY_QUEUE_STATS, [queue-share]
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	// v393: a target without guest memory is never registered (as in FindTexture); there is
@@ -2058,6 +2214,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
+	QueueShare::NoteImage(id.index, true); // KYTY_QUEUE_STATS, [queue-share]
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -2094,6 +2251,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {
+	QueueShare::NoteImage(id.index, true); // KYTY_QUEUE_STATS, [queue-share]: a shader's storage write
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id) {
@@ -3071,6 +3229,244 @@ void TextureCache::RunGarbageCollector() {
 TextureCache::GcTotals TextureCache::GetGcTotals() const {
 	return {g_gc_skip.freed, g_gc_skip.freed_mb, g_gc_skip.bindless, g_gc_skip.written_back, g_gc_trim_runs,
 	        g_gc_trim_backoffs, g_gc_skip.trim_gpu};
+}
+
+TextureCache::LevelCensus TextureCache::GetLevelCensus() {
+	LevelCensus census;
+	// The unasked levels' guest ranges: asked of the kernel after the cache's lock is released.
+	std::vector<std::pair<uint64_t, uint64_t>> unasked_ranges;
+	{
+	std::scoped_lock lock {m_lock};
+	m_slot_images.ForEach([&](ImageId, const Image& image) {
+		const auto& info   = image.info;
+		const auto  levels = info.resources.levels;
+		if (!image.registered || image.backing.image == nullptr || levels <= 1 || levels > info.mip_layout.size() ||
+		    info.samples != 1 || info.data.Empty() || image.IsGpuModified()) {
+			return;
+		}
+		const auto bytes = image.AccountedSize();
+		census.images++;
+		census.bytes += bytes;
+		census.pinned_bytes += image.bindless_pinned ? bytes : 0;
+		if (image.lowest_view_level == 0xff) {
+			census.unviewed_images++;
+			census.unviewed_bytes += bytes;
+			return;
+		}
+		// The bytes of the levels below `level` (finer than it), as the guest lays them out.
+		const auto below = [&](uint32_t level, bool collect) {
+			uint64_t sum = 0;
+			for (uint32_t l = 0; l < std::min(level, levels); l++) {
+				const auto& mip = info.mip_layout[l];
+				if (mip.size == 0 || mip.offset > info.data.size || mip.size > info.data.size - mip.offset) {
+					continue;
+				}
+				sum += mip.size;
+				if (collect) {
+					unasked_ranges.emplace_back(info.data.address + mip.offset, mip.size);
+				}
+			}
+			return sum;
+		};
+		if (const auto unasked = below(image.lowest_view_level, true); unasked != 0) {
+			census.unasked_images++;
+			census.unasked_bytes += unasked;
+			census.unasked_pinned_bytes += image.bindless_pinned ? unasked : 0;
+		}
+		if (const auto latest = below(image.latest_view_level, false); latest != 0) {
+			census.below_latest_images++;
+			census.below_latest_bytes += latest;
+			census.below_latest_pinned_bytes += image.bindless_pinned ? latest : 0;
+		}
+	});
+	}
+	for (const auto& [address, size]: unasked_ranges) {
+		// The committed bytes from the level's first byte on: a level mapped only in part counts
+		// from its first unmapped byte.
+		const auto mapped = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+		census.unasked_unmapped_bytes += size - std::min<uint64_t>(mapped, size);
+	}
+	return census;
+}
+
+TextureCache::SparseCensus TextureCache::GetSparseCensus() {
+	std::scoped_lock lock {m_lock};
+	SparseCensus     census;
+	m_slot_images.ForEach([&](ImageId, const Image& image) {
+		if (!image.sparse.sparse) {
+			return;
+		}
+		census.images++;
+		census.bound_bytes += image.sparse.bound_bytes;
+		census.binds       += image.sparse.binds;
+		const auto first = std::min(image.sparse.bound_first, image.sparse.tail_first);
+		uint64_t   unbound = 0;
+		for (uint32_t l = 0; l < std::min<uint32_t>(first, static_cast<uint32_t>(image.info.mip_layout.size())); l++) {
+			unbound += image.info.mip_layout[l].size;
+		}
+		census.unbound_bytes += unbound;
+		census.partly_images += unbound != 0 ? 1 : 0;
+		if (image.latest_reach_level != 0xff) {
+			uint64_t   idle = 0;
+			const auto to   = std::min<uint32_t>({image.latest_reach_level, image.sparse.tail_first,
+			                                      static_cast<uint32_t>(image.info.mip_layout.size())});
+			for (uint32_t l = first; l < to; l++) {
+				idle += image.info.mip_layout[l].size;
+			}
+			census.idle_bytes  += idle;
+			census.idle_images += idle != 0 ? 1 : 0;
+		}
+	});
+	return census;
+}
+
+TextureCache::ReachCensus TextureCache::GetReachCensus() {
+	struct Entry {
+		uint64_t                                    address;
+		std::array<std::pair<uint64_t, uint64_t>, 16> levels; // offset, size
+		uint32_t                                    count;
+		uint8_t                                     lowest_reach, latest_reach, lowest_view;
+		bool                                        pinned;
+	};
+	ReachCensus        census;
+	std::vector<Entry> entries;
+	{
+		std::scoped_lock lock {m_lock};
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			const auto& info   = image.info;
+			const auto  levels = info.resources.levels;
+			if (!image.registered || image.backing.image == nullptr || levels <= 1 || levels > info.mip_layout.size() ||
+			    info.samples != 1 || info.data.Empty() || image.IsGpuModified() || image.lowest_reach_level == 0xff) {
+				return;
+			}
+			Entry e {};
+			e.address      = info.data.address;
+			e.count        = levels;
+			e.lowest_reach = image.lowest_reach_level;
+			e.latest_reach = image.latest_reach_level;
+			e.lowest_view  = image.lowest_view_level;
+			e.pinned       = image.bindless_pinned;
+			for (uint32_t l = 0; l < levels; l++) {
+				const auto& mip = info.mip_layout[l];
+				const bool  ok  = mip.size != 0 && mip.offset <= info.data.size && mip.size <= info.data.size - mip.offset;
+				e.levels[l]     = ok ? std::pair {mip.offset, mip.size} : std::pair {uint64_t {0}, uint64_t {0}};
+			}
+			census.images++;
+			census.bytes += image.AccountedSize();
+			entries.push_back(e);
+		});
+	}
+	for (const auto& e: entries) {
+		uint64_t out = 0, out_unmapped = 0, reachable_unmapped = 0, below_latest = 0, all = 0, all_unmapped = 0;
+		for (uint32_t l = 0; l < e.count; l++) {
+			const auto [offset, size] = e.levels[l];
+			// Levels under 64 KB are left out: a thousandth of the bytes, most of the kernel queries.
+			if (size < (64u << 10u)) {
+				continue;
+			}
+			// Committed bytes from the level's first byte on (asked outside the cache's lock).
+			const auto mapped   = std::min<uint64_t>(Libs::LibKernel::Memory::TryClampRangeSize(e.address + offset, size), size);
+			const auto unmapped = size - mapped;
+			if (uint8_t probe = 0; unmapped != 0 &&
+			                       Libs::LibKernel::Memory::TryReadBacking(e.address + offset + mapped, &probe, 1)) {
+				census.unmapped_but_readable_bytes += unmapped;
+			}
+			all          += size;
+			all_unmapped += unmapped;
+			if (l < e.lowest_reach) {
+				out          += size;
+				out_unmapped += unmapped;
+			} else {
+				reachable_unmapped += unmapped;
+			}
+			below_latest += l < e.latest_reach ? size : 0;
+		}
+		if (out != 0) {
+			census.out_of_reach_images++;
+			census.out_of_reach_bytes += out;
+			census.out_of_reach_pinned_bytes += e.pinned ? out : 0;
+			census.out_of_reach_unmapped_bytes += out_unmapped;
+		}
+		if (reachable_unmapped != 0) {
+			census.reachable_unmapped_images++;
+			census.reachable_unmapped_bytes += reachable_unmapped;
+		}
+		if (all != 0 && all_unmapped == all) {
+			census.no_level_mapped_images++;
+			census.no_level_mapped_bytes += all;
+		}
+		census.below_latest_reach_bytes += below_latest;
+		census.clamped_images += e.lowest_reach > e.lowest_view ? 1 : 0;
+	}
+	return census;
+}
+
+TextureCache::ShareCensus TextureCache::GetShareCensus() {
+	struct Entry {
+		uint64_t address, size;
+		bool     pinned;
+	};
+	ShareCensus        census;
+	std::vector<Entry> entries;
+	{
+		std::scoped_lock lock {m_lock};
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			if (!image.registered || image.backing.image == nullptr || image.info.data.Empty()) {
+				return;
+			}
+			const auto bytes = image.AccountedSize();
+			census.images++;
+			census.bytes += bytes;
+			census.host_bytes += m_graphics.ImageAllocationBytes(image.backing);
+			census.gpu_written_bytes += image.IsGpuModified() ? bytes : 0;
+			if (image.bindless_pinned) {
+				census.pinned_images++;
+				census.pinned_bytes += bytes;
+			}
+			entries.push_back({image.info.data.address, image.info.data.size, image.bindless_pinned});
+		});
+	}
+	// By address, the larger range first where two begin together.
+	std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+		return a.address != b.address ? a.address < b.address : a.size > b.size;
+	});
+	const auto covered = [&](bool pinned_only) {
+		uint64_t sum = 0, end = 0;
+		for (const auto& e: entries) {
+			if (pinned_only && !e.pinned) {
+				continue;
+			}
+			const auto e_end = e.address + e.size;
+			if (e_end > end) {
+				sum += e_end - std::max(e.address, end);
+				end = e_end;
+			}
+		}
+		return sum;
+	};
+	census.covered_bytes        = covered(false);
+	census.pinned_covered_bytes = covered(true);
+	uint64_t reach = 0; // the end of the ranges before this one
+	for (size_t i = 0; i < entries.size(); i++) {
+		const auto& e     = entries[i];
+		const auto  e_end = e.address + e.size;
+		if (i != 0 && e_end <= reach) {
+			census.inside_images++;
+			census.inside_bytes += e.size;
+			if (entries[i - 1].address == e.address && entries[i - 1].size == e.size) {
+				census.same_range_images++;
+				census.same_range_bytes += e.size;
+			}
+		}
+		reach = std::max(reach, e_end);
+		// Committed bytes from the range's first byte on (asked outside the cache's lock).
+		const auto mapped = Libs::LibKernel::Memory::TryClampRangeSize(e.address, e.size);
+		if (mapped < e.size) {
+			census.unmapped_images++;
+			census.unmapped_bytes += e.size - mapped;
+		}
+	}
+	return census;
 }
 
 void TextureCache::SetBindlessEvictable(std::span<const ImageId> ids) {

@@ -671,7 +671,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.successors, id_map);
 		block.predecessors.clear();
-		block.dominators.clear();
 		auto& terminator          = block.terminator;
 		terminator.true_block     = RemapId(terminator.true_block, id_map);
 		terminator.false_block    = RemapId(terminator.false_block, id_map);
@@ -687,6 +686,9 @@ void PruneUnreachableBlocks(Graph& graph) {
 	graph.back_edges.clear();
 	graph.natural_loops.clear();
 	graph.components.clear();
+	graph.dom_idom.clear(); // Dominates is false until the analyses run again, as with empty lists
+	graph.dom_pre.clear();
+	graph.dom_post.clear();
 	RebuildPredecessors(graph);
 }
 
@@ -736,38 +738,113 @@ std::vector<uint32_t> SolverOrder(const Graph& graph) {
 }
 
 void ComputeDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
+	// Cooper, Harvey and Kennedy's iteration on a reverse postorder from a virtual root whose
+	// children are the entry and every other block without predecessors (each its own root, as
+	// before). The same relation as the set intersection it replaces, without the sets.
+	const auto     count   = static_cast<uint32_t>(graph.blocks.size());
+	const uint32_t virtual_root = count;
+	std::vector<uint32_t> roots;
+	if (graph.entry_block < count) {
+		roots.push_back(graph.entry_block);
 	}
-
-	// Predecessors before successors (back edges aside).
-	const auto order   = SolverOrder(graph);
-	bool       changed = true;
-	while (changed) {
-		changed = false;
-		for (const auto id: order) {
-			auto& block = graph.blocks[id];
-			if (block.id == graph.entry_block) {
+	for (uint32_t id = 0; id < count; id++) {
+		if (id != graph.entry_block && graph.blocks[id].predecessors.empty()) {
+			roots.push_back(id);
+		}
+	}
+	// Postorder over successors from the roots.
+	std::vector<uint32_t>                      rpo_number(count + 1, UINT32_MAX);
+	std::vector<uint32_t>                      postorder;
+	std::vector<uint8_t>                       visited(count, 0);
+	std::vector<std::pair<uint32_t, uint32_t>> stack;
+	postorder.reserve(count);
+	for (const auto root: roots) {
+		if (visited[root] != 0) {
+			continue;
+		}
+		visited[root] = 1;
+		stack.emplace_back(root, 0u);
+		while (!stack.empty()) {
+			const auto  block      = stack.back().first;
+			const auto& successors = graph.blocks[block].successors;
+			if (stack.back().second < successors.size()) {
+				const auto succ = successors[stack.back().second++];
+				if (succ < count && visited[succ] == 0) {
+					visited[succ] = 1;
+					stack.emplace_back(succ, 0u);
+				}
 				continue;
 			}
-			std::vector<uint32_t> next;
-			if (block.predecessors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.predecessors.front()].dominators;
-				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
-				}
-				InsertSorted(next, block.id);
+			postorder.push_back(block);
+			stack.pop_back();
+		}
+	}
+	const auto reached = static_cast<uint32_t>(postorder.size());
+	// rpo_number: the virtual root first (0), then the blocks in reverse postorder.
+	rpo_number[virtual_root] = 0;
+	for (uint32_t index = 0; index < reached; index++) {
+		rpo_number[postorder[reached - 1u - index]] = index + 1u;
+	}
+	std::vector<uint32_t> idom(count + 1, UINT32_MAX);
+	idom[virtual_root] = virtual_root;
+	std::vector<uint8_t> is_root(count, 0);
+	for (const auto root: roots) {
+		is_root[root] = 1;
+		idom[root]    = virtual_root;
+	}
+	const auto intersect = [&](uint32_t a, uint32_t b) {
+		while (a != b) {
+			while (rpo_number[a] > rpo_number[b]) a = idom[a];
+			while (rpo_number[b] > rpo_number[a]) b = idom[b];
+		}
+		return a;
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (uint32_t index = 0; index < reached; index++) {
+			const auto block = postorder[reached - 1u - index];
+			if (is_root[block] != 0) {
+				continue;
 			}
-			if (next != block.dominators) {
-				block.dominators = std::move(next);
-				changed          = true;
+			uint32_t next = UINT32_MAX;
+			for (const auto pred: graph.blocks[block].predecessors) {
+				if (pred >= count || rpo_number[pred] == UINT32_MAX || idom[pred] == UINT32_MAX) {
+					continue; // not reached from a root, or not processed yet
+				}
+				next = next == UINT32_MAX ? pred : intersect(pred, next);
+			}
+			if (next != idom[block]) {
+				idom[block] = next;
+				changed     = true;
 			}
 		}
+	}
+	// Tree numbering.
+	std::vector<std::vector<uint32_t>> children(count + 1);
+	for (uint32_t index = 0; index < reached; index++) {
+		const auto block = postorder[reached - 1u - index];
+		children[idom[block]].push_back(block);
+	}
+	graph.dom_idom.assign(count, UINT32_MAX);
+	graph.dom_pre.assign(count, UINT32_MAX);
+	graph.dom_post.assign(count, UINT32_MAX);
+	uint32_t                                   clock = 0;
+	std::vector<std::pair<uint32_t, uint32_t>> walk {{virtual_root, 0u}};
+	while (!walk.empty()) {
+		auto& [node, child] = walk.back();
+		if (child == 0 && node != virtual_root) {
+			graph.dom_pre[node] = clock++;
+		}
+		if (child < children[node].size()) {
+			const auto next = children[node][child++];
+			walk.emplace_back(next, 0u);
+			continue;
+		}
+		if (node != virtual_root) {
+			graph.dom_post[node] = clock++;
+			graph.dom_idom[node] = idom[node] == virtual_root ? UINT32_MAX : idom[node];
+		}
+		walk.pop_back();
 	}
 }
 
@@ -978,12 +1055,30 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.predecessors, id_map);
 		RemapIds(block.successors, id_map);
-		RemapIds(block.dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
 		block.terminator.continue_block = RemapId(block.terminator.continue_block, id_map);
 	}
+
+	// The dominator tree's arrays are by id: move them with the ids.
+	const auto remap_by_id = [&](std::vector<uint32_t>& values, bool ids) {
+		if (values.size() != id_map.size()) {
+			values.clear();
+			return;
+		}
+		std::vector<uint32_t> moved(values.size(), UINT32_MAX);
+		for (uint32_t old_id = 0; old_id < values.size(); old_id++) {
+			if (id_map[old_id] < moved.size()) {
+				moved[id_map[old_id]] = ids && values[old_id] != UINT32_MAX ? RemapId(values[old_id], id_map)
+				                                                           : values[old_id];
+			}
+		}
+		values = std::move(moved);
+	};
+	remap_by_id(graph.dom_idom, true);
+	remap_by_id(graph.dom_pre, false);
+	remap_by_id(graph.dom_post, false);
 
 	return id_map;
 }
@@ -1032,8 +1127,14 @@ BasicBlock* Graph::FindBlockByPc(uint32_t pc) {
 
 bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
-	return target != nullptr &&
-	       std::binary_search(target->dominators.begin(), target->dominators.end(), dominator);
+	if (target == nullptr || block >= dom_pre.size() || dominator >= dom_pre.size()) {
+		return false;
+	}
+	if (dom_pre[block] == UINT32_MAX) {
+		return FindBlock(dominator) != nullptr; // no root reaches it: dominated by every block
+	}
+	return dom_pre[dominator] != UINT32_MAX && dom_pre[dominator] <= dom_pre[block] &&
+	       dom_post[block] <= dom_post[dominator];
 }
 
 namespace {
@@ -1820,7 +1921,14 @@ std::string GraphToString(const Graph& graph) {
 		text += fmt::format("  predecessors=[{}] successors=[{}]\n",
 		                    VectorToString(block.predecessors).c_str(),
 		                    VectorToString(block.successors).c_str());
-		text += fmt::format("  dominators=[{}]\n", VectorToString(block.dominators).c_str());
+		std::vector<uint32_t> dominators;
+		if (block.id < graph.dom_pre.size() && graph.dom_pre[block.id] != UINT32_MAX) {
+			for (uint32_t id = block.id; id != UINT32_MAX; id = graph.dom_idom[id]) {
+				dominators.push_back(id);
+			}
+			std::ranges::sort(dominators);
+		}
+		text += fmt::format("  dominators=[{}]\n", VectorToString(dominators).c_str());
 		text += fmt::format(
 		    "  terminator={} condition={} true={} false={} merge={} continue={} loop_header={} "
 		    "indirect_sgpr={} indirect_selector={} indirect_targets=[{}] selector_values=[{}] "

@@ -1,5 +1,9 @@
 #include "kernel/fileSystem.h"
 
+#include "common/gameStarted.h"
+
+#include <cstring>
+
 #include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -431,6 +435,18 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	auto flags_u = static_cast<uint32_t>(flags);
+
+	// v0.5 FG: a save written after the boot ends the title panels (Common::GameStarted).
+	if (std::strncmp(path, "/savedata", 9) == 0) {
+		Common::GameStarted::Trace("open", path, flags_u);
+		if ((flags_u & 0x0603u) != 0) { // write, create or truncate
+			if (Common::GameStarted::Seconds() >= 10.0) {
+				Common::GameStarted::Note("a save was written");
+			}
+		} else {
+			Common::GameStarted::Reset("a save was read");
+		}
+	}
 
 	LOGF("\t path = %s\n"
 	     "\t flags = %08" PRIx32 "\n"

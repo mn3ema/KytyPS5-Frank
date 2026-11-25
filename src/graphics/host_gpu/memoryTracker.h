@@ -7,10 +7,12 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <optional>
 #include <source_location>
 #include <span>
 #include <cstdlib>
@@ -314,12 +316,19 @@ public:
 
 	// Batch counterpart for sorted [address, size] spans. Region locks are acquired once in
 	// ascending region order, while copy discovery and GPU transitions retain input order.
+	// batch_protect (v445j): the GPU transitions set every span's bits first and bring each
+	// region's page protection up to date once, with all its locks still held (the same pages end
+	// with the same protection; fewer host calls when many spans share a region).
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges,
-	                         RangeFunc&& range_func, UploadFunc&& upload_func) {
+	                         RangeFunc&& range_func, UploadFunc&& upload_func,
+	                         bool batch_protect = false) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
+		// v445k: KYTY_CPU_COST sub-phases (UR::Pieces, UR::Scan, UR::UploadFn, UR::State).
+		std::optional<CpuCost::Phase> sub_phase_;
+		sub_phase_.emplace("UR::Pieces");
 		struct Piece { uint64_t region, offset, bytes; RegionManager* manager; };
 		std::vector<Piece> pieces;
 		std::vector<std::pair<uint64_t, RegionManager*>> managers;
@@ -346,14 +355,36 @@ public:
 		               managers.end());
 		for (const auto& [region, manager]: managers) { (void)region; manager->lock.lock(); }
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		sub_phase_.reset();
+		sub_phase_.emplace("UR::Scan");
 		for (const auto& piece: pieces) {
 			piece.manager->template ForEachModifiedRange<DirtySource::Cpu, true>(
 			    piece.manager->GetCpuAddr() + piece.offset, piece.bytes, range_func);
 		}
+		sub_phase_.reset();
+		sub_phase_.emplace("UR::UploadFn");
 		upload_func();
-		for (const auto& piece: pieces) {
-			piece.manager->template ChangeState<DirtySource::Gpu, true>(
-			    piece.manager->GetCpuAddr() + piece.offset, piece.bytes);
+		sub_phase_.reset();
+		// v445l: the state phase named by how many tracker regions the call's spans touch.
+		sub_phase_.emplace(managers.size() > 256  ? "UR::State regions>256"
+		                   : managers.size() > 64 ? "UR::State regions65-256"
+		                   : managers.size() > 16 ? "UR::State regions17-64"
+		                   : managers.size() > 1  ? "UR::State regions2-16"
+		                                          : "UR::State region1");
+		if (batch_protect) {
+			for (const auto& piece: pieces) {
+				piece.manager->template ChangeStateBits<DirtySource::Gpu, true>(
+				    piece.manager->GetCpuAddr() + piece.offset, piece.bytes);
+			}
+			for (const auto& [region, manager]: managers) {
+				(void)region;
+				manager->template ApplyStateProtection<DirtySource::Gpu, true>();
+			}
+		} else {
+			for (const auto& piece: pieces) {
+				piece.manager->template ChangeState<DirtySource::Gpu, true>(
+				    piece.manager->GetCpuAddr() + piece.offset, piece.bytes);
+			}
 		}
 		s_upload_owner = previous_upload_owner;
 		for (auto it = managers.rbegin(); it != managers.rend(); ++it) it->second->lock.unlock();

@@ -117,13 +117,14 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-	const auto user_data_dwords = program.bindings.user_data_registers.size();
+	const auto user_data_dwords = program.bindings.UserDataDwords();
 	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    program.bindings.memory_offset_dword !=
+	        user_data_dwords + (has_dispatch_threads ? (program.rt_role != IR::RtRole::None ? IR::RtShaderDataDwords : 3u) : 0u) ||
 	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
@@ -503,6 +504,9 @@ uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo
 	const auto threads = std::max(workgroup->threads_num[0], 1u) *
 	                     std::max(workgroup->threads_num[1], 1u) *
 	                     std::max(workgroup->threads_num[2], 1u);
+	if (program.rt_role != IR::RtRole::None) {
+		return spv::ScopeSubgroup; // no workgroup in the ray-tracing stages (one wave shares its LDS region)
+	}
 	if (threads <= program.wave_size) {
 		return spv::ScopeWorkgroup;
 	}
@@ -536,6 +540,16 @@ bool GetRobustBufferAccess() {
 
 void SetCoherentLoadAcquire(bool enabled) {
 	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
+}
+
+std::atomic<bool> g_rt_maximal_reconvergence {false};
+
+void SetRtMaximalReconvergence(bool supported) {
+	g_rt_maximal_reconvergence.store(supported, std::memory_order_relaxed);
+}
+
+bool GetRtMaximalReconvergence() {
+	return g_rt_maximal_reconvergence.load(std::memory_order_relaxed);
 }
 
 void SetDenormFlushToZero32(bool supported) {
@@ -587,8 +601,8 @@ bool UsesPixelInterlock(const IR::Program& program) {
 	       g_pixel_interlock.load(std::memory_order_relaxed);
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  std::vector<uint32_t>* rt_record) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -618,8 +632,15 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	DefineModule(state);
 	EmitProgram(state);
-	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
-	                            "main", state.interface_variables);
+	DefineUsedRtDescriptors(state);
+	DefineRtRecord(state);
+	if (rt_record != nullptr) {
+		*rt_record = std::move(state.rt_record_words);
+	}
+	const auto model = state.program.rt_role == IR::RtRole::Raygen   ? spv::ExecutionModelRayGenerationKHR
+	                   : state.program.rt_role == IR::RtRole::Callable ? spv::ExecutionModelCallableKHR
+	                                                                   : ExecutionModelForStage(state.program.stage);
+	state.builder.AddEntryPoint(model, state.main_func, "main", state.interface_variables);
 
 	return state.builder.Build();
 }

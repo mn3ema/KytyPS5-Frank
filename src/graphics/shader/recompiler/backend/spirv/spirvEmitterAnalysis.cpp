@@ -164,12 +164,13 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 		EXIT_IF(image_resource.resource_class == IR::ImageResourceClass::Storage &&
 		        (image_resource.atomic || image_resource.dimension != ImageDimension::Dim2D));
 		const auto type     = ImageType(state, image_resource);
-		const auto variable = state.bindless_image_variables.find(type);
-		EXIT_IF(variable == state.bindless_image_variables.end() || state.bindless_slot == 0);
+		EXIT_IF(state.bindless_slot == 0 || (!state.program.bindings.rt_fixed &&
+		                                     !state.bindless_image_variables.contains(type)));
+		const auto variable = BindlessImageVariable(state, image_resource);
 		const auto pointer_type =
 		    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type);
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable->second,
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable,
 		                          state.bindless_slot);
 		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
 		const auto image = state.builder.AllocateId();
@@ -202,7 +203,8 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto pointer = DescriptorElementPointer(
-	    state, pointer_type, state.sampler_variable, ConstantU32(state, array_index),
+	    state, pointer_type, state.sampler_variable,
+	    RtPlaced(state, RtRecordSlot::SamplerArray, sampler, array_index),
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
 	const auto sampler_id = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
@@ -249,11 +251,12 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	const auto kind = IR::DescriptorBindingForImage(image);
 	EXIT_IF(!kind.has_value());
 	if (array_index == 0u) {
-		array_index = ConstantU32(state, ResourceForDescriptor(state, *kind, resource) + mip);
+		const auto index = ResourceForDescriptor(state, *kind, resource) + mip;
+		array_index      = RtPlaced(state, RtRecordSlot::ImageArray, (static_cast<uint32_t>(*kind) << 16u) | index, index);
 	}
 	const auto pointer_type = state.builder.Type(
 	    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image));
-	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	const uint32_t variable = state.image_variables[IR::ImageBindingIndex(*kind)];
 	return DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
 	                                "image descriptor array was not emitted");
 }
@@ -266,9 +269,11 @@ uint32_t LoadDynamicClassUintDescriptor(EmitterState& state, uint32_t resource) 
 	EXIT_IF(!kind.has_value());
 	const auto type         = ImageType(state, image);
 	const auto pointer_type = state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type);
-	const auto variable     = state.image_variables[IR::ImageBindingIndex(*kind)];
+	const uint32_t variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	const auto index        = ResourceForDescriptor(state, *kind, resource);
 	const auto pointer      = DescriptorElementPointer(
-        state, pointer_type, variable, ConstantU32(state, ResourceForDescriptor(state, *kind, resource)),
+        state, pointer_type, variable,
+        RtPlaced(state, RtRecordSlot::ImageArray, (static_cast<uint32_t>(*kind) << 16u) | index, index),
         *kind, resource, "dynamic-class uint image descriptor array was not emitted");
 	const auto loaded = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, loaded, pointer);
@@ -278,7 +283,8 @@ uint32_t LoadDynamicClassUintDescriptor(EmitterState& state, uint32_t resource) 
 uint32_t DynamicClassIsUint(EmitterState& state, uint32_t resource) {
 	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageClassDword());
 	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
-	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word,
+	                                              RtPlaced(state, RtRecordSlot::ImageResource, resource, resource)),
 	                                ConstantU32(state, 1u));
 	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
 }
@@ -286,7 +292,8 @@ uint32_t DynamicClassIsUint(EmitterState& state, uint32_t resource) {
 uint32_t DynamicLayerIs2D(EmitterState& state, uint32_t resource) {
 	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageLayerDword());
 	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
-	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word,
+	                                              RtPlaced(state, RtRecordSlot::ImageResource, resource, resource)),
 	                                ConstantU32(state, 1u));
 	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
 }
@@ -294,7 +301,8 @@ uint32_t DynamicLayerIs2D(EmitterState& state, uint32_t resource) {
 uint32_t DynamicImage3DIs2D(EmitterState& state, uint32_t resource) {
 	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageDim3DDword());
 	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
-	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word,
+	                                              RtPlaced(state, RtRecordSlot::ImageResource, resource, resource)),
 	                                ConstantU32(state, 1u));
 	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
 }
@@ -302,7 +310,8 @@ uint32_t DynamicImage3DIs2D(EmitterState& state, uint32_t resource) {
 uint32_t DynamicCubeIs(EmitterState& state, uint32_t resource) {
 	const auto word = EmitShaderDataDwordLoad(state, state.program.bindings.ImageCubeDword());
 	const auto bit  = EmitBinaryU32(state, spv::OpBitwiseAnd,
-	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, resource)),
+	                                EmitBinaryU32(state, spv::OpShiftRightLogical, word,
+	                                              RtPlaced(state, RtRecordSlot::ImageResource, resource, resource)),
 	                                ConstantU32(state, 1u));
 	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0u));
 }

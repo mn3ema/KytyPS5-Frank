@@ -59,6 +59,10 @@
 
 namespace Libs::Graphics {
 
+// v440v: set by the draw-prep scanner around the indirect register handlers (pm4Dispatch.h).
+thread_local bool g_cp_lenient        = false;
+thread_local bool g_cp_lenient_failed = false;
+
 // KYTY_TRACE_GS_SLOT_SEQ=<lines>: with KYTY_TRACE_GS_SLOT, every write to that slot, zero
 // included, in command order ([gs-seq] lines), and the draws that see it (renderDraw).
 static int32_t TracedGsSlot() {
@@ -2025,6 +2029,17 @@ KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
 	return 1;
 }
 
+KYTY_CP_OP_PARSER(CpOpPssr) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto packet_dw = KYTY_PM4_LEN(cmd_id) - 1;
+	EXIT_NOT_IMPLEMENTED(packet_dw < Pssr::RequestDwords || packet_dw > dw);
+	Pssr::Request request {};
+	std::memcpy(&request, buffer, sizeof(request));
+	cp.ProcessPssr(request);
+	return packet_dw;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndexType) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2186,6 +2201,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
+			if (g_cp_lenient) {
+				g_cp_lenient_failed = true; // the draw-prep scanner read the list early: taint
+				continue;
+			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
@@ -2249,6 +2268,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
+			if (g_cp_lenient) {
+				g_cp_lenient_failed = true; // the draw-prep scanner read the list early: taint
+				continue;
+			}
 			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
@@ -2305,6 +2328,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			}
+			if (g_cp_lenient) {
+				g_cp_lenient_failed = true; // the draw-prep scanner read the list early: taint
+				continue;
 			}
 			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}

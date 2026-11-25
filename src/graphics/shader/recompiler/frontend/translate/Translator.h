@@ -1,5 +1,6 @@
 #pragma once
 
+#include "graphics/shader/recompiler/ir/RtCallable.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
@@ -50,6 +51,11 @@ public:
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
 	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
+	// v440 callable split (IR/RtCallable.h): the guest call as a callable call (ray-generation
+	// side), the register state from and to the payload (callee entry and exit).
+	void EmitCallableCall(const IR::RtCallInfo& rt);
+	void LoadPayloadRegisters(const IR::RtCallInfo& rt, IR::U1 call_exec = IR::U1(IR::Value(true)));
+	void StorePayloadRegisters(const IR::RtCallInfo& rt);
 	// Diagnostics (KYTY_SCALE_PC): multiplies an instruction's F32 destination by a factor.
 	void ScaleDestination(const Decoder::Instruction& inst, uint32_t factor_bits);
 	// Diagnostics (KYTY_PROBE_PC): copies the probed registers to v253..v255.
@@ -285,6 +291,7 @@ private:
 	void MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers);
 	void S_MOV_B64(const Decoder::Instruction& inst);
 	void S_WQM(const Decoder::Instruction& inst, bool wide);
+	void NoteExecWidening(const Decoder::Instruction& inst);
 	void V_MOVRELS_B32(const Decoder::Instruction& inst);
 	void V_MOVRELD_B32(const Decoder::Instruction& inst);
 	void V_READFIRSTLANE_B32(const Decoder::Instruction& inst);

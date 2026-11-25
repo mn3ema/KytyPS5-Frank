@@ -146,10 +146,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
 	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
 	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
+	// Standard256B colour targets (upstream a79c999): PS5 Pro mode renders into them (PSSR's
+	// outputs are 256B-tiled), tiled like 256B textures.
+	const bool     standard256  = rt.attrib3.tile_mode == Prospero::TileMode::kStandard256B;
+	const bool     texture_tile = standard256 || standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B:
 		case Prospero::TileMode::kStandard4KB:
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kDepth:

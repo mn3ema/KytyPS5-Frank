@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/syncToggle.h"
 #include "graphics/host_gpu/timeline.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 
 #include <algorithm>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -69,6 +71,125 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 	std::_Exit(322);
 }
 
+// [watcher-loop] (KYTY_PROTECT_STATS, v445m): the tracker's own loop over a region's pages
+// (UpdateRegionWatchers), apart from the host protection calls it makes. [0]: the GPU thread,
+// [1]: every other thread (fault handlers). Times in time-stamp counter ticks (CpuCost::Detail).
+struct WatcherLoopStats {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> loop_ticks {0};    // inside UpdateRegionWatchers, without lock wait and Protect
+	std::atomic<uint64_t> lock_ticks {0};    // waiting for the region's spin lock
+	std::atomic<uint64_t> protect_ticks {0}; // Protect() called from the loop
+	std::atomic<uint64_t> protect_calls {0};
+	std::atomic<uint64_t> visited {0}; // pages the loop went over
+	std::atomic<uint64_t> updated {0}; // pages whose watcher count it changed
+	std::atomic<uint64_t> changed {0}; // pages whose host protection had to change
+};
+std::array<WatcherLoopStats, 2> g_watcher_loop;
+thread_local uint64_t           t_watcher_protect_ticks = 0;
+thread_local uint64_t           t_watcher_protect_calls = 0;
+thread_local bool               t_in_watcher_loop       = false;
+
+// [fault-census] (pageManager.h). Written from the fault handler: atomics only.
+struct FaultCensusState {
+	static constexpr size_t Slots = 16384;
+	static constexpr uint64_t Write = 1, GpuDirty = 2, CpuClean = 4, GpuThread = 8, None = 0;
+	struct Slot {
+		std::atomic<uint64_t> key {0};    // bit 63 | page << 4 | flags; 0: free
+		std::atomic<uint32_t> thread {0}; // guest thread id + 1 (0: not written yet)
+		std::atomic<uint32_t> count {0};
+	};
+	struct Name {
+		std::atomic<uint32_t> thread {0}; // guest thread id + 1; 0: free
+		std::atomic<bool>     ready {false};
+		char                  name[32] {};
+	};
+	std::array<Slot, Slots> slots;
+	std::array<Name, 128>   names;
+	std::atomic<uint64_t>   total {0}, writes {0}, gpu_dirty {0}, cpu_clean {0}, untracked {0}, gpu_thread {0};
+	std::atomic<uint64_t>   dropped {0}; // the table was full
+	std::atomic<uint32_t>   used {0};
+	std::atomic<int64_t>    reported_ms {0};
+};
+FaultCensusState* g_fault_census = nullptr; // set once by the first PageManager, before any fault is counted
+
+bool FaultCensusEnabledSlow() noexcept {
+	static const bool enabled = [] {
+		const char* only = std::getenv("KYTY_PROTECT_STATS");
+		return Common::FpsLogDiagnostics() || (only != nullptr && only[0] == '1');
+	}();
+	return enabled;
+}
+
+// In the fault handler: no allocation, no lock.
+void FaultCensusNote(uint64_t vaddr, bool write, bool gpu_dirty, bool cpu_clean) noexcept {
+	auto* census = g_fault_census;
+	if (census == nullptr) {
+		return;
+	}
+	using State = FaultCensusState;
+	const bool     gpu_thread = Profiler::t_gpu_thread;
+	const uint32_t thread     = static_cast<uint32_t>(Libs::LibKernel::PthreadGetthreadid()) + 1u;
+	census->total.fetch_add(1, std::memory_order_relaxed);
+	census->writes.fetch_add(write ? 1u : 0u, std::memory_order_relaxed);
+	census->gpu_dirty.fetch_add(gpu_dirty ? 1u : 0u, std::memory_order_relaxed);
+	census->cpu_clean.fetch_add(cpu_clean && !gpu_dirty ? 1u : 0u, std::memory_order_relaxed);
+	census->untracked.fetch_add(!cpu_clean && !gpu_dirty ? 1u : 0u, std::memory_order_relaxed);
+	census->gpu_thread.fetch_add(gpu_thread ? 1u : 0u, std::memory_order_relaxed);
+	// The thread's name, once per thread.
+	static thread_local bool named = false;
+	if (!named) {
+		named = true;
+		for (auto& entry: census->names) {
+			uint32_t expected = 0;
+			if (entry.thread.load(std::memory_order_relaxed) == thread) {
+				break;
+			}
+			if (entry.thread.compare_exchange_strong(expected, thread, std::memory_order_relaxed)) {
+				char name[64] = "(host thread)";
+				if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+					if (Libs::LibKernel::PthreadGetname(self, name) != 0) {
+						name[0] = '\0';
+					}
+				}
+				name[31] = '\0';
+				std::memcpy(entry.name, name, sizeof(entry.name));
+				entry.ready.store(true, std::memory_order_release);
+				break;
+			}
+			if (expected == thread) {
+				break;
+			}
+		}
+	}
+	const uint64_t key = (uint64_t {1} << 63u) | ((vaddr / PAGE_SIZE) << 4u) | (write ? State::Write : State::None) |
+	                     (gpu_dirty ? State::GpuDirty : State::None) | (cpu_clean ? State::CpuClean : State::None) |
+	                     (gpu_thread ? State::GpuThread : State::None);
+	auto index = static_cast<size_t>(((key ^ (uint64_t {thread} << 40u)) * 0x9e3779b97f4a7c15ull) >> 40u) &
+	             (State::Slots - 1u);
+	for (size_t probe = 0; probe < 32; probe++, index = (index + 1u) & (State::Slots - 1u)) {
+		auto& slot    = census->slots[index];
+		auto  current = slot.key.load(std::memory_order_acquire);
+		if (current == 0) {
+			if (census->used.load(std::memory_order_relaxed) >= State::Slots / 2u) {
+				break;
+			}
+			if (slot.key.compare_exchange_strong(current, key, std::memory_order_acq_rel)) {
+				census->used.fetch_add(1, std::memory_order_relaxed);
+				slot.thread.store(thread, std::memory_order_release);
+				slot.count.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+		}
+		// A slot another thread is just claiming (its thread not written yet) reads as another
+		// thread's: this fault takes a slot of its own, and the report adds equal entries up.
+		if (current == key && slot.thread.load(std::memory_order_acquire) == thread) {
+			slot.count.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+	census->dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
@@ -90,6 +211,118 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 }
 
 std::atomic<uint64_t> g_stale_resolved {0}; // pages, for [page-protect]
+// [page-protect]: pages a lazy release left no-access, and stale pages a new read watcher took
+// over (the host call the lazy release saved).
+std::atomic<uint64_t> g_stale_made {0};
+std::atomic<uint64_t> g_stale_reused {0};
+// [page-protect]: pages inside a changed range whose protection did not change, by the length of
+// their run (1-3, 4-15, 16-63, 64 and more), and what KYTY_PROTECT_GAP left out.
+std::atomic<uint64_t> g_gap_pages[4] {};
+std::atomic<uint64_t> g_gap_skipped {0};
+std::atomic<uint64_t> g_gap_splits {0};
+
+// v445h: default back to 0 (off); two in-run A/Bs (g449b, g449d) showed no fps change either way.
+// v445e: default 16 (KYTY_PROTECT_GAP=0: off). M3/M4 of 11-17: GPU-thread arm time 80 -> 48-58 ms/s,
+// disarm time on all threads 149 -> 41 ms/s, and KYTY_PROTECT_VERIFY found no page whose protection
+// differed (94 M left-out pages checked). KYTY_SYNC_TOGGLE_MODE=protectgap: on in the toggle's on
+// windows only, for an A/B inside one run.
+// KYTY_PROTECT_GAP=<pages> (v438zw; was default 0: off). One host call covers the pages from the first
+// to the last page of a pass whose protection changes, with every unchanged page between them.
+// With this, a call is not carried across <pages> or more unchanged pages: it ends at the last
+// changed page and a new one starts at the next. The same pages get the same protection; the
+// pages left out already have it. Off while the protection helper is configured (its marks are
+// cleared per call). At most 4096.
+uint64_t ProtectGapBytes() noexcept {
+	static const uint64_t bytes = [] {
+		const char*    value = std::getenv("KYTY_PROTECT_GAP");
+		const uint64_t pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+		if (pages == 0 || SyncToggle::ProtectHelperConfigured() ||
+		    SyncToggle::ProtectHelperAlwaysEnabled()) {
+			return uint64_t {0};
+		}
+		return (pages > 4096 ? 4096 : pages) * PAGE_SIZE;
+	}();
+	if (SyncToggle::ProtectGapToggled() && !SyncToggle::ProtectGapWindow()) {
+		return 0; // the toggle's off window
+	}
+	return bytes;
+}
+
+// KYTY_PROTECT_VERIFY=1 (v438zw, Windows; slow): checks against the host what the tracker takes
+// for granted. (1) A page a lazy release leaves stale, and a stale page a new read watcher takes
+// over without a host call, must be no-access on the host at that moment. (2) The pages
+// KYTY_PROTECT_GAP leaves out get the call after all, and the host's protection of each must be
+// the same before and after it. A difference ends the run with the page.
+bool ProtectVerify() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROTECT_VERIFY");
+		const bool  on    = value != nullptr && value[0] == '1';
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		if (on) {
+			std::fprintf(stderr, "[protect-verify] not available on this host: off\n");
+			return false;
+		}
+#endif
+		if (on && (SyncToggle::ProtectHelperConfigured() || SyncToggle::ProtectHelperAlwaysEnabled())) {
+			std::fprintf(stderr, "[protect-verify] off: the protection helper applies changes later\n");
+			return false;
+		}
+		return on;
+	}();
+	return enabled;
+}
+std::atomic<uint64_t> g_verify_stale_pages {0};
+std::atomic<uint64_t> g_verify_gap_pages {0};
+
+// The host's protection of every page of the range (0 where it is not committed). False where it
+// cannot be read.
+bool HostProtections([[maybe_unused]] uint64_t vaddr, [[maybe_unused]] uint64_t size,
+                     [[maybe_unused]] std::vector<uint32_t>& pages) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	pages.clear();
+	pages.reserve(size / PAGE_SIZE);
+	const uint64_t end = vaddr + size;
+	for (uint64_t current = vaddr; current < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0) {
+			return false;
+		}
+		const uint64_t next = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		if (next <= current) {
+			return false;
+		}
+		const uint32_t protect = info.State == MEM_COMMIT ? static_cast<uint32_t>(info.Protect) : 0u;
+		for (uint64_t page = current; page < next && page < end; page += PAGE_SIZE) {
+			pages.push_back(protect);
+		}
+		current = next;
+	}
+	return true;
+#else
+	return false;
+#endif
+}
+
+// KYTY_PROTECT_VERIFY, part 1: the tracker relies on these pages being no-access on the host.
+void VerifyNoAccess(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::vector<uint32_t> pages;
+	if (!HostProtections(vaddr, size, pages)) {
+		return;
+	}
+	for (size_t i = 0; i < pages.size(); i++) {
+		if (pages[i] != 0 && (pages[i] & 0xffu) != PAGE_NOACCESS) {
+			Fatal("KYTY_PROTECT_VERIFY: page 0x%016" PRIx64 " is stale (no-access by the tracker) but "
+			      "the host has protection 0x%" PRIx32 " (run 0x%016" PRIx64 "+0x%" PRIx64 ")",
+			      vaddr + i * PAGE_SIZE, pages[i], vaddr, size);
+		}
+	}
+	g_verify_stale_pages.fetch_add(pages.size(), std::memory_order_relaxed);
+#else
+	(void)vaddr;
+	(void)size;
+#endif
+}
 thread_local const char* t_protect_kind = nullptr; // [page-protect]: the watcher change
 
 bool QueueProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept;
@@ -262,6 +495,7 @@ struct PageManager::Impl {
 		double                                 arm_us_gpu = 0, disarm_us_gpu = 0; // on the GPU thread
 		std::unordered_map<std::string, std::array<double, 5>> reasons; // arm calls, arm us, disarm calls, disarm us, arm pages
 		std::unordered_map<uint64_t, uint32_t> armed; // page -> arm count in the window
+		uint64_t                               start_ticks = CpuCost::Detail::Ticks(); // [watcher-loop]
 	};
 	static ProtectStats* Stats() {
 		// KYTY_PROTECT_STATS=1: these stats alone. KYTY_FPS_LOG is named in the recompiler's sources,
@@ -393,6 +627,62 @@ struct PageManager::Impl {
 		std::fprintf(stderr, "[page-protect] GPU thread: arm %.1f ms/s disarm %.1f ms/s; stale pages resolved by faults %.0f/s\n",
 		             stats->arm_us_gpu / 1000.0 / s, stats->disarm_us_gpu / 1000.0 / s,
 		             static_cast<double>(g_stale_resolved.exchange(0)) / s);
+		std::fprintf(stderr,
+		             "[page-protect] lazy release: %.0f pages/s left no-access, %.0f pages/s taken over by "
+		             "a new GPU write without a host call\n",
+		             static_cast<double>(g_stale_made.exchange(0)) / s,
+		             static_cast<double>(g_stale_reused.exchange(0)) / s);
+		std::fprintf(stderr,
+		             "[page-protect] unchanged pages inside changed ranges, by run length: 1-3: %.0f/s, "
+		             "4-15: %.0f/s, 16-63: %.0f/s, 64+: %.0f/s; left out by KYTY_PROTECT_GAP: %.0f/s in "
+		             "%.0f splits/s\n",
+		             static_cast<double>(g_gap_pages[0].exchange(0)) / s,
+		             static_cast<double>(g_gap_pages[1].exchange(0)) / s,
+		             static_cast<double>(g_gap_pages[2].exchange(0)) / s,
+		             static_cast<double>(g_gap_pages[3].exchange(0)) / s,
+		             static_cast<double>(g_gap_skipped.exchange(0)) / s,
+		             static_cast<double>(g_gap_splits.exchange(0)) / s);
+		{
+			// [watcher-loop]: the tracker's page loop apart from its host calls (v445m).
+			const auto   ticks_now   = CpuCost::Detail::Ticks();
+			const double ns_per_tick = ticks_now > stats->start_ticks
+			                               ? s * 1e9 / static_cast<double>(ticks_now - stats->start_ticks)
+			                               : 0.0;
+			stats->start_ticks       = ticks_now;
+			std::string line         = "[watcher-loop] 5 s:";
+			for (size_t who = 0; who < g_watcher_loop.size(); who++) {
+				auto&        w       = g_watcher_loop[who];
+				const auto   take    = [](std::atomic<uint64_t>& value) {
+                    return static_cast<double>(value.exchange(0, std::memory_order_relaxed));
+				};
+				const double calls   = take(w.calls);
+				const double loop    = take(w.loop_ticks) * ns_per_tick / 1e6 / s;
+				const double lock    = take(w.lock_ticks) * ns_per_tick / 1e6 / s;
+				const double protect = take(w.protect_ticks) * ns_per_tick / 1e6 / s;
+				const double pcalls  = take(w.protect_calls);
+				const double visited = take(w.visited);
+				const double updated = take(w.updated);
+				const double changed = take(w.changed);
+				char         text[400];
+				std::snprintf(text, sizeof(text),
+				              "%s %s: %.0f calls/s, loop %.2f ms/s (%.0f ns/call, %.1f ns/page), lock wait %.2f ms/s, "
+				              "Protect inside %.2f ms/s in %.0f calls/s; pages/s visited %.0f, count changed %.0f, "
+				              "protection changed %.0f (%.1f%% of visited)",
+				              who == 0 ? "" : " |", who == 0 ? "GPU thread" : "other threads", calls / s, loop,
+				              calls != 0 ? loop * 1e6 * s / calls : 0.0, visited != 0 ? loop * 1e6 * s / visited : 0.0,
+				              lock, protect, pcalls / s, visited / s, updated / s, changed / s,
+				              visited != 0 ? 100.0 * changed / visited : 0.0);
+				line += text;
+			}
+			std::fprintf(stderr, "%s\n", line.c_str());
+		}
+		if (ProtectVerify()) {
+			std::fprintf(stderr,
+			             "[protect-verify] %llu stale pages and %llu left-out pages checked against the "
+			             "host, no difference\n",
+			             static_cast<unsigned long long>(g_verify_stale_pages.load()),
+			             static_cast<unsigned long long>(g_verify_gap_pages.load()));
+		}
 		std::vector<std::pair<std::string, std::array<double, 5>>> reasons(stats->reasons.begin(),
 		                                                                stats->reasons.end());
 		std::sort(reasons.begin(), reasons.end(), [](const auto& a, const auto& b) {
@@ -418,6 +708,16 @@ struct PageManager::Impl {
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
 	            Region* region = nullptr) noexcept {
+		// [watcher-loop]: this call's time is not the loop's (the stats' own bookkeeping included).
+		struct WatcherProtectTime {
+			const uint64_t begin = t_in_watcher_loop ? CpuCost::Detail::Ticks() : 0;
+			~WatcherProtectTime() {
+				if (begin != 0) {
+					t_watcher_protect_ticks += CpuCost::Detail::Ticks() - begin;
+					t_watcher_protect_calls++;
+				}
+			}
+		} watcher_protect_time;
 		const bool gpu_ownership_change =
 		    t_protect_kind != nullptr &&
 		    (std::strcmp(t_protect_kind, "gpu-dirty") == 0 ||
@@ -460,7 +760,50 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
-		SpinGuard  lock(region.lock);
+		// [watcher-loop] (KYTY_PROTECT_STATS): this loop's own time, lock wait and Protect apart.
+		const bool     loop_stats  = Stats() != nullptr;
+		const uint64_t loop_begin  = loop_stats ? CpuCost::Detail::Ticks() : 0;
+		SpinGuard      lock(region.lock);
+		const uint64_t loop_locked = loop_stats ? CpuCost::Detail::Ticks() : 0;
+		uint64_t       loop_updated = 0;
+		uint64_t       loop_changed = 0;
+		struct LoopNote {
+			bool            on;
+			uint64_t        begin, locked, pages;
+			const uint64_t& updated;
+			const uint64_t& changed;
+			bool            outer_in_loop      = t_in_watcher_loop;
+			uint64_t        outer_protect      = t_watcher_protect_ticks;
+			uint64_t        outer_protect_call = t_watcher_protect_calls;
+			LoopNote(bool on_, uint64_t begin_, uint64_t locked_, uint64_t pages_, const uint64_t& updated_,
+			         const uint64_t& changed_)
+			    : on(on_), begin(begin_), locked(locked_), pages(pages_), updated(updated_), changed(changed_) {
+				if (on) {
+					t_in_watcher_loop       = true;
+					t_watcher_protect_ticks = 0;
+					t_watcher_protect_calls = 0;
+				}
+			}
+			~LoopNote() {
+				if (!on) {
+					return;
+				}
+				const auto end     = CpuCost::Detail::Ticks();
+				const auto protect = t_watcher_protect_ticks;
+				auto&      w       = g_watcher_loop[Profiler::t_gpu_thread ? 0 : 1];
+				w.calls.fetch_add(1, std::memory_order_relaxed);
+				w.lock_ticks.fetch_add(locked - begin, std::memory_order_relaxed);
+				w.loop_ticks.fetch_add(end - locked > protect ? end - locked - protect : 0, std::memory_order_relaxed);
+				w.protect_ticks.fetch_add(protect, std::memory_order_relaxed);
+				w.protect_calls.fetch_add(t_watcher_protect_calls, std::memory_order_relaxed);
+				w.visited.fetch_add(pages, std::memory_order_relaxed);
+				w.updated.fetch_add(updated, std::memory_order_relaxed);
+				w.changed.fetch_add(changed, std::memory_order_relaxed);
+				t_in_watcher_loop       = outer_in_loop;
+				t_watcher_protect_ticks = outer_protect;
+				t_watcher_protect_calls = outer_protect_call;
+			}
+		} loop_note(loop_stats, loop_begin, loop_locked, last - first, loop_updated, loop_changed);
 		const bool lazy = is_read && !track && t_lazy_read_release && LazyReadReleaseActive();
 		t_protect_kind  = is_read ? (track ? "gpu-dirty" : "gpu-clean") : (track ? "cpu-clean" : "cpu-dirty");
 		struct KindReset {
@@ -470,8 +813,34 @@ struct PageManager::Impl {
 		uint64_t   range_begin           = 0;
 		uint64_t   range_bytes           = 0;
 		uint64_t   potential_range_bytes = 0;
+		// KYTY_PROTECT_GAP: the first page a split left out, until the next changed page shows
+		// that the unsplit call would have covered it.
+		const uint64_t gap_bytes    = ProtectGapBytes();
+		size_t         skipped_from = SIZE_MAX;
+		const bool     verify       = ProtectVerify();
+		const bool     counting     = verify || Stats() != nullptr;
+		// KYTY_PROTECT_VERIFY: a run of pages whose host protection this pass relies on without
+		// a call; checked before the pass's next host call, which could cover (and repair) them.
+		size_t check_begin = 0;
+		size_t check_end   = 0;
+		const auto flush_check = [&] {
+			if (check_end > check_begin) {
+				VerifyNoAccess(base_addr + check_begin * PAGE_SIZE, (check_end - check_begin) * PAGE_SIZE);
+			}
+			check_begin = check_end = 0;
+		};
+		[[maybe_unused]] const auto note_check = [&](size_t page) {
+			if (check_end > check_begin && check_end == page) {
+				check_end++;
+			} else {
+				flush_check();
+				check_begin = page;
+				check_end   = page + 1;
+			}
+		};
 
 		const auto release_pending = [&] {
+			flush_check();
 			if (range_bytes != 0) {
 				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms, &region);
 				range_bytes           = 0;
@@ -491,10 +860,24 @@ struct PageManager::Impl {
 				if (update) {
 					if constexpr (track) {
 						// No-access again by its counts: the host already is.
+						if (counting && region.stale_count.load(std::memory_order_relaxed) != 0 &&
+						    region.stale.Get(page_index)) {
+							g_stale_reused.fetch_add(1, std::memory_order_relaxed);
+							if (verify) {
+								note_check(page_index);
+							}
+						}
 						region.ClearStale(page_index);
 					} else if (new_count == 0 &&
 					           old_perms == Common::VirtualMemory::Mode::NoAccess) {
 						if (lazy) {
+							if (counting && !(region.stale_count.load(std::memory_order_relaxed) != 0 &&
+							                  region.stale.Get(page_index))) {
+								g_stale_made.fetch_add(1, std::memory_order_relaxed);
+								if (verify) {
+									note_check(page_index);
+								}
+							}
 							region.SetStale(page_index);
 						} else {
 							// A sync-toggle window can end while pages from its on-window are stale.
@@ -507,26 +890,77 @@ struct PageManager::Impl {
 
 			if (new_perms != perms) [[unlikely]] {
 				release_pending();
-				perms = new_perms;
+				perms        = new_perms;
+				skipped_from = SIZE_MAX; // the unsplit call would have ended here too
 			} else if (range_bytes != 0) {
 				potential_range_bytes += PAGE_SIZE;
+				if (gap_bytes != 0 && potential_range_bytes - range_bytes > gap_bytes) {
+					// KYTY_PROTECT_GAP: this many unchanged pages since the last changed one.
+					skipped_from = static_cast<size_t>(range_begin + range_bytes / PAGE_SIZE);
+					release_pending();
+				}
 			}
 
 			if (!update) {
 				continue;
 			}
+			loop_updated++;
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
 			if (watcher_edge && old_perms != new_perms) {
+				loop_changed++;
 				if (range_bytes == 0) {
+					if (skipped_from != SIZE_MAX) {
+						// The unsplit call would have run on to this page: [skipped_from, here)
+						// is what the split left out.
+						g_gap_skipped.fetch_add(page_index - skipped_from, std::memory_order_relaxed);
+						g_gap_splits.fetch_add(1, std::memory_order_relaxed);
+						if (verify) {
+							flush_check();
+							VerifyGap(region, base_addr, skipped_from, page_index, perms);
+						}
+						skipped_from = SIZE_MAX;
+					}
 					range_begin           = page_index;
 					potential_range_bytes = PAGE_SIZE;
+				} else if (counting) {
+					const uint64_t between = (potential_range_bytes - range_bytes) / PAGE_SIZE - 1;
+					if (between != 0) {
+						g_gap_pages[between <= 3 ? 0 : between <= 15 ? 1 : between <= 63 ? 2 : 3].fetch_add(
+						    between, std::memory_order_relaxed);
+					}
 				}
 				range_bytes = potential_range_bytes;
 			}
 		}
 
 		release_pending();
+	}
+
+	// KYTY_PROTECT_VERIFY, part 2: the pages a KYTY_PROTECT_GAP split left out get the host call
+	// after all; the host's protection of each must be what it was.
+	void VerifyGap(Region& region, uint64_t base_addr, size_t from, size_t to,
+	               Common::VirtualMemory::Mode perms) {
+		const uint64_t        vaddr = base_addr + from * PAGE_SIZE;
+		const uint64_t        size  = (to - from) * PAGE_SIZE;
+		std::vector<uint32_t> before;
+		std::vector<uint32_t> after;
+		if (!HostProtections(vaddr, size, before)) {
+			return;
+		}
+		Protect(vaddr, size, perms, &region);
+		if (!HostProtections(vaddr, size, after) || after.size() != before.size()) {
+			return;
+		}
+		for (size_t i = 0; i < before.size(); i++) {
+			if (before[i] != after[i]) {
+				Fatal("KYTY_PROTECT_VERIFY: page 0x%016" PRIx64 " was left out by KYTY_PROTECT_GAP with "
+				      "host protection 0x%" PRIx32 ", the call sets 0x%" PRIx32 " (gap 0x%016" PRIx64
+				      "+0x%" PRIx64 ")",
+				      vaddr + i * PAGE_SIZE, before[i], after[i], vaddr, size);
+			}
+		}
+		g_verify_gap_pages.fetch_add(before.size(), std::memory_order_relaxed);
 	}
 
 	// The stale pages around vaddr's (a run of them with one protection by their counts, within
@@ -917,7 +1351,135 @@ void DrainProtectionHelperBeforeToggleOff() noexcept {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
+PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {
+	// [fault-census]: the table exists before the first fault is counted (none is made in a handler).
+	if (FaultCensusEnabledSlow() && g_fault_census == nullptr) {
+		g_fault_census = new FaultCensusState;
+	}
+}
+
+bool FaultCensus::Enabled() noexcept {
+	return g_fault_census != nullptr;
+}
+
+void FaultCensus::Report(void* context, Describe describe) {
+	auto* census = g_fault_census;
+	if (census == nullptr) {
+		return;
+	}
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                    std::chrono::steady_clock::now().time_since_epoch())
+	                    .count();
+	auto last = census->reported_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		census->reported_ms.compare_exchange_strong(last, ms);
+		return;
+	}
+	if (ms - last < 5000 || !census->reported_ms.compare_exchange_strong(last, ms)) {
+		return;
+	}
+	using State = FaultCensusState;
+	const double s = static_cast<double>(ms - last) / 1000.0;
+	struct Entry {
+		uint64_t key;
+		uint32_t thread;
+		uint64_t count;
+	};
+	// Faults that land while the table is read are counted in the next window or lost (a count
+	// taken and its slot cleared are two steps); the totals are exact.
+	std::vector<Entry> entries;
+	for (auto& slot: census->slots) {
+		const auto key = slot.key.load(std::memory_order_acquire);
+		if (key == 0) {
+			continue;
+		}
+		const auto count = slot.count.exchange(0, std::memory_order_relaxed);
+		if (count != 0) {
+			entries.push_back({key, slot.thread.load(std::memory_order_acquire), count});
+		}
+	}
+	// The slots keep their keys while the table has room (the same pages fault again); a table
+	// half full starts again, which loses the faults of that moment.
+	if (census->used.load(std::memory_order_relaxed) >= State::Slots / 4u) {
+		for (auto& slot: census->slots) {
+			slot.thread.store(0, std::memory_order_relaxed);
+			slot.count.store(0, std::memory_order_relaxed);
+			slot.key.store(0, std::memory_order_release);
+		}
+		census->used.store(0, std::memory_order_relaxed);
+	}
+	std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+		return a.key != b.key ? a.key < b.key : a.thread < b.thread;
+	});
+	std::vector<Entry> merged;
+	for (const auto& entry: entries) {
+		if (!merged.empty() && merged.back().key == entry.key && merged.back().thread == entry.thread) {
+			merged.back().count += entry.count;
+		} else {
+			merged.push_back(entry);
+		}
+	}
+	std::sort(merged.begin(), merged.end(), [](const Entry& a, const Entry& b) { return a.count > b.count; });
+	// By thread, over every entry.
+	std::unordered_map<uint32_t, std::array<uint64_t, 2>> by_thread; // reads, writes
+	for (const auto& entry: merged) {
+		by_thread[entry.thread][(entry.key & State::Write) != 0 ? 1 : 0] += entry.count;
+	}
+	const auto thread_name = [census](uint32_t thread) -> std::string {
+		for (const auto& name: census->names) {
+			if (name.thread.load(std::memory_order_relaxed) == thread && name.ready.load(std::memory_order_acquire)) {
+				return name.name;
+			}
+		}
+		return "?";
+	};
+	const auto take = [s](std::atomic<uint64_t>& value) {
+		return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) / s;
+	};
+	const double total = take(census->total), writes = take(census->writes);
+	std::string  text;
+	char         line[512];
+	std::snprintf(line, sizeof(line),
+	              "[fault-census] 5 s: %.0f faults/s: read %.0f, write %.0f | page GPU-dirty (read-watched) %.0f, "
+	              "CPU-clean only (write-watched) %.0f, neither (stale, released or not the tracker's) %.0f | on the GPU "
+	              "thread %.0f | distinct (page, thread, kind) %zu, not counted (table full) %.0f/s\n",
+	              total, total - writes, writes, take(census->gpu_dirty), take(census->cpu_clean), take(census->untracked),
+	              take(census->gpu_thread), merged.size(), take(census->dropped));
+	text += line;
+	{
+		std::vector<std::pair<uint32_t, std::array<uint64_t, 2>>> threads(by_thread.begin(), by_thread.end());
+		std::sort(threads.begin(), threads.end(), [](const auto& a, const auto& b) {
+			return a.second[0] + a.second[1] > b.second[0] + b.second[1];
+		});
+		text += "[fault-census]   by guest thread (id name: reads/s writes/s):";
+		for (size_t i = 0; i < threads.size() && i < 12; i++) {
+			std::snprintf(line, sizeof(line), " %u %s: %.0f %.0f |", threads[i].first - 1u,
+			              thread_name(threads[i].first).c_str(), static_cast<double>(threads[i].second[0]) / s,
+			              static_cast<double>(threads[i].second[1]) / s);
+			text += line;
+		}
+		text += "\n";
+	}
+	for (size_t i = 0; i < merged.size() && i < 10; i++) {
+		const auto&    entry   = merged[i];
+		const uint64_t address = ((entry.key & ~(uint64_t {1} << 63u)) >> 4u) * PAGE_SIZE;
+		char           owner[160] = "?";
+		if (describe != nullptr) {
+			describe(context, address, owner, sizeof(owner));
+		}
+		std::snprintf(line, sizeof(line),
+		              "[fault-census]   #%zu page 0x%012llx %s %.1f/s thread %u %s%s | at the fault: %s | now: %s\n", i + 1,
+		              static_cast<unsigned long long>(address), (entry.key & State::Write) != 0 ? "write" : "read ",
+		              static_cast<double>(entry.count) / s, entry.thread - 1u, thread_name(entry.thread).c_str(),
+		              (entry.key & State::GpuThread) != 0 ? " (GPU thread)" : "",
+		              (entry.key & State::GpuDirty) != 0
+		                  ? ((entry.key & State::CpuClean) != 0 ? "GPU-dirty + CPU-clean" : "GPU-dirty")
+		                  : ((entry.key & State::CpuClean) != 0 ? "CPU-clean (not GPU-dirty)" : "neither"),
+		              owner);
+		text += line;
+	}
+	std::fputs(text.c_str(), stderr);
+}
 
 PageManager::~PageManager() {
 	DrainProtectionHelper(ProtectDrainReason::Mapping);
@@ -982,6 +1544,17 @@ void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 }
 
 bool PageManager::ResolveStale(uint64_t vaddr, PageFaultAccess access) noexcept {
+	if (g_fault_census != nullptr && vaddr < ADDRESS_SIZE) [[unlikely]] {
+		// [fault-census]: the page's watchers as they are now, read without the region's lock.
+		bool gpu_dirty = false;
+		bool cpu_clean = false;
+		if (const auto* region = m_impl->FindRegion(vaddr); region != nullptr) {
+			const auto& page = region->pages[static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE)];
+			gpu_dirty        = page.access_watchers != 0;
+			cpu_clean        = page.write_watchers != 0;
+		}
+		FaultCensusNote(vaddr, access == PageFaultAccess::Write, gpu_dirty, cpu_clean);
+	}
 	if (!LazyReadReleaseMayBeActive() && !SyncToggle::ProtectHelperConfigured() &&
 	    !SyncToggle::ProtectHelperAlwaysEnabled()) {
 		return false;

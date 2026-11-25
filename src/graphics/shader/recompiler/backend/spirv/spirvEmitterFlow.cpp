@@ -43,13 +43,25 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		const auto address = Binary(state, spv::OpIAdd, u64, base,
 		                            state.builder.Constant(spv::OpConstant, u64,
 		                                                   component * 4u, 0u));
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-		                          address);
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask, 4u);
-		return value;
+		const auto load = [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          address);
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+			                          spv::MemoryAccessAlignedMask, 4u);
+			return value;
+		};
+		if (state.program.rt_role != IR::RtRole::None && IR::RtAddressTrap()) {
+			// v443l: a callable split's launch extents, behind the address trap (spirvEmitterRt.cpp).
+			const auto usable = EmitRtAddressUsable(state, base);
+			if (IR::RtAddressTrapReport()) {
+				EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), usable),
+				                [&]() { EmitRtAddressTrapped(state, base, 1u); });
+			}
+			return EmitValueOrZeroIfCondition(state, usable, load);
+		}
+		return load();
 	}
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
@@ -71,6 +83,14 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		const auto group = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, component);
 		return EmitAddU32(state, local,
 		                  EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
+	}
+	// v443i: a callable split's module takes its workgroup built-ins from the launch id
+	// (EmitRtWorkgroupInput). Since v442 it declares no compute inputs (DefineInputs), and without
+	// this every lane of every wave read thread 0 of group 0 from the "not declared" case below.
+	if (state.program.rt_role != IR::RtRole::None &&
+	    (kind == IR::StageInputKind::WorkgroupId || kind == IR::StageInputKind::NumWorkgroups ||
+	     kind == IR::StageInputKind::LocalInvocationId || kind == IR::StageInputKind::GlobalInvocationId)) {
+		return EmitInputComponentU32(state, kind, component);
 	}
 	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
 	const auto variable = InputVariableForKind(
@@ -481,6 +501,11 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+
+// v440 (spirvEmitterRt.cpp): the dispatch's thread extent on one axis, from the shader data.
+uint32_t EmitDispatchThreadCount(EmitterState& state, uint32_t axis) {
+	return EmitBuiltinU32(state, IR::StageInputKind::DispatchThreadCount, axis);
+}
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -1076,13 +1101,15 @@ void EmitBarrier(EmitterState& state) {
 		// Independent graphics invocations have no native workgroup left to synchronize.
 		return;
 	}
-	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
+	const auto memory_scope = tessellation ? spv::ScopeInvocation : LdsMemoryScope(state);
 	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
 	                        ? spv::MemorySemanticsUniformMemoryMask
 	                        : spv::MemorySemanticsWorkgroupMemoryMask;
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
-	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
+	// The ray-tracing stages have no workgroup: a barrier there can only span the subgroup.
+	const auto execution_scope = state.program.rt_role != IR::RtRole::None ? spv::ScopeSubgroup : spv::ScopeWorkgroup;
+	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, execution_scope),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
 
@@ -1095,7 +1122,7 @@ void EmitWaveLdsBarrier(EmitterState& state) {
 	                        : spv::MemorySemanticsWorkgroupMemoryMask;
 	state.builder.AddFunction(
 	    spv::OpControlBarrier, ConstantU32(state, state.wave_lds_scope),
-	    ConstantU32(state, spv::ScopeWorkgroup),
+	    ConstantU32(state, LdsMemoryScope(state)),
 	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
 }
 
@@ -1125,6 +1152,9 @@ uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {
 		return ConstantU32(state, 0);
+	} else if (state.rt_relocate) {
+		// v443: the register's place among the split's user-data registers, from the shader record.
+		return EmitShaderDataDwordLoadAt(state, 0u, RtPlaced(state, RtRecordSlot::UserData, IR::RegIndex(reg), dword));
 	} else {
 		return EmitShaderDataDwordLoad(state, dword);
 	}
@@ -1224,12 +1254,283 @@ static uint32_t EmitNativeWaveCondition(ValueEmitContext& ctx, const IR::Inst& i
 // reduces with DPP and V_READLANE 15/31: lanes left outside read as 0, so meshlets with fewer than
 // 32 vertices got spheres around the origin (17..31) or all-zero ones (up to 16), and the culling
 // removed them (the hexagonal holes in the skin).
-static bool WaveUniformBranches() {
-	static const bool enabled = [] {
+//
+// v446a (Mac 11-21): wave-uniform branches cost registers. Inside such a region every lane runs
+// and each write is a select on EXEC, which keeps the old and the new value of every register the
+// region writes live together; with per-lane branches the lanes EXEC disables skip the region and
+// the driver can give both values one register, as the hardware does. NVIDIA, offline
+// (tools/spv_regs): ade1bef389644fa5 168 -> 75 registers, dec083415ec94cc6 181 -> 31,
+// 7cca2c0d258a643b 168 -> 128, 238da5993d101c7b 204 -> 155. Per-lane branches differ only where
+// a lane EXEC disables matters inside the region: a cross-lane read (V_READLANE, DPP, permutes,
+// swizzles; V_READFIRSTLANE reads an active lane) or an EXEC write that turns lanes on
+// (IR::Program::exec_widens_lanes), as 637ad82d does. So by default only programs with one of
+// those keep wave-uniform branches. KYTY_WAVE_UNIFORM_BRANCHES=1: every wave32 program (v445z),
+// =0: none (per-lane, as before the 637ad82d fix).
+// v446r: the default is 1 again. g455h (v446o, auto): the GPU hung (device lost, warps stuck in
+// three shaders) 2.5 min into the New Game opening cinematic, as v446j/m did in Mac's play;
+// KYTY_WAVE_UNIFORM_BRANCHES=2 brings the per-lane planning back.
+static uint32_t WaveUniformBranchMode() {
+	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_WAVE_UNIFORM_BRANCHES");
-		return value == nullptr || value[0] != '0';
+		if (value == nullptr || value[0] == '\0') {
+			return 1u;
+		}
+		return value[0] == '0' ? 0u : value[0] == '1' ? 1u : 2u;
 	}();
-	return enabled;
+	return mode;
+}
+
+// KYTY_WAVE_PERLANE_MIN=<n> (default 1000): a branch goes per-lane only when the region it splits
+// holds at least n IR instructions; small regions keep their EXEC selects, which cost little, while
+// many small divergent branches cost more (g453c, every region per-lane: 7cca2c0d 382 -> 731 us per
+// call; g453e/g453h, 1000: 419/438 us, while ade1bef 358 -> 201/208 us, dec08341 149 -> 46/66 us
+// and 032d821b 58 -> 42/38 us kept their gains). 0: every region.
+static uint32_t WavePerLaneMinInstructions() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_WAVE_PERLANE_MIN");
+		return text == nullptr ? 1000u : static_cast<uint32_t>(std::strtoul(text, nullptr, 0));
+	}();
+	return value;
+}
+
+// KYTY_WAVE_UNIFORM_HASHES=<hash,...>: those programs keep wave-uniform branches (diagnostics).
+static bool WaveUniformListed(uint64_t hash) {
+	static const std::string list = [] {
+		const char* text = std::getenv("KYTY_WAVE_UNIFORM_HASHES");
+		return text == nullptr ? std::string() : std::string(text);
+	}();
+	if (list.empty()) {
+		return false;
+	}
+	const auto name = fmt::format("{:016x}", hash);
+	return list.find(name) != std::string::npos;
+}
+
+// A cross-lane read or a control barrier in the block, or nullptr. Control barriers need
+// subgroup-uniform control flow: the workgroup barrier, the store-completion barrier
+// (EmitStoreCompletion) and, while wave LDS ordering is on (WaveLdsScope), the barrier between LDS
+// accesses (EmitBlock). g453a with v446c (no barriers counted) lost the device in
+// e1f7c4d1cc06bdeb, whose per-lane regions held 7 of them.
+static const char* LaneSensitiveOp(const EmitterState& state, const IR::Block& block) {
+	for (const auto& inst: block) {
+		switch (inst.GetOpcode()) {
+			case IR::ValueOpcode::ReadLane: return "ReadLane";
+			case IR::ValueOpcode::WriteLane: return "WriteLane";
+			case IR::ValueOpcode::DppMoveU32: return "DppMoveU32";
+			case IR::ValueOpcode::DppUpdateU32: return "DppUpdateU32";
+			case IR::ValueOpcode::Permlane16U32: return "Permlane16U32";
+			case IR::ValueOpcode::PermuteU32: return "PermuteU32";
+			case IR::ValueOpcode::BpermuteU32: return "BpermuteU32";
+			case IR::ValueOpcode::SwizzleU32: return "SwizzleU32";
+			case IR::ValueOpcode::WqmU64: return "WqmU64";
+			case IR::ValueOpcode::Barrier: return "Barrier";
+			case IR::ValueOpcode::StoreCompletion: return "StoreCompletion";
+			default:
+				if (state.wave_lds_scope != 0 && IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::None) {
+					return "LDS access (wave LDS barrier)";
+				}
+				break;
+		}
+	}
+	return nullptr;
+}
+
+// Which branch blocks keep wave-uniform branches: a branch whose lanes have not rejoined before a
+// lane-sensitive block (a cross-lane read, or an EXEC write that turns lanes on). With per-lane
+// branches the lanes split at a branch and rejoin at its immediate post-dominator; a
+// lane-sensitive block reachable from the branch's targets before that point would run without
+// the lanes that took the other way.
+static void PlanWaveUniformBranches(EmitterState& state) {
+	const auto& program = state.program;
+	const auto  mode    = WaveUniformBranchMode();
+	static const bool log = std::getenv("KYTY_WAVE_UNIFORM_LOG") != nullptr;
+	state.wave_uniform_ready = true;
+	if (mode != 2u) {
+		state.wave_per_lane_all = mode == 0u;
+		return;
+	}
+	// v446h: the A/B variant with wave-uniform branches everywhere (KYTY_TRANSLATION_VARIANT=2).
+	if ((program.info.translation_variant & 2u) != 0u || WaveUniformListed(program.shader_hash)) {
+		return;
+	}
+	const auto  min_size = WavePerLaneMinInstructions();
+	const auto& blocks = program.blocks;
+	const auto  count  = blocks.size();
+	std::unordered_map<const IR::Block*, uint32_t> index;
+	index.reserve(count);
+	for (uint32_t i = 0; i < count; i++) {
+		index.emplace(blocks[i], i);
+	}
+	std::vector<uint8_t> sensitive(count, 0);
+	bool any_sensitive = false;
+	bool any_widening  = false;
+	for (uint32_t i = 0; i < count; i++) {
+		const char* op = LaneSensitiveOp(state, *blocks[i]);
+		if (op != nullptr || blocks[i]->exec_widens) {
+			sensitive[i] = 1;
+			any_sensitive = true;
+		}
+		any_widening = any_widening || blocks[i]->exec_widens;
+	}
+	// The flag without a flagged block (a pass rebuilt the blocks), or a merged callable split
+	// (one module's blocks at a time): every branch stays wave-uniform when anything is sensitive.
+	if ((program.exec_widens_lanes && !any_widening) || program.layout_blocks != nullptr) {
+		bool other = program.exec_widens_lanes;
+		const auto& all = program.layout_blocks != nullptr ? *program.layout_blocks : blocks;
+		for (const auto* block: all) {
+			other = other || LaneSensitiveOp(state, *block) != nullptr;
+		}
+		state.wave_per_lane_all = !other;
+		if (log) {
+			LOGF("[wave-branches] %016llx %s (whole program)\n", static_cast<unsigned long long>(program.shader_hash),
+			     other ? "wave-uniform" : "per-lane");
+		}
+		return;
+	}
+	if (!any_sensitive && min_size == 0u) {
+		state.wave_per_lane_all = true;
+		if (log) {
+			LOGF("[wave-branches] %016llx per-lane (no lane-sensitive block)\n",
+			     static_cast<unsigned long long>(program.shader_hash));
+		}
+		return;
+	}
+	// Immediate post-dominators (Cooper, Harvey, Kennedy) on the reversed graph, with a virtual
+	// exit (index count) after every block without successors.
+	const uint32_t exit = static_cast<uint32_t>(count);
+	std::vector<std::vector<uint32_t>> succ(count + 1);
+	for (uint32_t i = 0; i < count; i++) {
+		for (const auto* next: blocks[i]->ImmSuccessors()) {
+			if (const auto found = index.find(next); found != index.end()) {
+				succ[i].push_back(found->second);
+			}
+		}
+		if (succ[i].empty()) {
+			succ[i].push_back(exit);
+		}
+	}
+	// Reverse graph: edges from a block's successor back to it.
+	std::vector<std::vector<uint32_t>> rsucc(count + 1);
+	for (uint32_t i = 0; i < count; i++) {
+		for (const auto s: succ[i]) {
+			rsucc[s].push_back(i);
+		}
+	}
+	// Postorder of the reverse graph from the exit.
+	std::vector<uint32_t> order;
+	std::vector<uint32_t> number(count + 1, UINT32_MAX);
+	{
+		std::vector<std::pair<uint32_t, size_t>> stack;
+		std::vector<uint8_t>                     seen(count + 1, 0);
+		stack.emplace_back(exit, 0);
+		seen[exit] = 1;
+		while (!stack.empty()) {
+			auto& [node, next] = stack.back();
+			if (next < rsucc[node].size()) {
+				const auto child = rsucc[node][next++];
+				if (seen[child] == 0) {
+					seen[child] = 1;
+					stack.emplace_back(child, 0);
+				}
+			} else {
+				number[node] = static_cast<uint32_t>(order.size());
+				order.push_back(node);
+				stack.pop_back();
+			}
+		}
+	}
+	std::vector<uint32_t> ipdom(count + 1, UINT32_MAX);
+	ipdom[exit] = exit;
+	const auto intersect = [&](uint32_t a, uint32_t b) {
+		while (a != b) {
+			while (number[a] < number[b]) a = ipdom[a];
+			while (number[b] < number[a]) b = ipdom[b];
+		}
+		return a;
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (size_t k = order.size(); k-- > 0;) {
+			const auto node = order[k];
+			if (node == exit) continue;
+			uint32_t idom = UINT32_MAX;
+			for (const auto s: succ[node]) { // predecessors of node in the reversed graph
+				if (number[s] == UINT32_MAX || ipdom[s] == UINT32_MAX) continue;
+				idom = idom == UINT32_MAX ? s : intersect(s, idom);
+			}
+			if (idom != UINT32_MAX && ipdom[node] != idom) {
+				ipdom[node] = idom;
+				changed = true;
+			}
+		}
+	}
+	std::vector<uint32_t> sizes(count, 0);
+	for (uint32_t i = 0; i < count; i++) {
+		sizes[i] = static_cast<uint32_t>(blocks[i]->Instructions().size());
+	}
+	uint32_t uniform = 0;
+	uint32_t small   = 0;
+	uint32_t branches = 0;
+	std::vector<uint32_t> mark(count + 1, UINT32_MAX);
+	std::vector<uint32_t> work;
+	for (uint32_t b = 0; b < count; b++) {
+		if (succ[b].size() < 2) continue;
+		branches++;
+		// A block the reverse walk never reached (an endless loop): keep the branch wave-uniform.
+		const uint32_t stop = ipdom[b] == UINT32_MAX ? UINT32_MAX - 1 : ipdom[b];
+		bool     hit  = ipdom[b] == UINT32_MAX;
+		uint64_t size = 0;
+		work.assign(succ[b].begin(), succ[b].end());
+		while (!hit && !work.empty()) {
+			const auto node = work.back();
+			work.pop_back();
+			// v446o: a branch that reaches itself is a loop branch; loops keep wave-uniform branches
+			// (lanes leave a per-lane loop one by one, which the guest's wave never does).
+			if (node == b) {
+				hit = true;
+				break;
+			}
+			if (node == stop || node == exit || mark[node] == b) continue;
+			mark[node] = b;
+			if (sensitive[node] != 0) {
+				hit = true;
+				break;
+			}
+			size += sizes[node];
+			for (const auto s: succ[node]) work.push_back(s);
+		}
+		if (hit) {
+			uniform++;
+		} else if (size < min_size) {
+			small++;
+		} else {
+			state.wave_per_lane_blocks.insert(blocks[b]);
+		}
+	}
+	if (log) {
+		LOGF("[wave-branches] %016llx %u of %u branch blocks wave-uniform (+%u small regions)\n",
+		     static_cast<unsigned long long>(program.shader_hash), uniform, branches, small);
+	}
+}
+
+// v446o: whether this program may take per-lane branches (then its module asks for maximal
+// reconvergence: structured merges bring the lanes back together before cross-lane work).
+bool MayUsePerLaneBranches(EmitterState& state) {
+	if (WaveUniformBranchMode() == 1u) {
+		return false;
+	}
+	if (!state.wave_uniform_ready) {
+		PlanWaveUniformBranches(state);
+	}
+	return state.wave_per_lane_all || !state.wave_per_lane_blocks.empty();
+}
+
+static bool WaveUniformBranch(EmitterState& state, const IR::Inst& inst) {
+	if (!state.wave_uniform_ready) {
+		PlanWaveUniformBranches(state);
+	}
+	// A condition outside a planned branch block (not expected) stays wave-uniform.
+	return !state.wave_per_lane_all && !state.wave_per_lane_blocks.contains(inst.Parent());
 }
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -1237,7 +1538,7 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto* workgroup = ShaderWorkgroupInput(ctx.state.program.stage, ctx.state.input_info);
 		if (workgroup != nullptr && ctx.state.program.wave_size == workgroup->host_subgroup_size &&
 		    (ctx.state.program.wave_size == 64u ||
-		     (ctx.state.program.wave_size == 32u && WaveUniformBranches()))) {
+		     (ctx.state.program.wave_size == 32u && WaveUniformBranch(ctx.state, inst)))) {
 			return EmitNativeWaveCondition(ctx, inst);
 		}
 		return ctx.Arg(inst, 0);

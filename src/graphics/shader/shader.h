@@ -163,6 +163,8 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// v446i: ShaderComputeInputInfo::translation_variant for the vertex-side stages.
+	uint32_t                translation_variant = 0;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -178,6 +180,10 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
+	// v446h: translation choices of an A/B run (KYTY_SYNC_TOGGLE_MODE=variant): 1 static buffer
+	// formats, 2 wave-uniform branches everywhere. Part of the program key when nonzero; such
+	// programs bypass the shader disk cache and the ledger.
+	uint32_t           translation_variant        = 0;
 	ShaderStageRuntime stage;
 };
 
@@ -214,6 +220,8 @@ struct ShaderPixelInputInfo {
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
+	// v446i: ShaderComputeInputInfo::translation_variant for the pixel stage.
+	uint32_t                                       translation_variant          = 0;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }

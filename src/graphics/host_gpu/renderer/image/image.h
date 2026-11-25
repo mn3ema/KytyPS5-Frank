@@ -167,6 +167,21 @@ public:
 	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
 	// table (TextureCache::on_bindless_unregister) to repoint the slot.
 	bool             bindless_pinned = false;
+	// v438zn ([tex-levels]): the finest level any view of this image has asked for since it was
+	// made, and the base level of the view asked for last (0xff: no view yet). Read by the census
+	// only: the host image holds every level of the chain, whatever the views ask for.
+	uint8_t          lowest_view_level = 0xff;
+	uint8_t          latest_view_level = 0xff;
+	// v438zp ([tex-reach]): the same with the view's minimum LOD counted in: the finest level a
+	// filtered sample through the view can touch is its base level plus the whole part of the clamp.
+	uint8_t          lowest_reach_level = 0xff;
+	uint8_t          latest_reach_level = 0xff;
+	// v438zr (KYTY_TEX_SPARSE): set when the host image is sparse; which levels have memory.
+	SparseImageState sparse;
+	// Gives memory to the levels from `first` on that have none. True when levels were added;
+	// with `upload_again` the image is then uploaded again from guest memory (the new levels are
+	// empty). Nothing to do for an image that is not sparse.
+	bool EnsureSparseLevels(uint32_t first, bool upload_again = true);
 	ImageId          self_id {}; // set by TextureCache::InsertImage
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;

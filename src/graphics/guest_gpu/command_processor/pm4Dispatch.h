@@ -28,6 +28,11 @@ extern const std::array<hw_sh_parser_func_t, Pm4::SH_NUM>  g_hw_sh_func;
 extern hw_sh_indirect_func_t                               g_hw_sh_indirect_func[Pm4::SH_NUM];
 extern const std::array<hw_uc_parser_func_t, Pm4::UC_NUM>  g_hw_uc_func;
 extern hw_uc_indirect_func_t                               g_hw_uc_indirect_func[Pm4::UC_NUM];
+// v440v: the draw-prep scanner applies indirect register lists it may read before they are
+// written; with g_cp_lenient set an unknown register in such a list sets g_cp_lenient_failed
+// instead of ending the emulator.
+extern thread_local bool g_cp_lenient;
+extern thread_local bool g_cp_lenient_failed;
 extern const std::array<cp_op_parser_func_t, 256>          g_cp_op_func;
 extern const std::array<cp_op_parser_func_t, Pm4::R_NUM>   g_cp_op_custom_func;
 
@@ -159,6 +164,7 @@ uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, u
 uint32_t CpOpWaitRegMem64(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpFlip(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpReleaseMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpPssr(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 
 } // namespace Libs::Graphics
 

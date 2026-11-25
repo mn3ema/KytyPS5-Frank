@@ -46,7 +46,11 @@ void MasterSemaphore::Refresh() {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
-	if (known < counter && counter > g_gpu_progress_tick.load(std::memory_order_relaxed)) {
+	// v438zx: after a device loss the counter reads UINT64_MAX (AMD 11-17: the report then named
+	// the last work sent, not the work the GPU stopped in). Only a tick that was handed out
+	// counts as progress, so the report keeps the last tick the GPU really finished.
+	if (known < counter && counter < CurrentTick() &&
+	    counter > g_gpu_progress_tick.load(std::memory_order_relaxed)) {
 		g_gpu_progress_tick.store(counter, std::memory_order_relaxed);
 		g_gpu_progress_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
 		                        std::memory_order_relaxed);

@@ -40,6 +40,8 @@ struct ResourceSpecialization {
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          bindless                   = false;
+		bool                          bindless_address           = false; // v439
+		bool                          bindless_value             = false; // v439b
 		bool                          operator==(const Image&) const = default;
 	};
 

@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/ir/RtCallable.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -24,10 +25,18 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// v440: set for the two halves of a ray-tracing shader split at its call (IR/RtCallable.h).
+	const IR::RtCallInfo*       rt_call = nullptr;
+	// v440 M3: a whole callable split (ray generation + callables, merged; IR/RtCallable.h). The
+	// code TranslateProgram is given is then the split's main code.
+	const IR::RtSplitInput*     rt_split = nullptr;
 };
 
 struct TranslateResult {
 	bool        unsupported = false;
+	// The refusal depends on this variant's input (a size bound): the shader's other variants may
+	// translate, so it is no reason for a shader-wide refusal.
+	bool        input_dependent_refusal = false;
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
@@ -35,6 +44,12 @@ struct TranslateResult {
 
 struct CompileResult {
 	std::vector<uint32_t>  spirv;
+	// A merged callable split: spirv is the ray-generation module, these the callables (callable
+	// index i: the split's target i).
+	std::vector<std::vector<uint32_t>> rt_callable_spirv;
+	// v443 (shared callables, IR/RtCallable.h): each callable's shader record words (empty: none),
+	// which the host writes after its group handle in the shader binding table.
+	std::vector<std::vector<uint32_t>> rt_callable_records;
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;

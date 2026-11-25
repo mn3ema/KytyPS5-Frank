@@ -10,22 +10,27 @@ void RemoveIdentities(const BlockList& blocks) {
 	// Each identity's uses move to its argument in program order, as before; its own entry in the
 	// argument's use list is dropped for all identities at once at the end. Removing it one by
 	// one searched and shifted lists that grow with every identity folded into the same value.
-	std::unordered_set<const Inst*> removed;
-	std::vector<Inst*>              touched;
+	// Removed identities are marked and erased after that (a set of them cost most of the pass
+	// on programs with millions of identities).
+	std::vector<Inst*> touched;
+	bool               any = false;
 	for (auto* block: blocks) {
-		auto& instructions = block->Instructions();
-		for (auto inst = instructions.begin(); inst != instructions.end();) {
-			if (inst->GetOpcode() != ValueOpcode::Identity) {
-				inst++;
+		for (auto& inst: block->Instructions()) {
+			if (inst.GetOpcode() != ValueOpcode::Identity) {
 				continue;
 			}
-			const auto replacement = inst->Arg(0);
-			inst->ReplaceUsesForRemoval(replacement, removed, touched);
-			removed.insert(&*inst);
-			inst = instructions.erase(inst);
+			const auto replacement = inst.Arg(0);
+			inst.ReplaceUsesForRemoval(replacement, touched);
+			any = true;
 		}
 	}
-	Inst::DropRemovedUses(touched, removed);
+	if (!any) {
+		return;
+	}
+	Inst::DropRemovedUses(touched);
+	for (auto* block: blocks) {
+		std::erase_if(block->Instructions(), [](const Inst& inst) { return inst.Removed(); });
+	}
 }
 
 void EliminateDeadCode(const BlockList& blocks) {

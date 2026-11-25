@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <source_location>
 
 namespace Libs::Graphics {
 
@@ -35,7 +36,46 @@ public:
 		return m_direct == nullptr && m_scheduler == nullptr;
 	}
 
+	// v445h: the renderer's own copies, fills and dispatches, counted by call site and, in a
+	// KYTY_GPU_TIMING window, timed (GpuTiming::Work). With the census off this is the gap note
+	// and the command, as before.
+	template <typename Record>
+	void InternalWork(GpuTiming::Work work, uint32_t gap_bit, uint64_t amount,
+	                  const std::source_location& site, Record&& record) const {
+		BarrierReason::NoteSite(site, BarrierReason::SiteWork); // KYTY_BARRIER_REASON_STATS
+		if (!GpuTiming::Detail::g_census.load(std::memory_order_relaxed)) {
+			GpuTiming::Note(gap_bit);
+			record();
+			return;
+		}
+		vk::QueryPool pool;
+		const auto    first = GpuTiming::Detail::WorkBegin(
+		    work, gap_bit, amount, site, m_scheduler != nullptr && Threaded() ? m_scheduler->CurrentTick() : 0, pool);
+		if (first >= 0) {
+			writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, static_cast<uint32_t>(first));
+		}
+		record();
+		if (first >= 0) {
+			writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, static_cast<uint32_t>(first) + 1u);
+		}
+	}
+	template <typename Region>
+	[[nodiscard]] static uint64_t Texels(uint32_t count, const Region* regions) noexcept {
+		uint64_t texels = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			const auto& e = RegionExtent(regions[i]);
+			texels += uint64_t {e.width} * e.height * e.depth;
+		}
+		return texels;
+	}
+	[[nodiscard]] static const vk::Extent3D& RegionExtent(const vk::BufferImageCopy& r) noexcept { return r.imageExtent; }
+	[[nodiscard]] static const vk::Extent3D& RegionExtent(const vk::ImageCopy& r) noexcept { return r.extent; }
+	[[nodiscard]] static const vk::Extent3D& RegionExtent(const vk::ImageResolve& r) noexcept { return r.extent; }
+
 	void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
+		if (m_scheduler != nullptr && bind_point != vk::PipelineBindPoint::eGraphics) {
+			m_scheduler->NoteComputeState(); // v445b: KYTY_DISPATCH_DELTA (commandScheduler.h)
+		}
 		Run([=](vk::CommandBuffer command) { command.bindPipeline(bind_point, pipeline); });
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
@@ -91,13 +131,35 @@ public:
 			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
 		});
 	}
-	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
-		GpuTiming::Note(GpuTiming::GapDispatch);
-		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
+	void dispatch(uint32_t x, uint32_t y, uint32_t z, std::source_location site = std::source_location::current()) const {
+		InternalWork(GpuTiming::WorkDispatch, GpuTiming::GapDispatch, uint64_t {x} * y * z, site, [&] {
+			Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
+		});
 	}
-	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
-		GpuTiming::Note(GpuTiming::GapDispatch);
-		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
+	// v440 M3: a callable split's launch (KYTY_RT_CALLABLES); the regions are copied.
+	void traceRaysKHR(vk::StridedDeviceAddressRegionKHR raygen, vk::StridedDeviceAddressRegionKHR callable,
+	                  uint32_t width, uint32_t height, uint32_t depth) const {
+		Run([=](vk::CommandBuffer command) {
+			const vk::StridedDeviceAddressRegionKHR none {};
+			command.traceRaysKHR(&raygen, &none, &none, &callable, width, height, depth);
+		});
+	}
+	// v443q (KYTY_RT_STACK_BYTES): the stack of a pipeline made with that dynamic state.
+	void setRayTracingPipelineStackSizeKHR(uint32_t bytes) const {
+		Run([=](vk::CommandBuffer command) { command.setRayTracingPipelineStackSizeKHR(bytes); });
+	}
+	// v440p: the launch size {width, height, depth} is read from `command` on the GPU.
+	void traceRaysIndirectKHR(vk::StridedDeviceAddressRegionKHR raygen, vk::StridedDeviceAddressRegionKHR callable,
+	                          vk::DeviceAddress command_address) const {
+		Run([=](vk::CommandBuffer command) {
+			const vk::StridedDeviceAddressRegionKHR none {};
+			command.traceRaysIndirectKHR(&raygen, &none, &none, &callable, command_address);
+		});
+	}
+	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset, std::source_location site = std::source_location::current()) const {
+		InternalWork(GpuTiming::WorkDispatch, GpuTiming::GapDispatch, 0, site, [&] {
+			Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
+		});
 	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
 		Run([=](vk::CommandBuffer command) { command.bindIndexBuffer(buffer, offset, type); });
@@ -192,6 +254,7 @@ public:
 	                     const vk::ImageMemoryBarrier* images,
 	                     std::source_location site = std::source_location::current()) const {
 		GpuTiming::Note(GpuTiming::GapBarrier);
+		BarrierReason::NoteSite(site, BarrierReason::SiteBarrier); // KYTY_BARRIER_REASON_STATS
 		if (!Threaded()) {
 			SetBarrierSite(&site);
 			m_direct.pipelineBarrier(source, destination, flags, memory_count, memory, buffer_count,
@@ -215,6 +278,7 @@ public:
 	void pipelineBarrier2(const vk::DependencyInfo& dependency,
 	                      std::source_location site = std::source_location::current()) const {
 		GpuTiming::Note(GpuTiming::GapBarrier);
+		BarrierReason::NoteSite(site, BarrierReason::SiteBarrier); // KYTY_BARRIER_REASON_STATS
 		if (!Threaded()) {
 			SetBarrierSite(&site);
 			m_direct.pipelineBarrier2(dependency);
@@ -243,6 +307,7 @@ public:
 	void guestPipelineBarrier2(const vk::DependencyInfo& dependency,
 	                           std::source_location site = std::source_location::current()) const {
 		GpuTiming::Note(GpuTiming::GapGuestBarrier);
+		BarrierReason::NoteSite(site, BarrierReason::SiteGuestBarrier); // KYTY_BARRIER_REASON_STATS
 		EXIT_IF(dependency.pNext != nullptr || dependency.memoryBarrierCount != 1 ||
 		        dependency.bufferMemoryBarrierCount != 0 || dependency.imageMemoryBarrierCount != 0);
 		const vk::MemoryBarrier2 barrier = dependency.pMemoryBarriers[0];
@@ -258,30 +323,36 @@ public:
 		});
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
-	                const vk::BufferCopy* regions) const {
-		GpuTiming::Note(GpuTiming::GapCopyBuffer);
-		if (!Threaded()) {
-			m_direct.copyBuffer(source, destination, count, regions);
-			return;
+	                const vk::BufferCopy* regions, std::source_location site = std::source_location::current()) const {
+		uint64_t bytes = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			bytes += regions[i].size;
 		}
-		const auto* r = m_scheduler->Stash(regions, count);
-		m_scheduler->Record(
-		    [=](vk::CommandBuffer command) { command.copyBuffer(source, destination, count, r); });
+		InternalWork(GpuTiming::WorkCopyBuffer, GpuTiming::GapCopyBuffer, bytes, site, [&] {
+			if (!Threaded()) {
+				m_direct.copyBuffer(source, destination, count, regions);
+				return;
+			}
+			const auto* r = m_scheduler->Stash(regions, count);
+			m_scheduler->Record(
+			    [=](vk::CommandBuffer command) { command.copyBuffer(source, destination, count, r); });
+		});
 	}
-	void copyBuffer(vk::Buffer source, vk::Buffer destination, const vk::BufferCopy& region) const {
-		GpuTiming::Note(GpuTiming::GapCopyBuffer);
-		copyBuffer(source, destination, 1, &region);
+	void copyBuffer(vk::Buffer source, vk::Buffer destination, const vk::BufferCopy& region,
+	                std::source_location site = std::source_location::current()) const {
+		copyBuffer(source, destination, 1, &region, site);
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
-	                  const void* data) const {
-		GpuTiming::Note(GpuTiming::GapFill);
-		if (!Threaded()) {
-			m_direct.updateBuffer(buffer, offset, size, data);
-			return;
-		}
-		const auto* copy = m_scheduler->Stash(static_cast<const std::byte*>(data), size);
-		m_scheduler->Record([=](vk::CommandBuffer command) {
-			command.updateBuffer(buffer, offset, size, copy);
+	                  const void* data, std::source_location site = std::source_location::current()) const {
+		InternalWork(GpuTiming::WorkFill, GpuTiming::GapFill, size, site, [&] {
+			if (!Threaded()) {
+				m_direct.updateBuffer(buffer, offset, size, data);
+				return;
+			}
+			const auto* copy = m_scheduler->Stash(static_cast<const std::byte*>(data), size);
+			m_scheduler->Record([=](vk::CommandBuffer command) {
+				command.updateBuffer(buffer, offset, size, copy);
+			});
 		});
 	}
 	void resetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) const {
@@ -297,69 +368,74 @@ public:
 		Run([=](vk::CommandBuffer command) { command.writeTimestamp(stage, pool, query); });
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
-	                uint32_t value) const {
-		GpuTiming::Note(GpuTiming::GapFill);
-		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });
-	}
-	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
-	                       uint32_t count, const vk::BufferImageCopy* regions) const {
-		GpuTiming::Note(GpuTiming::GapCopyImage);
-		if (!Threaded()) {
-			m_direct.copyBufferToImage(source, destination, layout, count, regions);
-			return;
-		}
-		const auto* r = m_scheduler->Stash(regions, count);
-		m_scheduler->Record([=](vk::CommandBuffer command) {
-			command.copyBufferToImage(source, destination, layout, count, r);
+	                uint32_t value, std::source_location site = std::source_location::current()) const {
+		// (a fill to the buffer's end, VK_WHOLE_SIZE, counts no bytes)
+		InternalWork(GpuTiming::WorkFill, GpuTiming::GapFill, size == VK_WHOLE_SIZE ? 0 : size, site, [&] {
+			Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });
 		});
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
-	                       const vk::BufferImageCopy& region) const {
-		GpuTiming::Note(GpuTiming::GapCopyImage);
-		copyBufferToImage(source, destination, layout, 1, &region);
+	                       uint32_t count, const vk::BufferImageCopy* regions, std::source_location site = std::source_location::current()) const {
+		InternalWork(GpuTiming::WorkBufferToImage, GpuTiming::GapCopyImage, Texels(count, regions), site, [&] {
+			if (!Threaded()) {
+				m_direct.copyBufferToImage(source, destination, layout, count, regions);
+				return;
+			}
+			const auto* r = m_scheduler->Stash(regions, count);
+			m_scheduler->Record([=](vk::CommandBuffer command) {
+				command.copyBufferToImage(source, destination, layout, count, r);
+			});
+		});
+	}
+	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
+	                       const vk::BufferImageCopy& region, std::source_location site = std::source_location::current()) const {
+		copyBufferToImage(source, destination, layout, 1, &region, site);
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
-	                       uint32_t count, const vk::BufferImageCopy* regions) const {
-		GpuTiming::Note(GpuTiming::GapCopyImage);
-		if (!Threaded()) {
-			m_direct.copyImageToBuffer(source, layout, destination, count, regions);
-			return;
-		}
-		const auto* r = m_scheduler->Stash(regions, count);
-		m_scheduler->Record([=](vk::CommandBuffer command) {
-			command.copyImageToBuffer(source, layout, destination, count, r);
+	                       uint32_t count, const vk::BufferImageCopy* regions, std::source_location site = std::source_location::current()) const {
+		InternalWork(GpuTiming::WorkImageToBuffer, GpuTiming::GapCopyImage, Texels(count, regions), site, [&] {
+			if (!Threaded()) {
+				m_direct.copyImageToBuffer(source, layout, destination, count, regions);
+				return;
+			}
+			const auto* r = m_scheduler->Stash(regions, count);
+			m_scheduler->Record([=](vk::CommandBuffer command) {
+				command.copyImageToBuffer(source, layout, destination, count, r);
+			});
 		});
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
-	                       const vk::BufferImageCopy& region) const {
-		GpuTiming::Note(GpuTiming::GapCopyImage);
-		copyImageToBuffer(source, layout, destination, 1, &region);
+	                       const vk::BufferImageCopy& region, std::source_location site = std::source_location::current()) const {
+		copyImageToBuffer(source, layout, destination, 1, &region, site);
 	}
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, uint32_t count,
-	               const vk::ImageCopy* regions) const {
-		GpuTiming::Note(GpuTiming::GapCopyImage);
-		if (!Threaded()) {
-			m_direct.copyImage(source, source_layout, destination, destination_layout, count,
-			                   regions);
-			return;
-		}
-		const auto* r = m_scheduler->Stash(regions, count);
-		m_scheduler->Record([=](vk::CommandBuffer command) {
-			command.copyImage(source, source_layout, destination, destination_layout, count, r);
+	               const vk::ImageCopy* regions, std::source_location site = std::source_location::current()) const {
+		InternalWork(GpuTiming::WorkCopyImage, GpuTiming::GapCopyImage, Texels(count, regions), site, [&] {
+			if (!Threaded()) {
+				m_direct.copyImage(source, source_layout, destination, destination_layout, count,
+				                   regions);
+				return;
+			}
+			const auto* r = m_scheduler->Stash(regions, count);
+			m_scheduler->Record([=](vk::CommandBuffer command) {
+				command.copyImage(source, source_layout, destination, destination_layout, count, r);
+			});
 		});
 	}
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
-	               vk::ImageLayout destination_layout, const vk::ImageCopy& region) const {
-		GpuTiming::Note(GpuTiming::GapCopyImage);
-		copyImage(source, source_layout, destination, destination_layout, 1, &region);
+	               vk::ImageLayout destination_layout, const vk::ImageCopy& region,
+	               std::source_location site = std::source_location::current()) const {
+		copyImage(source, source_layout, destination, destination_layout, 1, &region, site);
 	}
 	void resolveImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
-	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region) const {
-		GpuTiming::Note(GpuTiming::GapCopyImage);
-		Run([=](vk::CommandBuffer command) {
-			command.resolveImage(source, source_layout, destination, destination_layout, 1,
-			                     &region);
+	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region,
+	                  std::source_location site = std::source_location::current()) const {
+		InternalWork(GpuTiming::WorkCopyImage, GpuTiming::GapCopyImage, Texels(1, &region), site, [&] {
+			Run([=](vk::CommandBuffer command) {
+				command.resolveImage(source, source_layout, destination, destination_layout, 1,
+				                     &region);
+			});
 		});
 	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,

@@ -69,7 +69,6 @@ struct BasicBlock {
 	std::vector<Assignment> assignments;
 	std::vector<uint32_t> predecessors;
 	std::vector<uint32_t> successors;
-	std::vector<uint32_t> dominators;
 	Terminator            terminator;
 };
 
@@ -104,6 +103,14 @@ struct Graph {
 	FailureKind                             failure_kind  = FailureKind::None;
 	uint32_t                                failure_block = UINT32_MAX;
 	std::string                             unsupported_reason;
+	// The dominator tree by block id: immediate dominator (UINT32_MAX for a root: the entry, or a
+	// block without predecessors) and the tree walk's pre/post numbers, so that Dominates is two
+	// compares. dom_pre is UINT32_MAX for a block no root reaches (every block dominates it, as
+	// the set intersection this replaced left it). Per-block dominator lists took blocks squared
+	// memory: 1.9 GB on a 21,894-block program.
+	std::vector<uint32_t>                   dom_idom;
+	std::vector<uint32_t>                   dom_pre;
+	std::vector<uint32_t>                   dom_post;
 
 	const BasicBlock* FindBlock(uint32_t id) const;
 	BasicBlock*       FindBlock(uint32_t id);

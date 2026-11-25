@@ -342,13 +342,49 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto extent = Unary(s, spv::OpBitcast, TypeF32(s), ctx.Arg(*ray, node_words));
 	const auto origin = vector(node_words + 1u), direction = vector(node_words + 4u),
 	           inverse = vector(node_words + 7u);
-	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
+	const auto value = EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
 	    ConstantU32CompositeZero(s, 4), [&] {
 		const auto result = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
 		    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse);
 		return result;
 	});
+	// v440z, KYTY_RT_COUNT=1 in a callable split's ray generation (spirvEmitterRt.cpp): counters
+	// after the call-site ones: +12 active lanes intersecting, +16 of them answered "no child /
+	// invalid" (x = ~0), +20 a triangle missed (x = +inf).
+	static const bool count = [] {
+		const char* env = std::getenv("KYTY_RT_COUNT");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (count && s.program.rt_role == IR::RtRole::Raygen &&
+	    s.program.bindings.dispatch_thread_dword != IR::PushData::NoStart) {
+		const auto u32 = TypeU32(s), u64 = TypeScalarU64(s), boolean = TypeBool(s);
+		const auto dword = s.program.bindings.dispatch_thread_dword;
+		const auto table = Binary(s, spv::OpBitwiseOr, u64,
+		                          Unary(s, spv::OpUConvert, u64, EmitShaderDataDwordLoad(s, dword + 3u)),
+		                          Binary(s, spv::OpShiftLeftLogical, u64,
+		                                 Unary(s, spv::OpUConvert, u64, EmitShaderDataDwordLoad(s, dword + 4u)),
+		                                 s.builder.Constant(spv::OpConstant, u64, 32u, 0u)));
+		const auto bump = [&](uint32_t offset) {
+			const auto address = Binary(s, spv::OpIAdd, u64, table,
+			                            s.builder.Constant(spv::OpConstant, u64,
+			                                               IR::RtTargetSlots * IR::RtTargetWords * 4u + offset, 0u));
+			const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), address);
+			const auto result  = s.builder.AllocateId();
+			s.builder.AddFunction(spv::OpAtomicIAdd, u32, result, pointer, ConstantU32(s, 1u), ConstantU32(s, 0u),
+			                      ConstantU32(s, 1u));
+		};
+		const auto active = Binary(s, spv::OpLogicalAnd, boolean, ctx.Arg(inst, 2), EmitRtAddressUsable(s, table));
+		const auto x      = Extract(s, u32, value, 0u);
+		const auto none   = Binary(s, spv::OpLogicalAnd, boolean, active,
+		                           Binary(s, spv::OpIEqual, boolean, x, ConstantU32(s, ~0u)));
+		const auto missed = Binary(s, spv::OpLogicalAnd, boolean, active,
+		                           Binary(s, spv::OpIEqual, boolean, x, ConstantU32(s, 0x7f800000u)));
+		EmitIfCondition(s, active, [&]() { bump(12u); });
+		EmitIfCondition(s, none, [&]() { bump(16u); });
+		EmitIfCondition(s, missed, [&]() { bump(20u); });
+	}
+	return value;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

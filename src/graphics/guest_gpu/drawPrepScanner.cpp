@@ -166,8 +166,11 @@ bool DrawPrepScanner::ApplyRegisterIndirect(uint32_t header, const uint32_t* bod
 	const std::array<uint32_t, 4> copy {static_cast<uint32_t>(local), static_cast<uint32_t>(local >> 32u),
 	                                    body[2], body[3]};
 	const auto opcode = (header >> 8u) & 0xffu;
+	g_cp_lenient        = true;
+	g_cp_lenient_failed = false;
 	(void)g_cp_op_func[opcode](*m_state->cp, header, copy.data(), 5u, 5u);
-	return true;
+	g_cp_lenient = false;
+	return !g_cp_lenient_failed;
 }
 
 void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* packet) {

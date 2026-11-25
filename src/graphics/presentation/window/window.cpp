@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/fsr3FrameGen.h"
 #include "graphics/presentation/window.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompileProgress.h"
 
@@ -256,6 +257,12 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F11:
 				if (!key.repeat) {
 					ToggleDesktopFullscreen();
+				}
+				break;
+			case SDLK_F8:
+				// v0.5 FG (Mac 11-24): frame generation on/off at any moment, with a note on screen.
+				if (!key.repeat && Libs::Graphics::Fsr3::FrameGen::Active()) {
+					Libs::Graphics::ShowFrameGenerationHint(Libs::Graphics::Fsr3::FrameGen::Toggle(), 4);
 				}
 				break;
 			case SDLK_RETURN:
@@ -986,6 +993,9 @@ void WindowContext::UpdateTitle(bool new_frame) {
 	static uint64_t frame_num   = 0;
 	static uint64_t fps_frames  = 0;
 	static double   current_fps = 0.0;
+	// Frame generation: every present, real and generated, over the same second.
+	static uint64_t fps_presents = Libs::Graphics::Fsr3::FrameGen::Presents();
+	static double   shown_fps    = -1.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1006,8 +1016,14 @@ void WindowContext::UpdateTitle(bool new_frame) {
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
+		const auto presents = Libs::Graphics::Fsr3::FrameGen::Presents();
+		shown_fps = Libs::Graphics::Fsr3::FrameGen::Enabled()
+		                ? static_cast<double>(presents - fps_presents) * static_cast<double>(frequency) /
+		                      static_cast<double>(now - fps_start)
+		                : -1.0;
+		fps_presents = presents;
+		fps_start    = now;
+		fps_frames   = 0;
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
@@ -1039,11 +1055,14 @@ void WindowContext::UpdateTitle(bool new_frame) {
 			                          progress.pipelines_built.load(std::memory_order_relaxed) + pipes_new, pipes_new);
 		}
 	}
+	// With frame generation: the rate shown (real and generated frames), then the game's own.
+	const auto fps_text = shown_fps >= 0.0 ? fmt::format("{:.0f} (game {:.0f})", shown_fps, current_fps)
+	                                       : fmt::format("{:.0f}", current_fps);
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}]{}, frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}]{}, frame: {}, fps: {}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, precompile, frame_num, current_fps);
+	    device_name, processor_name, precompile, frame_num, fps_text);
 
 	// The title is set on the main thread. This ran on the present thread at every present and
 	// waited for the main thread (SDL_RunOnMainThread with wait_complete): when the main thread's

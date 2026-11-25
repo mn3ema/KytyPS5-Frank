@@ -124,6 +124,9 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
 // GPU holds it and a host read would wait for the GPU.
 [[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);
+// GPU thread: IsGpuBufferWritten, or some byte is downloading (its download not yet published), so
+// a host read would wait for the GPU either way (v446p, SRT diagnostics).
+[[nodiscard]] bool     IsGpuBufferPending(uint64_t vaddr, uint64_t size);
 // GPU thread: starts the download of the GPU-written bytes of [vaddr, vaddr + size) without
 // waiting for it (KYTY_SRT_DEFER). Returns the scheduler tick whose completion (and priority
 // operations) publish them, or 0 when nothing is pending and an ordinary read may proceed.
@@ -146,6 +149,8 @@ void SetGpuReadDelegate(bool delegate);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
+// v445s (KYTY_FAST_FINISH_CLEANREAD): RenderContext::TryLiftCleanReadPage, 0 without a renderer.
+int  TryLiftCleanFaultingPage(uint64_t fault_vaddr) noexcept;
 // Crash diagnostics: prints the guest mapping, the host state and the recent guest mapping changes
 // at an address whose fault nothing handled.
 void DescribeUnhandledFault(uint64_t vaddr);

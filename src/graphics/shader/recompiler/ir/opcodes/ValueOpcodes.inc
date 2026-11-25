@@ -12,6 +12,13 @@ VALUE_OPCODE(GetUserData, U32, ScalarReg)
 VALUE_OPCODE(GetDispatchThreadExtent, U32, U32)
 VALUE_OPCODE(GetShaderBase, U64)
 VALUE_OPCODE(ReadClockRealtime64, U64)
+// v440 callable split: a slot of the callable payload (register state across a guest call), and the
+// call itself (callable index, guest exec).
+VALUE_OPCODE(PayloadLoad, U32, U32)
+VALUE_OPCODE(PayloadStore, Void, U32, U32)
+VALUE_OPCODE(ExecuteCallable, Void, U32, U1)
+// The callable index of a call target (address low, high) from the pipeline's target table.
+VALUE_OPCODE(RtCallableIndex, U32, U32, U32)
 VALUE_OPCODE(MeshDrawParameter, U32, U32)
 VALUE_OPCODE(MeshAllocate, Void, U32)
 VALUE_OPCODE(TessellationBase, U32, U32)

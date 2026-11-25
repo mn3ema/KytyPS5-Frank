@@ -1,4 +1,5 @@
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include "common/logging/log.h"
 #include "libs/errno.h"
@@ -41,6 +42,9 @@ LIB_DEFINE(InitUlt_1);
 namespace LibPsml {
 LIB_DEFINE(InitPsml_1);
 } // namespace LibPsml
+namespace LibPsmlBase {
+LIB_DEFINE(InitPsmlBase_1);
+} // namespace LibPsmlBase
 
 namespace LibCes {
 LIB_DEFINE(InitCes_1);
@@ -134,7 +138,12 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitNet_1(s);
 	InitPad_1(s);
 	InitPlayGo_1(s);
-	LibPsml::InitPsml_1(s);
+	// Pro mode: PSSR and MFSR2 (libPsml.cpp); base mode keeps the stubs it always had.
+	if (Loader::SystemContentIsTrinityMode()) {
+		LibPsml::InitPsml_1(s);
+	} else {
+		LibPsmlBase::InitPsmlBase_1(s);
+	}
 	InitPngDec_1(s);
 	InitPngEnc_1(s);
 	InitPlatform_1(s);

@@ -37,6 +37,9 @@ struct DispatchRunState {
 	const uint32_t* packet    = nullptr; // the dispatch being recorded
 	bool            continues = false;   // an earlier dispatch of the same run was recorded last
 	bool            more      = false;   // another dispatch of the run follows
+	// KYTY_BARRIER_REASON_STATS (statistics only): why this dispatch does not continue the run of
+	// the dispatch before it (BarrierReason::Why; 0: it does).
+	uint32_t        why       = 0;
 	// The run's upcoming thread-dimension indirect dispatches (from this one), collected by the
 	// command processor when this one has no converted counts yet.
 	std::vector<DispatchRunIndirect>                                  upcoming;

@@ -1,3 +1,4 @@
+#include "common/proConfig.h"
 #include "common/archive.h"
 #include "common/common.h"
 #include "common/cpuAffinity.h"
@@ -115,6 +116,13 @@ static void PrintUsage() {
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for\n"
+	         "                                       supported titles. Default: off.\n");
+	::printf("  --pssr-upscaler <value>              With --trinity, upscale PSSR with Linear,\n"
+	         "                                       DLSS, or FSR. Default: Linear.\n");
+	::printf("  --dlss-folder <folder>               DLSS model folder.\n");
+	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
+	::printf("  --fsr-folder <folder>                FidelityFX DLL folder (Windows).\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --output-resolution <1080|2160|auto> TV resolution the game is told. Default: auto\n"
@@ -182,7 +190,7 @@ static bool ParseBool(const std::string& value, bool& out) {
 
 template <typename E>
 static bool ParseEnum(const std::string& value, E& out) {
-	auto enum_value = magic_enum::enum_cast<E>(value.c_str());
+	auto enum_value = magic_enum::enum_cast<E>(value, magic_enum::case_insensitive);
 	if (!enum_value.has_value()) {
 		return false;
 	}
@@ -286,6 +294,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--vr") {
 			options.config.vr_enabled = true;
+			continue;
+		}
+
+		// PS5 Pro mode for titles that support it (PSSR, which --pssr-upscaler maps to a host upscaler).
+		if (arg == "--trinity") {
+			Config::MutableProOptions().pro_enabled = true;
 			continue;
 		}
 
@@ -430,6 +444,21 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--pssr-upscaler") {
+			if (!ParseEnum(value, Config::MutableProOptions().pssr_upscaler)) {
+				::printf("invalid PSSR upscaler: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--dlss-folder") {
+			Config::MutableProOptions().dlss_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--dlss-preset") {
+			if (value.size() != 1 || value[0] < 'A' || value[0] > 'O') {
+				::printf("invalid DLSS preset: %s\n", value.c_str());
+				return false;
+			}
+			Config::MutableProOptions().dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
+		} else if (arg == "--fsr-folder") {
+			Config::MutableProOptions().fsr_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
@@ -606,6 +635,24 @@ static void ApplyFrankEnvironmentDefaults() {
 	    // v438g (Mac 11-15): the frame keeps its aspect ratio (16:9 on a 16:10 panel gets black
 	    // bars instead of a stretch). KYTY_KEEP_ASPECT=0: fill the window.
 	    {"KYTY_KEEP_ASPECT", "1"},
+	    // v438zy (Mac 11-17, "make it default"): sparse textures (only the levels a view can
+	    // reach get memory) on NVIDIA GPUs when KYTY_TEX_SPARSE is not set. mac6 play (v438zu):
+	    // hitches 31.6 -> 4.5 per minute, 1% low 6.3 -> 12.4 fps, device memory flat at 12-13 GB.
+	    // KYTY_TEX_SPARSE=0 turns it off; KYTY_TEX_SPARSE_NVIDIA=0 keeps NVIDIA off by default.
+	    {"KYTY_TEX_SPARSE_NVIDIA", "2"},
+	    // v0.5 (Mac's play settings since 11-21, built in):
+	    // The glass reflection resolve 2feed4c0d841a3c4 only draws artifacts until the ray-tracing
+	    // shaders translate; the four big ray-tracing compute shaders that never translate
+	    // (unsupported SOP1 opcode 0x21, over the IR bounds) are skipped outright instead of retried
+	    // (a retry froze the game for minutes). KYTY_SKIP_SHADER_HASHES= (empty) skips none.
+	    {"KYTY_SKIP_SHADER_HASHES",
+	     "2feed4c0d841a3c4,fc0537b7278db60c,384f47083f0d5e08,29be8047c4e86afe,e6d76d24f59f8015"},
+	    // Tessellated pipelines are built whole, not linked from pipeline libraries (linked, the
+	    // water and terrain tessellation drew nothing). KYTY_GPL_SKIP=0 links them.
+	    {"KYTY_GPL_SKIP", "2"},
+	    // No dispatch-run exclusions: 06544f382c6b0850 and 3378b4a64461d6ca overlap like the rest
+	    // (in-run A/B -1.2 and -3.0 ms a frame, no GPU hang in 10 boots).
+	    {"KYTY_DISPATCH_RUN_EXCLUDE", "0"},
 	};
 	for (const auto& [name, value]: Defaults) {
 		if (std::getenv(name) == nullptr) {
@@ -629,6 +676,8 @@ static void ApplyFrankOptionDefaults(RunOptions& options) {
 	options.config.red_zone_protection_enabled = true;
 #endif
 	(void)ParseEnum(std::string("Performance"), options.config.shader_optimization_type);
+	// v0.5: the guest's vblank at 120 Hz, as in Mac's play (--vblank-frequency overrides).
+	options.config.vblank_frequency = 120;
 }
 
 static int Main(int argc, char* argv[]) {

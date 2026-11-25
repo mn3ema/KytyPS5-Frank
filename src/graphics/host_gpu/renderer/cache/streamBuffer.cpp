@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/staleHooks.h"
 #include "common/fpsLog.h"
+#include "common/floorStats.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -82,6 +83,10 @@ struct BdaEntry {
 	MemoryUsage usage  = MemoryUsage::DeviceLocal;
 	bool        shared = false;
 	bool        no_bda = false; // a buffer without a device address, placed by a probe (KYTY_FAULT_MAP)
+	bool        rt_table = false; // v443: a callable split's binding table; `cpu` is its shader hash
+	const uint32_t* rt_counters = nullptr; // (its counters, IR/RtCallable.h, host-mapped while it is live)
+	std::vector<uint64_t> rt_targets;      // (each callable's guest code address: a word per callable follows the counters)
+	std::vector<uint32_t> rt_code_hashes;  // (each callable's code hash, IR::RtCodeHash)
 };
 struct BdaRegistry {
 	std::unordered_map<const void*, uint64_t> probed; // buffers without a device address -> va
@@ -102,6 +107,7 @@ struct BdaRegistry {
 	std::unordered_map<const void*, Image> live_images;
 	std::unordered_map<const void*, std::pair<uint64_t, uint64_t>> image_va; // VkImage -> memory range
 	std::vector<Image>                     released_images; // ring
+	uint64_t                               sparse_images_live = 0; // v443k: known by handle only
 	size_t                                 released_images_next = 0;
 	uint64_t                               images_mapped = 0, images_unmapped = 0;
 };
@@ -165,7 +171,8 @@ void BdaPrint(const char* what, const BdaEntry& e, uint64_t address, uint64_t no
 	             " (now tick %" PRIu64 ")\n",
 	             what, e.device, e.size, address - e.device,
 	             address >= e.device + e.size ? ", past its end" : "", e.cpu,
-	             BdaUsageName(e.usage), e.shared ? " shared" : (e.no_bda ? " no-BDA" : ""), ms(e.created), e.created_tick,
+	             e.rt_table ? "ray-tracing binding table of the shader in `guest`" : BdaUsageName(e.usage),
+	             e.shared ? " shared" : (e.no_bda ? " no-BDA" : ""), ms(e.created), e.created_tick,
 	             released, now_tick);
 }
 
@@ -321,7 +328,10 @@ void FaultMapNoteImage(GraphicContext& graphics, VmaAllocation allocation,
 	if (!created) {
 		std::lock_guard lock(r.mutex);
 		const auto found = r.live_images.find(allocation);
-		if (found == r.live_images.end()) return;
+		if (found == r.live_images.end()) {
+			r.image_va.erase(image); // one whose memory could not be mapped (below)
+			return;
+		}
 		auto e     = found->second;
 		e.released = std::chrono::steady_clock::now();
 		r.live_images.erase(found);
@@ -361,6 +371,8 @@ void FaultMapNoteImage(GraphicContext& graphics, VmaAllocation allocation,
 	std::lock_guard lock(r.mutex);
 	if (base == 0) {
 		r.images_unmapped++;
+		// v443k: alive all the same (FaultMapImageVa), with no address to give.
+		r.image_va[image] = {0, 0};
 		return;
 	}
 	BdaRegistry::Image e;
@@ -380,7 +392,27 @@ void FaultMapNoteImage(GraphicContext& graphics, VmaAllocation allocation,
 	r.images_mapped++;
 }
 
-// diagnosticCheckpoints.cpp: the memory range of a live image (false: unknown or freed).
+// v443k: a sparse image (KYTY_TEX_SPARSE) has no allocation of its own and was not in this map at
+// all, so the bindless audit called every slot holding one "written with an image that is no longer
+// live" (611 and 837 slots in g443h and g443j), and a handle the driver gave to a new sparse image
+// was described by the destroyed image that had it before. It is alive by its handle, without an
+// address: its memory is blocks bound into an address range of the driver's.
+void FaultMapNoteSparseImage(VkImage image, bool created) {
+	if (!FaultMapEnabled() || image == VK_NULL_HANDLE) {
+		return;
+	}
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	if (created) {
+		r.image_va[image] = {0, 0};
+		r.sparse_images_live++;
+	} else if (r.image_va.erase(image) != 0 && r.sparse_images_live != 0) {
+		r.sparse_images_live--;
+	}
+}
+
+// diagnosticCheckpoints.cpp: the memory range of a live image (false: unknown or freed). A live
+// image without an address in this map (sparse, or its memory could not be mapped) gives 0 + 0.
 bool FaultMapImageVa(const void* image, uint64_t& va, uint64_t& size) {
 	auto&           r = Bda();
 	std::lock_guard lock(r.mutex);
@@ -418,6 +450,28 @@ std::string FaultMapImageRange(const void* image) {
 	return " (no memory record)";
 }
 
+// v443: a buffer with a device address made outside the Buffer class (a callable split's shader
+// binding table, shaders.cpp) joins the registry, so a fault inside it, alive or destroyed, is
+// named like any other. Declared where they are used (shaders.cpp, pipelineCache.cpp).
+void FaultNoteRtTable(uint64_t device, uint64_t size, uint64_t shader_hash, const uint32_t* counters,
+                      const std::vector<uint64_t>& targets, const std::vector<uint32_t>& code_hashes);
+void FaultNoteRtTable(uint64_t device, uint64_t size, uint64_t shader_hash, const uint32_t* counters,
+                      const std::vector<uint64_t>& targets, const std::vector<uint32_t>& code_hashes) {
+	BdaNoteCreated(device, size, shader_hash, MemoryUsage::Upload, false, 0);
+	auto&           r = Bda();
+	std::lock_guard lock(r.mutex);
+	if (const auto found = r.live.find(device); found != r.live.end()) {
+		found->second.rt_table    = true;
+		found->second.rt_counters = counters;
+		found->second.rt_targets  = targets;
+		found->second.rt_code_hashes = code_hashes;
+	}
+}
+void FaultForgetRtTable(uint64_t device, uint64_t tick);
+void FaultForgetRtTable(uint64_t device, uint64_t tick) {
+	BdaNoteReleased(device, tick);
+}
+
 // bufferCache.cpp (KYTY_FAULT_MAP=1): BDA page-table entries pointing into [lo, hi).
 void BdaShadowDescribe(uint64_t lo, uint64_t hi);
 
@@ -432,6 +486,76 @@ void DescribeDeviceAddress(uint64_t address, uint64_t precision, uint64_t now_ti
 	             "[device-fault] address 0x%016" PRIx64 ": %zu live buffers with device addresses "
 	             "(%" PRIu64 " created, %" PRIu64 " destroyed)\n",
 	             address, r.live.size(), r.created_count, r.released_count);
+	// v443: the callable splits' binding tables, and with KYTY_RT_COUNT=1 what their call sites
+	// counted up to the fault ("outside the target set": lanes whose call target the pipeline did
+	// not have).
+	for (const auto& [device, e]: r.live) {
+		if (!e.rt_table) {
+			continue;
+		}
+		char counters[256] = "";
+		if (e.rt_counters != nullptr) {
+			std::snprintf(counters, sizeof(counters),
+			              ": lanes at the call %u, outside the target set %u, calling %u; intersections %u, no "
+			              "child/invalid %u, triangle missed %u; loop cap hits %u",
+			              e.rt_counters[0], e.rt_counters[1], e.rt_counters[2], e.rt_counters[3], e.rt_counters[4],
+			              e.rt_counters[5], e.rt_counters[7]);
+		}
+		std::fprintf(stderr, "[device-fault]   ray-tracing binding table dev 0x%016" PRIx64 "+0x%" PRIx64
+		                     " of shader %016" PRIx64 "%s\n",
+		             device, e.size, e.cpu, counters);
+		if (e.rt_counters != nullptr) {
+			// v443c: lanes that called and are not back, by callable (a trace that does not end: these
+			// are where it is, or with none here it is in the ray-generation code).
+			constexpr uint32_t Words = 32; // IR::RtCounterWords
+			uint64_t inside = 0;
+			uint32_t listed = 0;
+			for (size_t i = 0; i < e.rt_targets.size(); i++) {
+				const uint32_t lanes = e.rt_counters[Words + i];
+				inside += lanes;
+				if (lanes != 0 && listed++ < 24) {
+					std::fprintf(stderr, "[device-fault]     %u lanes inside callable %zu (guest code 0x%" PRIx64 ")\n", lanes, i,
+					             e.rt_targets[i]);
+				}
+			}
+			std::fprintf(stderr, "[device-fault]     lanes back from their call %u; inside callables now %" PRIu64 " (%u callables)%s\n",
+			             e.rt_counters[6], inside, listed,
+			             e.rt_counters[0] == 0 && e.rt_counters[2] == 0 ? " (the call-site counters need KYTY_RT_COUNT=1)" : "");
+			if (e.rt_counters[19] != 0) {
+				// v443j (the address trap, IR/RtCallable.h): translations that landed at N * 4 GiB plus
+				// less than a page and were not read.
+				int64_t module = -1;
+				for (size_t i = 0; i < e.rt_code_hashes.size(); i++) {
+					if (e.rt_code_hashes[i] == e.rt_counters[24]) {
+						module = static_cast<int64_t>(i);
+						break;
+					}
+				}
+				std::fprintf(stderr,
+				             "[device-fault]     address trap: %u reads not made; the last (site %u: 0 address table, 1 launch "
+				             "extents, 3 write bitmap): guest 0x%08x%08x -> dev 0x%08x%08x in %s %" PRId64 " (code hash %08x)\n",
+				             e.rt_counters[19], e.rt_counters[25], e.rt_counters[23], e.rt_counters[22], e.rt_counters[21],
+				             e.rt_counters[20], module >= 0 ? "callable" : "the ray generation or a callable not in this pipeline,",
+				             module, e.rt_counters[24]);
+			}
+			if (e.rt_counters[14] != 0) {
+				// v443f (KYTY_RT_TRACE_PC=1): how far the callables got.
+				int64_t callable = -1;
+				for (size_t i = 0; i < e.rt_code_hashes.size(); i++) {
+					if (e.rt_code_hashes[i] == e.rt_counters[18]) {
+						callable = static_cast<int64_t>(i);
+						break;
+					}
+				}
+				std::fprintf(stderr,
+				             "[device-fault]     callable invocations started %u, ended %u; the last guest block completed: pc 0x%x "
+				             "of callable %" PRId64 " (code hash %08x, guest code 0x%" PRIx64 "); the highest pc completed 0x%x\n",
+				             e.rt_counters[14], e.rt_counters[15], e.rt_counters[17], callable, e.rt_counters[18],
+				             callable >= 0 && static_cast<size_t>(callable) < e.rt_targets.size() ? e.rt_targets[callable] : 0,
+				             e.rt_counters[16]);
+			}
+		}
+	}
 	bool any = false;
 	auto it  = r.live.upper_bound(hi);
 	if (it != r.live.begin()) {
@@ -485,6 +609,19 @@ void DescribeDeviceAddress(uint64_t address, uint64_t precision, uint64_t now_ti
 		for (size_t i = 0; i < image_hits.size() && i < 6; i++) {
 			PrintImage("in destroyed image", *image_hits[i], address);
 			any = true;
+		}
+		// v443j: said outright, since "is it an image a bindless slot held" is the question asked of
+		// every such fault: an image that covers the address is listed above with its history (its
+		// bindless slots included); with none, no slot of set 1 can have named memory there.
+		if (image_hits.empty() &&
+		    std::ranges::none_of(r.live_images, [&](const auto& item) {
+			    return item.second.va < hi && item.second.va + item.second.size > lo;
+		    })) {
+			std::fprintf(stderr,
+			             "[device-fault]   no image with memory of its own covers it, live or among the %zu destroyed ones "
+			             "remembered; %" PRIu64 " live sparse images have no address in this map (their memory is bound into "
+			             "the driver's own address ranges)\n",
+			             r.released_images.size(), r.sparse_images_live);
 		}
 		// v122: what the host did with these images (bindless slots, set-0 binds, attachments).
 		for (const auto& [key, e]: r.live_images) {
@@ -979,6 +1116,12 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 			static const bool log = Common::FpsLogDiagnostics();
 			const auto        wait_start = std::chrono::steady_clock::now();
 			Scheduler().Wait(watch.tick);
+			if (Common::FloorStats::Enabled()) {
+				Common::FloorStats::Add(Common::FloorStats::Get().ring_wait_ns,
+				                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                                                  std::chrono::steady_clock::now() - wait_start)
+				                                                  .count()));
+			}
 			if (log) {
 				static std::mutex                                         mutex;
 				static std::map<uint64_t, std::pair<uint64_t, double>>    waits;

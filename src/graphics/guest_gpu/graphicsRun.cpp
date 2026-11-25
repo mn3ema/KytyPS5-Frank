@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/drawPrepScanner.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
+#include "graphics/host_gpu/renderer/queueShare.h"
 #include "graphics/host_gpu/renderer/syncToggle.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/imgRef.h"
@@ -24,6 +25,7 @@
 #include "common/sampler.h"
 #include "graphics/host_gpu/renderer/barrierMerge.h"
 #include "graphics/host_gpu/renderer/barrierSink.h"
+#include "graphics/host_gpu/renderer/barrierReason.h"
 #include "graphics/host_gpu/renderer/dispatchRun.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -36,6 +38,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
+#include "kernel/guestWait.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
@@ -70,6 +73,7 @@ void     WaitUploadWorker(uint64_t upto);
 // Before the command processor writes guest memory itself: upload reads queued before must not
 // see the bytes it writes (they belong to work recorded earlier).
 static void SettleUploadReads() {
+	const CpuCost::Phase cpu_phase_("SettleUploadReads");
 	DrainProtectionHelper(ProtectDrainReason::GuestWrite);
 	if (const auto pushed = UploadWorkerPushed(); pushed != 0) {
 		WaitUploadWorker(pushed);
@@ -83,6 +87,9 @@ static std::atomic<uint64_t> g_cmd_from_sync {0};
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local const uint32_t*   g_run_expected_next = nullptr; // KYTY_DISPATCH_RUNS
+// KYTY_BARRIER_REASON_STATS (statistics only): why the scan after the thread's last dispatch found
+// no next dispatch for its run (BarrierReason::Why).
+static thread_local uint32_t          g_run_last_stop     = 0;
 static std::atomic<uint64_t> g_compute_submissions {0};
 static std::atomic<uint64_t> g_compute_submission_dw {0};
 static thread_local bool              g_gpu_thread        = false;
@@ -323,6 +330,92 @@ static const tracy::SourceLocationData* Pm4ZoneLocation(uint32_t opcode, uint32_
 	return location.name != nullptr ? &location : nullptr;
 }
 
+// KYTY_CPU_COST: the phase a PM4 packet's handler runs under, by opcode and, for NOPs, by the
+// custom code in the header ("PM4 <name>", or the hex opcode). The time of a draw or dispatch
+// packet outside its draw or dispatch (argument decoding) is this phase's self time.
+static const char* Pm4PhaseName(uint32_t opcode, uint32_t r) {
+	struct Names {
+		char ops[256][16];
+		char nops[Pm4::R_NUM][20];
+	};
+	static const Names* const names = [] {
+		auto* result = new Names;
+		for (uint32_t i = 0; i < 256; i++) {
+			std::snprintf(result->ops[i], sizeof(result->ops[i]), "PM4 op 0x%02x", i);
+		}
+		for (uint32_t i = 0; i < Pm4::R_NUM; i++) {
+			std::snprintf(result->nops[i], sizeof(result->nops[i]), "PM4 NOP r 0x%02x", i);
+		}
+		return result;
+	}();
+	if (opcode == Pm4::IT_NOP) {
+		switch (r) {
+			case Pm4::R_DRAW_RESET: return "PM4 NOP DRAW_RESET";
+			case Pm4::R_WAIT_FLIP_DONE: return "PM4 NOP WAIT_FLIP_DONE";
+			case Pm4::R_DISPATCH_RESET: return "PM4 NOP DISPATCH_RESET";
+			case Pm4::R_ACQUIRE_MEM: return "PM4 NOP ACQUIRE_MEM";
+			case Pm4::R_WRITE_DATA: return "PM4 NOP WRITE_DATA";
+			case Pm4::R_FLIP: return "PM4 NOP FLIP";
+			case Pm4::R_RELEASE_MEM: return "PM4 NOP RELEASE_MEM";
+			case Pm4::R_DMA_DATA: return "PM4 NOP DMA_DATA";
+			case Pm4::R_CONTEXT_STATE: return "PM4 NOP CONTEXT_STATE";
+			default: return names->nops[r & (Pm4::R_NUM - 1u)];
+		}
+	}
+	switch (opcode) {
+		case Pm4::IT_SET_BASE: return "PM4 SET_BASE";
+		case Pm4::IT_INDEX_BUFFER_SIZE: return "PM4 INDEX_BUFFER_SIZE";
+		case Pm4::IT_DISPATCH_DIRECT: return "PM4 DISPATCH_DIRECT";
+		case Pm4::IT_DISPATCH_INDIRECT: return "PM4 DISPATCH_INDIRECT";
+		case Pm4::IT_SET_PREDICATION: return "PM4 SET_PREDICATION";
+		case Pm4::IT_COND_EXEC: return "PM4 COND_EXEC";
+		case Pm4::IT_DRAW_INDIRECT: return "PM4 DRAW_INDIRECT";
+		case Pm4::IT_DRAW_INDEX_INDIRECT: return "PM4 DRAW_INDEX_INDIRECT";
+		case Pm4::IT_INDEX_BASE: return "PM4 INDEX_BASE";
+		case Pm4::IT_DRAW_INDEX_2: return "PM4 DRAW_INDEX_2";
+		case Pm4::IT_CONTEXT_CONTROL: return "PM4 CONTEXT_CONTROL";
+		case Pm4::IT_INDEX_TYPE: return "PM4 INDEX_TYPE";
+		case Pm4::IT_DRAW_INDIRECT_MULTI: return "PM4 DRAW_INDIRECT_MULTI";
+		case Pm4::IT_DRAW_INDEX_AUTO: return "PM4 DRAW_INDEX_AUTO";
+		case Pm4::IT_NUM_INSTANCES: return "PM4 NUM_INSTANCES";
+		case Pm4::IT_INDIRECT_BUFFER_CNST: return "PM4 INDIRECT_BUFFER_CNST";
+		case Pm4::IT_DRAW_INDEX_OFFSET_2: return "PM4 DRAW_INDEX_OFFSET_2";
+		case Pm4::IT_WRITE_DATA: return "PM4 WRITE_DATA";
+		case Pm4::IT_MEM_SEMAPHORE: return "PM4 MEM_SEMAPHORE";
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return "PM4 DRAW_INDEX_INDIRECT_MULTI";
+		case Pm4::IT_WAIT_REG_MEM: return "PM4 WAIT_REG_MEM";
+		case Pm4::IT_INDIRECT_BUFFER: return "PM4 INDIRECT_BUFFER";
+		case Pm4::IT_COPY_DATA: return "PM4 COPY_DATA";
+		case Pm4::IT_CP_DMA: return "PM4 CP_DMA";
+		case Pm4::IT_PFP_SYNC_ME: return "PM4 PFP_SYNC_ME";
+		case Pm4::IT_SURFACE_SYNC: return "PM4 SURFACE_SYNC";
+		case Pm4::IT_EVENT_WRITE: return "PM4 EVENT_WRITE";
+		case Pm4::IT_EVENT_WRITE_EOP: return "PM4 EVENT_WRITE_EOP";
+		case Pm4::IT_EVENT_WRITE_EOS: return "PM4 EVENT_WRITE_EOS";
+		case Pm4::IT_RELEASE_MEM: return "PM4 RELEASE_MEM";
+		case Pm4::IT_DMA_DATA: return "PM4 DMA_DATA";
+		case Pm4::IT_ACQUIRE_MEM: return "PM4 ACQUIRE_MEM";
+		case Pm4::IT_SET_SH_REG_INDIRECT: return "PM4 SET_SH_REG_INDIRECT";
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return "PM4 SET_UCONFIG_REG_INDIRECT";
+		case Pm4::IT_SET_CONFIG_REG: return "PM4 SET_CONFIG_REG";
+		case Pm4::IT_SET_CONTEXT_REG: return "PM4 SET_CONTEXT_REG";
+		case Pm4::IT_SET_SH_REG: return "PM4 SET_SH_REG";
+		case Pm4::IT_SET_QUEUE_REG: return "PM4 SET_QUEUE_REG";
+		case Pm4::IT_SET_UCONFIG_REG: return "PM4 SET_UCONFIG_REG";
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: return "PM4 SET_UCONFIG_REG_INDEX";
+		case Pm4::IT_WRITE_CONST_RAM: return "PM4 WRITE_CONST_RAM";
+		case Pm4::IT_DUMP_CONST_RAM: return "PM4 DUMP_CONST_RAM";
+		case Pm4::IT_INCREMENT_CE_COUNTER: return "PM4 INCREMENT_CE_COUNTER";
+		case Pm4::IT_INCREMENT_DE_COUNTER: return "PM4 INCREMENT_DE_COUNTER";
+		case Pm4::IT_WAIT_ON_CE_COUNTER: return "PM4 WAIT_ON_CE_COUNTER";
+		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF: return "PM4 WAIT_ON_DE_COUNTER_DIFF";
+		case Pm4::IT_DISPATCH_DRAW: return "PM4 DISPATCH_DRAW";
+		case Pm4::IT_WAIT_REG_MEM_64: return "PM4 WAIT_REG_MEM_64";
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT: return "PM4 SET_CONTEXT_REG_INDIRECT";
+		default: return names->ops[opcode & 0xffu];
+	}
+}
+
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -427,6 +520,7 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
+	LibKernel::GuestWait::NoteSubmit(LibKernel::GuestWait::Submit::Command, true);
 	m_work_available.Signal();
 }
 
@@ -443,6 +537,7 @@ bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 	}
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
+	LibKernel::GuestWait::NoteSubmit(LibKernel::GuestWait::Submit::Command, true);
 	m_work_available.Signal();
 	return true;
 }
@@ -472,10 +567,14 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	// memory the GPU wrote to; the write itself goes back to the GPU thread.
 	m_renderer.GetCommandScheduler().DeferPriorityOperation([this, address, value, size,
 	                                                         sequence] {
-		(void)TrySendCommand([this, address, value, size, sequence] {
+		// KYTY_QUEUE_STATS ([op-latency]): when the label's tick was seen finished (0: stats off).
+		const auto done_ns = CommandScheduler::OperationDoneNs();
+		(void)TrySendCommand([this, address, value, size, sequence, done_ns] {
 			DrainProtectionHelper(ProtectDrainReason::GuestWrite);
 			Timeline::Mark("label", address, value);
 			std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Label);
+			CommandScheduler::NoteLabelLatency(done_ns);
 			const auto pending = m_pending_labels.find(address);
 			if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
 				m_pending_labels.erase(pending);
@@ -512,6 +611,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		const CpuCost::Phase command_phase_("Pm4::Command");
 		RendererScope renderer_scope(m_renderer);
 		command();
 	}
@@ -524,6 +624,12 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		return;
 	}
 	g_cmd_from_sync.fetch_add(1, std::memory_order_relaxed);
+	// KYTY_GUEST_WAIT_STATS: the calling thread waits for the GPU thread (gpu-sync; a readback
+	// times its own round trips).
+	LibKernel::GuestWait::Scope guest_wait;
+	if (LibKernel::GuestWait::Enabled()) [[unlikely]] {
+		LibKernel::GuestWait::BeginGpuSync(guest_wait);
+	}
 	std::binary_semaphore done {0};
 	SendCommand([operation = std::move(command), &done]() mutable {
 		operation();
@@ -599,7 +705,10 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
-	m_suspend_point_ready->acquire();
+	{
+		const LibKernel::GuestWait::Scope guest_wait(LibKernel::GuestWait::Prim::SuspendPoint);
+		m_suspend_point_ready->acquire();
+	}
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -682,7 +791,10 @@ void CommandProcessor::BufferFlush() {
 	}
 	// Downloads of the windows the game threads keep reading back, behind this submission's
 	// writes, in the recording about to be submitted (BufferCache::EagerDownloads).
-	m_renderer.GetBufferCache().EagerDownloads();
+	{
+		const CpuCost::Phase eager_phase_("Flush::EagerDownloads");
+		m_renderer.GetBufferCache().EagerDownloads();
+	}
 	SetSubmitReasonIfUnset("BufferFlush (other)");
 	GetScheduler().Flush();
 }
@@ -696,6 +808,18 @@ void CommandProcessor::CompleteReleaseMemInterrupt() {
 }
 
 void CommandProcessor::CompleteDraw() {
+	// Item 2 (11-20). Inside a replayed multi-draw packet, the draw-flush interval's submit after
+	// a sub-draw drawn in full takes the base that sub-draw just left: the next sub-draw finds
+	// another command buffer ([multi-replay] command-changed, one base in 16 in every log) and is
+	// drawn in full too. A full sub-draw that left a base is counted at the packet's end instead
+	// (DrawIndirectMulti), as the replayed sub-draws already are. At most 15 a packet, so a packet
+	// that never replays is submitted as before. Only when a submit happens moves, by one packet
+	// at most. KYTY_MULTI_DRAW_DEFER_FLUSH=0: as before.
+	if (m_multi_draw_defer && m_multi_draw_deferred < 15u &&
+	    m_renderer.GetRenderExecutor().MultiDrawBaseValid()) {
+		m_multi_draw_deferred++;
+		return;
+	}
 	const auto tick = GetScheduler().CurrentTick();
 	GetScheduler().CompleteDraw();
 	if (RenderStats::IndirectReplayConfigured() && GetScheduler().CurrentTick() != tick) {
@@ -788,6 +912,7 @@ struct QueueStats {
 	uint64_t waits_blocked[QueueStatsCount][3] {};
 	uint64_t label_writes[QueueStatsCount] {};
 	uint64_t prepare_ns[QueueStatsCount] {}, record_ns[QueueStatsCount] {};
+	uint64_t parts_count[QueueStatsCount] {}; // dispatches whose parts were timed (direct ones that recorded)
 	uint64_t dispatch_on_async[QueueStatsCount] {};
 	uint64_t process_async_ns[QueueStatsCount] {};
 	uint64_t same_shader[QueueStatsCount] {}, same_bindings[QueueStatsCount] {}, same_all[QueueStatsCount] {};
@@ -801,6 +926,7 @@ static std::unordered_map<uint64_t, uint8_t>      g_label_writer;
 static std::mutex                                 g_queue_stats_mutex;
 static void QueueStatsNoteLabelWrite(uint64_t address) {
 	if (!QueueStatsEnabled()) return;
+	QueueShare::NoteGuestLabel(); // [queue-share]: the guest's own join points
 	std::lock_guard stats_lock(g_queue_stats_mutex);
 	g_label_writer[address & ~uint64_t {3}] = static_cast<uint8_t>(g_stat_queue);
 	g_queue_stats.label_writes[g_stat_queue % QueueStatsCount]++;
@@ -811,6 +937,7 @@ static void QueueStatsNoteWait(uint64_t address, bool blocked) {
 	const auto q  = g_stat_queue % QueueStatsCount;
 	const auto it = g_label_writer.find(address & ~uint64_t {3});
 	const int  writer_class = it == g_label_writer.end() ? 2 : (it->second == q ? 0 : 1);
+	QueueShare::NoteGuestWait(writer_class == 1 && ((it->second != 0) != (q != 0)), !blocked);
 	g_queue_stats.waits[q][writer_class]++;
 	if (blocked) {
 		g_queue_stats.waits_blocked[q][writer_class]++;
@@ -818,6 +945,10 @@ static void QueueStatsNoteWait(uint64_t address, bool blocked) {
 			g_queue_stats.cross_pairs[(q << 8u) | it->second]++;
 		}
 	}
+}
+// The guest queue the calling thread is processing (renderCompute.cpp's [dispatch-delta]).
+uint32_t QueueStatsQueue() {
+	return g_stat_queue % QueueStatsCount;
 }
 void QueueStatsNoteBindings(uint64_t shader_hash, uint64_t bindings_hash, uint64_t srt_hash) {
 	if (!QueueStatsEnabled()) return;
@@ -852,9 +983,70 @@ void QueueStatsNoteDispatchParts(uint64_t prepare_ns, uint64_t record_ns) {
 	const auto q = g_stat_queue % QueueStatsCount;
 	g_queue_stats.prepare_ns[q] += prepare_ns;
 	g_queue_stats.record_ns[q] += record_ns;
+	g_queue_stats.parts_count[q]++;
 }
+// KYTY_QUEUE_STATS, [run-breaks] (v438zd, stats only): why a dispatch run ended, by the packet
+// NextRunDispatch stopped at. A run's last dispatch records a barrier after it; when another
+// dispatch follows a few packets later ("then dispatch"), that barrier sits between two dispatches
+// and the GPU drains there (the barrier-only gaps of KYTY_GPU_TIMING). Key: kind << 24 | opcode << 16
+// | sub. kind 0: a type-3 packet that is not a run member (sub: the R code of a NOP, the event
+// type of an EVENT_WRITE*, the first register of a SET_*_REG, else 0); 1: the command buffer
+// ended (or its end is unknown); 2: not a type-3 packet; 3: a predicated packet; 4: a bad length.
+struct RunBreakCount {
+	uint64_t total         = 0;
+	uint64_t then_dispatch = 0;
+};
+static std::mutex                        g_run_break_mutex;
+static std::map<uint32_t, RunBreakCount> g_run_breaks;
+static void QueueStatsNoteRunBreak(uint32_t key, bool then_dispatch) {
+	std::lock_guard lock(g_run_break_mutex);
+	auto&           count = g_run_breaks[key];
+	count.total++;
+	count.then_dispatch += then_dispatch ? 1u : 0u;
+}
+static void RunBreaksReport(double seconds) {
+	std::vector<std::pair<uint32_t, RunBreakCount>> list;
+	{
+		std::lock_guard lock(g_run_break_mutex);
+		list.assign(g_run_breaks.begin(), g_run_breaks.end());
+		g_run_breaks.clear();
+	}
+	if (list.empty()) return;
+	uint64_t total = 0, then_dispatch = 0;
+	for (const auto& [key, count]: list) {
+		total += count.total;
+		then_dispatch += count.then_dispatch;
+	}
+	std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
+		return a.second.then_dispatch != b.second.then_dispatch
+		           ? a.second.then_dispatch > b.second.then_dispatch
+		           : a.second.total > b.second.total;
+	});
+	std::string out;
+	char        text[96];
+	std::snprintf(text, sizeof(text), "[run-breaks] %.0f/s, then dispatch %.0f/s |", total / seconds,
+	              then_dispatch / seconds);
+	out += text;
+	static constexpr const char* Kinds[] = {"op", "end", "type", "pred", "len"};
+	for (size_t i = 0; i < list.size() && i < 14; i++) {
+		const auto key  = list[i].first;
+		const auto kind = std::min<uint32_t>(key >> 24u, 4u);
+		if (kind == 0) {
+			std::snprintf(text, sizeof(text), " op=0x%02x:0x%x %.0f (%.0f)", (key >> 16u) & 0xffu,
+			              key & 0xffffu, list[i].second.total / seconds,
+			              list[i].second.then_dispatch / seconds);
+		} else {
+			std::snprintf(text, sizeof(text), " %s %.0f (%.0f)", Kinds[kind],
+			              list[i].second.total / seconds, list[i].second.then_dispatch / seconds);
+		}
+		out += text;
+	}
+	std::fprintf(stderr, "%s\n", out.c_str());
+}
+
 static void QueueStatsReport(double seconds) {
 	if (!QueueStatsEnabled()) return;
+	RunBreaksReport(seconds);
 	std::lock_guard stats_lock(g_queue_stats_mutex);
 	auto& st = g_queue_stats;
 	for (uint32_t q = 0; q < QueueStatsCount; q++) {
@@ -877,6 +1069,19 @@ static void QueueStatsReport(double seconds) {
 			             "on the async thread: dispatches %.0f/s, process %.0f ms/s\n",
 			             q, st.prepare_ns[q] / 1e6 / seconds, st.record_ns[q] / 1e6 / seconds,
 			             st.dispatch_on_async[q] / seconds, st.process_async_ns[q] / 1e6 / seconds);
+			// v438z+: the same per dispatch. "rest" is what neither the program lookup nor the two
+			// timed parts cover, over all of the queue's dispatches (the prologue, run bookkeeping,
+			// clears, every part of an indirect dispatch after its lookup).
+			const double n     = static_cast<double>(std::max<uint64_t>(st.dispatches[q], 1));
+			const double timed = static_cast<double>(std::max<uint64_t>(st.parts_count[q], 1));
+			std::fprintf(stderr,
+			             "[queue-stats3] q=%u per dispatch: all %.2f us (program %.2f us) over %.0f/s | timed direct %.0f/s: "
+			             "prepare %.2f us, bind+commit+record %.2f us | rest %.0f ms/s\n",
+			             q, st.dispatch_ns[q] / 1e3 / n, st.program_ns[q] / 1e3 / n, st.dispatches[q] / seconds,
+			             st.parts_count[q] / seconds, st.prepare_ns[q] / 1e3 / timed, st.record_ns[q] / 1e3 / timed,
+			             (static_cast<double>(st.dispatch_ns[q]) - static_cast<double>(st.program_ns[q]) -
+			              static_cast<double>(st.prepare_ns[q]) - static_cast<double>(st.record_ns[q])) /
+			                 1e6 / seconds);
 		}
 	}
 	for (const auto& [key, count]: st.cross_pairs) {
@@ -997,6 +1202,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 	QueueStatsNoteLabelWrite(reinterpret_cast<uint64_t>(write_one_address ? dst : dst + dw_num - 1));
+	LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Label); // written just below
 	g_bda_resync_seq.fetch_add(1, std::memory_order_relaxed);
 	SettleUploadReads();
 	if (CpWriteTraced(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * 4u)) {
@@ -1006,6 +1212,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
 	// the page, draining the GPU; WriteClean writes both copies instead.
+	const CpuCost::Phase write_phase_("WriteData::Write");
 	auto& cache = m_renderer.GetBufferCache();
 	if (write_one_address) {
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
@@ -1135,6 +1342,15 @@ void GuestGpu::Enqueue(Submission submission) {
 		}
 	}
 	const auto role = RoleOf(submission.queue_id);
+	if (LibKernel::GuestWait::Enabled()) [[unlikely]] {
+		namespace GW = LibKernel::GuestWait;
+		// The second argument: the signals below wake the GPU thread (role 0).
+		GW::NoteSubmit(submission.type == SubmissionType::Graphics          ? GW::Submit::Gfx
+		               : submission.type == SubmissionType::Compute         ? GW::Submit::Compute
+		               : submission.type == SubmissionType::FlipPreparation ? GW::Submit::FlipPrep
+		                                                                    : GW::Submit::SuspendPoint,
+		               role != 1 || !AsyncThreadAlways());
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_role_count[role]++;
@@ -1179,6 +1395,70 @@ struct SrtDeferStats {
 	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
 static thread_local SrtDeferStats g_srt_defer_stats;
+// v445v (KYTY_SRT_IDLE_STATS=1, diagnostics only): the GPU thread's waits for an SRT download when
+// no other guest queue has work ("Thread::WaitSrtDownload": 59 ms/s median in g450x, hidden in
+// [floor]'s proc). Per 2 ms wait slice: how many command buffers the host GPU still had to finish
+// before the download's tick when the slice began (1 = only the one the deferral itself submitted),
+// whether this wait had to submit the open command buffer first, and whether the tick landed.
+// [srt-idle] every 5 s.
+static bool SrtIdleStats() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_IDLE_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+struct SrtIdleStatsState {
+	uint64_t slices[5] {};    // behind 0, 1, 2, 3-4, 5+
+	uint64_t ns[5] {};
+	uint64_t flushed      = 0; // the open command buffer held the download: submitted here
+	uint64_t flushed_ns   = 0;
+	uint64_t landed       = 0; // the tick completed within the slice
+	uint64_t waits        = 0; // first slices (a dispatch's wait that ran nothing else)
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+static thread_local SrtIdleStatsState g_srt_idle;
+static thread_local uint64_t          g_srt_idle_last_tick = 0;
+static void SrtIdleNote(uint64_t behind, bool flushed, uint64_t ns, bool landed, uint64_t tick) {
+	auto&     st     = g_srt_idle;
+	const int bucket = behind == 0 ? 0 : behind == 1 ? 1 : behind == 2 ? 2 : behind <= 4 ? 3 : 4;
+	st.slices[bucket]++;
+	st.ns[bucket] += ns;
+	if (flushed) {
+		st.flushed++;
+		st.flushed_ns += ns;
+	}
+	st.landed += landed ? 1u : 0u;
+	if (tick != g_srt_idle_last_tick) {
+		st.waits++;
+		g_srt_idle_last_tick = tick;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - st.last < std::chrono::seconds(5)) {
+		return;
+	}
+	const double s = std::chrono::duration<double>(now - st.last).count();
+	uint64_t     n = 0, t = 0;
+	for (int i = 0; i < 5; i++) {
+		n += st.slices[i];
+		t += st.ns[i];
+	}
+	std::fprintf(stderr,
+	             "[srt-idle] %.1fs: %.0f waits/s, %.0f slices/s, %.1f ms/s (landed in the slice %.0f%%) | "
+	             "command buffers left before the tick at the slice's start: 0 %.0f/%.1fms 1 %.0f/%.1fms "
+	             "2 %.0f/%.1fms 3-4 %.0f/%.1fms 5+ %.0f/%.1fms (per s) | open command buffer submitted by "
+	             "the wait %.0f/s %.1f ms/s\n",
+	             s, static_cast<double>(st.waits) / s, static_cast<double>(n) / s,
+	             static_cast<double>(t) / 1e6 / s, n != 0 ? 100.0 * static_cast<double>(st.landed) / static_cast<double>(n) : 0.0,
+	             static_cast<double>(st.slices[0]) / s, static_cast<double>(st.ns[0]) / 1e6 / s,
+	             static_cast<double>(st.slices[1]) / s, static_cast<double>(st.ns[1]) / 1e6 / s,
+	             static_cast<double>(st.slices[2]) / s, static_cast<double>(st.ns[2]) / 1e6 / s,
+	             static_cast<double>(st.slices[3]) / s, static_cast<double>(st.ns[3]) / 1e6 / s,
+	             static_cast<double>(st.slices[4]) / s, static_cast<double>(st.ns[4]) / 1e6 / s,
+	             static_cast<double>(st.flushed) / s, static_cast<double>(st.flushed_ns) / 1e6 / s);
+	st      = {};
+	st.last = now;
+}
 struct SuspendSite {
 	uint64_t count = 0;
 	uint32_t queue = 0;
@@ -1195,15 +1475,20 @@ static void NoteSuspendSite(const uint32_t* packet, uint32_t remaining_dw) {
 	}
 }
 
+// KYTY_GPU_THREAD_STATS=1 (v312): the [gpu-thread] lines without the rest of the KYTY_FPS_LOG
+// diagnostics (KYTY_FPS_ONLY=0 also changes the shader disk cache key).
+static bool SrtStatsLogged() {
+	static const bool log = Common::FpsLogDiagnostics() || std::getenv("KYTY_GPU_THREAD_STATS") != nullptr;
+	return log;
+}
+
 static void ReportSrtDeferStats() {
 	auto&      st  = g_srt_defer_stats;
 	const auto now = std::chrono::steady_clock::now();
 	if (now - st.last < std::chrono::seconds(5)) {
 		return;
 	}
-	// KYTY_GPU_THREAD_STATS=1 (v312): these lines without the rest of the KYTY_FPS_LOG
-	// diagnostics (KYTY_FPS_ONLY=0 also changes the shader disk cache key).
-	static const bool log = Common::FpsLogDiagnostics() || std::getenv("KYTY_GPU_THREAD_STATS") != nullptr;
+	const bool log = SrtStatsLogged();
 	if (log) {
 		const double s = std::chrono::duration<double>(now - st.last).count();
 		std::fprintf(stderr,
@@ -1419,30 +1704,58 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 
 	auto loop_mark = std::chrono::steady_clock::now();
 	for (;;) {
-		{
+		// v445o (KYTY_TIMERS_CUT; on by default since v445p, =0 off; toggle mode "timers"): this loop read the clock
+		// seven times per iteration for statistics, whoever read them. With the cut on a time is
+		// taken only when something uses it: the [gpu-thread] lines (srt_timed), [floor]'s thread
+		// times, [queue-stats]. Decided once per iteration: a begin and its end agree. Without
+		// the [gpu-thread] lines nothing reads g_srt_defer_stats, and its 5 s report (which then
+		// prints and resets nothing else) is skipped.
+		const bool timers_cut  = SyncToggle::TimersCut();
+		const bool srt_timed   = !timers_cut || SrtStatsLogged();
+		const bool floor_timed = srt_timed || Common::FloorStats::Enabled();
+		const bool srt_report  = srt_timed || QueueStatsEnabled();
+		SyncToggle::Bump(srt_timed ? SyncToggle::Hits().loop_timed : SyncToggle::Hits().loop_untimed);
+		if (srt_timed) {
 			const auto now = std::chrono::steady_clock::now();
 			g_srt_defer_stats.loop_us += static_cast<uint64_t>(
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(now - loop_mark).count());
-			g_srt_defer_stats.iters++;
 			loop_mark = now;
 		}
+		g_srt_defer_stats.iters++;
+		// KYTY_CPU_COST: everything this thread does is under this phase; its self time is the
+		// loop's own bookkeeping, the waits for work are "Thread::Wait..." ([cpu-total]).
+		const CpuCost::Phase         loop_phase_("Thread::Loop");
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		{
-			const auto lock_begin = std::chrono::steady_clock::now();
+			const auto lock_begin = srt_timed ? std::chrono::steady_clock::now()
+			                                  : std::chrono::steady_clock::time_point {};
+			std::optional<CpuCost::Phase> lock_phase_(std::in_place, "Thread::QueueLock");
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			g_srt_defer_stats.lock_us += static_cast<uint64_t>(
-			    std::chrono::duration_cast<std::chrono::nanoseconds>(
-			        std::chrono::steady_clock::now() - lock_begin)
-			        .count());
+			lock_phase_.reset();
+			if (srt_timed) {
+				g_srt_defer_stats.lock_us += static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        std::chrono::steady_clock::now() - lock_begin)
+				        .count());
+			}
 			while (!has_work() && !gpu->m_stopping) {
 				gpu->m_processing[role] = false;
 				gpu->m_idle.Signal();
 				Timeline::Mark("gpu-idle");
 				const auto empty_begin = std::chrono::steady_clock::now();
-				wait_work();
+				if (role == 0) {
+					LibKernel::GuestWait::GpuEmptyBegin(); // KYTY_GUEST_WAIT_STATS: who ends this wait
+				}
+				{
+					const CpuCost::Phase wait_phase_("Thread::WaitEmpty");
+					wait_work();
+				}
+				if (role == 0) {
+					LibKernel::GuestWait::GpuEmptyEnd();
+				}
 				{
 					const auto empty_ns = static_cast<uint64_t>(
 					    std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1511,6 +1824,7 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 				if (selected_queue < 0 && tick_pending) {
 					// Nothing else to run: poll for the downloads (and new submissions).
 					gpu->m_processing[role] = false;
+					const CpuCost::Phase wait_phase_("Thread::WaitSrtDownload");
 					const auto wait_begin = std::chrono::steady_clock::now();
 					// Wait for the GPU itself (2 ms slices, the queue unlocked so the guest can
 					// submit), not for a new submission: nothing signals m_work_available when a
@@ -1524,11 +1838,28 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 						work.WaitFor(&gpu->m_queue_mutex, 50);
 					} else {
 						gpu->m_queue_mutex.Unlock();
+						bool idle_flushed = false;
 						if (scheduler.Active() && pending_tick >= scheduler.CurrentTick()) {
 							RendererScope renderer_scope(gpu->m_renderer);
 							(KYTY_SUBMIT_REASON(), scheduler.Flush()); // the download is still in the open command buffer
+							idle_flushed = true;
 						}
-						(void)scheduler.WaitFor(pending_tick, 2'000'000);
+						// v445v (KYTY_SRT_IDLE_STATS): how far the host GPU still was from the tick.
+						uint64_t idle_behind = 0;
+						if (SrtIdleStats()) {
+							scheduler.GetMasterSemaphore().Refresh();
+							const auto known = scheduler.GetMasterSemaphore().KnownGpuTick();
+							idle_behind      = pending_tick > known ? pending_tick - known : 0;
+						}
+						const auto idle_slice_begin = std::chrono::steady_clock::now();
+						const bool idle_landed      = scheduler.WaitFor(pending_tick, 2'000'000);
+						if (SrtIdleStats()) {
+							SrtIdleNote(idle_behind, idle_flushed,
+							            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+							                                      std::chrono::steady_clock::now() - idle_slice_begin)
+							                                      .count()),
+							            idle_landed, pending_tick);
+						}
 						gpu->m_queue_mutex.Lock();
 					}
 					g_srt_defer_stats.idle_waits++;
@@ -1546,7 +1877,10 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 					Timeline::Mark("gpu-blocked");
 					const auto blocked_begin = std::chrono::steady_clock::now();
 					g_srt_defer_stats.blocked_waits++;
-					work.WaitFor(&gpu->m_queue_mutex, toggled ? 10 : 100);
+					{
+						const CpuCost::Phase wait_phase_("Thread::WaitBlocked");
+						work.WaitFor(&gpu->m_queue_mutex, toggled ? 10 : 100);
+					}
 					{
 						const auto blocked_ns = static_cast<uint64_t>(
 						    std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1592,13 +1926,15 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			const auto command_begin = std::chrono::steady_clock::now();
+			const auto command_begin = floor_timed ? std::chrono::steady_clock::now()
+			                                       : std::chrono::steady_clock::time_point {};
 			{
+				const CpuCost::Phase command_phase_("Thread::Command");
 				RendererScope renderer_scope(gpu->m_renderer);
 				command();
 			}
 			g_srt_defer_stats.cmd_count++;
-			{
+			if (floor_timed) {
 				const auto command_ns = static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::nanoseconds>(
 				        std::chrono::steady_clock::now() - command_begin)
@@ -1608,7 +1944,9 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 					Common::FloorStats::Add(Common::FloorStats::Get().thread_command_ns, command_ns);
 				}
 			}
-			ReportSrtDeferStats();
+			if (srt_report) {
+				ReportSrtDeferStats();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing[role] = false;
@@ -1629,15 +1967,22 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 			    std::exchange(submission.srt_wait_tick, 0));
 		}
 		g_srt_wait_tick     = 0;
-		const auto process_begin = std::chrono::steady_clock::now();
+		const bool process_timed = floor_timed || QueueStatsEnabled();
+		const auto process_begin = process_timed ? std::chrono::steady_clock::now()
+		                                         : std::chrono::steady_clock::time_point {};
 		g_stat_queue = submission.queue_id;
 		GpuTiming::SetQueue(submission.queue_id);
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
 		{
-			const auto ns = static_cast<uint64_t>(
-			    std::chrono::duration_cast<std::chrono::nanoseconds>(
-			        std::chrono::steady_clock::now() - process_begin)
-			        .count());
+			const CpuCost::Phase process_phase_("Thread::Process");
+			complete = gpu->Process(submission);
+		}
+		{
+			const auto ns = process_timed
+			                    ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                std::chrono::steady_clock::now() - process_begin)
+			                                                .count())
+			                    : uint64_t {0};
 			if (QueueStatsEnabled()) {
 				std::lock_guard stats_lock(g_queue_stats_mutex);
 				const auto q = submission.queue_id % QueueCount;
@@ -1662,14 +2007,21 @@ void GuestGpu::ThreadRunRole(GuestGpu* gpu, uint32_t role) {
 			}
 		}
 		const auto srt_tick = std::exchange(g_srt_wait_tick, 0);
-		ReportSrtDeferStats();
+		if (srt_report) {
+			ReportSrtDeferStats();
+		}
 
-		const auto lock2_begin = std::chrono::steady_clock::now();
+		const auto lock2_begin = srt_timed ? std::chrono::steady_clock::now()
+		                                   : std::chrono::steady_clock::time_point {};
+		std::optional<CpuCost::Phase> lock2_phase_(std::in_place, "Thread::QueueLock");
 		Common::LockGuard lock(gpu->m_queue_mutex);
-		g_srt_defer_stats.lock_us += static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(
-		        std::chrono::steady_clock::now() - lock2_begin)
-		        .count());
+		lock2_phase_.reset();
+		if (srt_timed) {
+			g_srt_defer_stats.lock_us += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - lock2_begin)
+			        .count());
+		}
 		gpu->m_queue_busy[submission.queue_id] = false;
 		if (!complete) {
 			submission.blocked       = true;
@@ -1759,6 +2111,7 @@ bool GuestGpu::Process(Submission& submission) {
 	HotPagesSlice(!submission.started);
 	const bool first_slice = !submission.started;
 	g_run_expected_next    = nullptr; // a run continues only within one slice of one submission
+	g_run_last_stop        = BarrierReason::WhySlice;
 	auto&      cp          = GetProcessor(submission.queue_id);
 	Timeline::Mark("proc-begin", submission.queue_id, static_cast<uint64_t>(submission.type));
 	struct EndMark {
@@ -1770,6 +2123,7 @@ bool GuestGpu::Process(Submission& submission) {
 	} end_mark {submission};
 
 	{
+		const CpuCost::Phase begin_phase_("Process::Begin");
 		RendererScope renderer_scope(m_renderer);
 		g_bda_submission_cpu_epoch.store(submission.cpu_epoch, std::memory_order_relaxed);
 		if (first_slice) {
@@ -1816,6 +2170,7 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			const CpuCost::Phase end_phase_("Process::End");
 			RendererScope renderer_scope(m_renderer);
 			if (progressed) {
 				if (complete) {
@@ -1849,6 +2204,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			const CpuCost::Phase end_phase_("Process::End");
 			RendererScope renderer_scope(m_renderer);
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
@@ -1864,12 +2220,14 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::FlipPreparation: {
+			const CpuCost::Phase flip_phase_("Process::FlipPreparation");
 			RendererScope renderer_scope(m_renderer);
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		}
 		case SubmissionType::SuspendPoint: {
+			const CpuCost::Phase suspend_phase_("Process::SuspendPoint");
 			RendererScope renderer_scope(m_renderer);
 			cp.EmitGuestBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
@@ -2040,6 +2398,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	if (DrawPrep::Enabled() && !draw_prep) {
 		DrawPrep::ClearCurrent();
 	}
+	// KYTY_CPU_COST: the packet loop's own work (headers, skips, replay checks) is this phase's
+	// self time; each packet's handler runs under "PM4 <opcode>" (Pm4PhaseName).
+	// KYTY_CPU_COST_PACKETS=0: no phase per packet (register writes are most packets; [cpu-total]
+	// prints what the records cost); their time is then "Pm4::Loop"'s.
+	const CpuCost::Phase loop_phase_("Pm4::Loop");
+	static const bool    packet_phases = [] {
+        const char* value = std::getenv("KYTY_CPU_COST_PACKETS");
+        return value == nullptr || value[0] != '0';
+	}();
+	const bool cpu_cost = packet_phases && CpuCost::Enabled();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -2210,6 +2578,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			    location != nullptr) {
 				command_zone.emplace(location);
 			}
+		}
+		std::optional<CpuCost::Phase> packet_phase_;
+		if (cpu_cost) {
+			packet_phase_.emplace(Pm4PhaseName(opcode, KYTY_PM4_R(packet_header)));
 		}
 		uint32_t packet_dw = 0;
 		// Graphics right of way: the async thread hands the mutex over at this packet boundary
@@ -2735,7 +3107,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 				run_packet         = cursor.commands.data() + cursor.offset_dw;
 				run_end            = cursor.commands.data() + cursor.commands.size();
 			}
-			PrepareMeshArgsRun(*this, run_packet, run_end);
+			{
+				const CpuCost::Phase scan_phase_("R::MeshArgsScan");
+				PrepareMeshArgsRun(*this, run_packet, run_end);
+			}
 			if (RenderStats::IndirectReplayActive() &&
 			    m_renderer.GetRenderExecutor().ReplayIndirectDraw(
 			        m_submit_id, CurrentBuffer(), reinterpret_cast<uint64_t>(args_addr),
@@ -2755,7 +3130,11 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 	if (!indexed) {
 		DrawIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
+		{
+			// The arguments are read here: a fault when the GPU wrote them (a readback).
+			const CpuCost::Phase read_phase_("R::ArgsRead");
+			std::memcpy(&args, args_addr, sizeof(args));
+		}
 		if (LogIndirectDraw()) {
 			LOGF("Indirect draw: args=0x%010" PRIx64 " vertices=%u instances=%u first=%u\n",
 			     reinterpret_cast<uint64_t>(args_addr), args.vertex_count_per_instance,
@@ -2773,7 +3152,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	DrawIndexedIndirectArgs args {};
-	std::memcpy(&args, args_addr, sizeof(args));
+	{
+		const CpuCost::Phase read_phase_("R::ArgsRead");
+		std::memcpy(&args, args_addr, sizeof(args));
+	}
 	if (LogIndirectDraw()) {
 		LOGF("Indirect indexed draw: args=0x%010" PRIx64 " indices=%u instances=%u first=%u\n",
 		     reinterpret_cast<uint64_t>(args_addr), args.index_count_per_instance,
@@ -2860,6 +3242,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		// The count is read here: a fault when the GPU wrote it (a readback).
+		const CpuCost::Phase count_phase_("M::CountRead");
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -2933,8 +3317,34 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                    ImgRef::Address() == 0 && !LogIndirectDraw();
 	auto&      executor = m_renderer.GetRenderExecutor();
 	uint32_t   replayed_in_packet = 0;
+	// See CompleteDraw. Off with KYTY_MULTI_DRAW_PACKET_FLUSH=0 as well (per sub-draw).
+	static const bool defer_flush = [] {
+		const char* packet = std::getenv("KYTY_MULTI_DRAW_PACKET_FLUSH");
+		const char* defer  = std::getenv("KYTY_MULTI_DRAW_DEFER_FLUSH");
+		return (packet == nullptr || packet[0] != '0') && (defer == nullptr || defer[0] != '0');
+	}();
+	// KYTY_RENDER_STATS: [multi-packets], the packets by class (RenderStats::MultiPacketNote).
+	const bool census = RenderStats::Enabled();
+	if (census) {
+		using Note = RenderStats::MultiPacketNote;
+		RenderStats::NoteMultiPacket(Note::Packets);
+		RenderStats::NoteMultiPacket(Note::SubDraws, draw_count);
+		if (draw_count == 1) {
+			RenderStats::NoteMultiPacket(Note::Single);
+		}
+		if (indexed) {
+			RenderStats::NoteMultiPacket(Note::IndexedPackets);
+			RenderStats::NoteMultiPacket(Note::IndexedRest, draw_count - 1u);
+			executor.CensusMultiDrawIndexed(true);
+		}
+		if (replay) {
+			RenderStats::NoteMultiPacket(Note::ReplayPackets);
+		}
+	}
 	if (replay) {
 		executor.BeginMultiDraw();
+		m_multi_draw_defer    = defer_flush;
+		m_multi_draw_deferred = 0;
 	}
 	for (uint32_t i = 0; i < draw_count; i++) {
 		if (probe && i > 0) {
@@ -2962,9 +3372,15 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		if (!indexed) {
 			auto* args      = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
-			m_num_instances = args->instance_count;
+			{
+				const CpuCost::Phase read_phase_("M::ArgsRead"); // the record's first read
+				m_num_instances = args->instance_count;
+			}
 			m_num_instances_args = 0;
 			WriteIndirectStartInstance(args->start_instance_location);
+			if (census && replay && i == 0) {
+				executor.CensusMultiDrawFirst(CurrentBuffer());
+			}
 			if (replay && i > 0 &&
 			    executor.ReplayMultiDraw(m_submit_id, CurrentBuffer(), args->vertex_count_per_instance,
 			                             args->instance_count, args->start_vertex_location,
@@ -2997,8 +3413,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
 
+		std::optional<CpuCost::Phase> read_phase_(std::in_place, "M::ArgsRead"); // the record's first read
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
+		read_phase_.reset();
 
 		const uint32_t index_count =
 		    (m_index_buffer_size != 0
@@ -3023,10 +3441,32 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		           .offset_source  = DrawOffsetSource::IndirectArgs});
 	}
 	if (replay) {
+		if (census) {
+			executor.CensusMultiDrawEnd(CurrentBuffer());
+		}
 		executor.EndMultiDraw();
+		// The full sub-draws CompleteDraw left for here, counted as it would have counted them,
+		// up to the first submit: the rest were recorded into the command buffer that submit sent.
+		m_multi_draw_defer = false;
+		uint32_t counted   = 0;
+		while (counted < m_multi_draw_deferred) {
+			const auto tick = GetScheduler().CurrentTick();
+			CompleteDraw();
+			counted++;
+			if (GetScheduler().CurrentTick() != tick) {
+				break;
+			}
+		}
+		if (counted < m_multi_draw_deferred && Common::FloorStats::Enabled()) {
+			Common::FloorStats::Add(Common::FloorStats::Get().draws, m_multi_draw_deferred - counted);
+		}
+		m_multi_draw_deferred = 0;
 		if (replayed_in_packet != 0) {
 			CompleteDraw(); // the packet's replayed sub-draws, once
 		}
+	}
+	if (census && indexed) {
+		executor.CensusMultiDrawIndexed(false);
 	}
 	if (probe) {
 		const auto h = RenderStats::LastCommitHash();
@@ -3123,8 +3563,15 @@ static void NoteDispatchQueue(uint64_t addr, bool async, uint32_t x, uint32_t y,
 // with, if the stream reaches it with nothing but SET_SH_REG and debug markers in between
 // (g_run_expected_next, declared at the top).
 
+// stop, stop_at (KYTY_QUEUE_STATS, [run-breaks]): why and where the scan gave up.
 static const uint32_t* NextRunDispatch(const uint32_t* p, const uint32_t* end,
-                                       std::array<uint32_t, 3>* local) {
+                                       std::array<uint32_t, 3>* local, uint32_t* stop = nullptr,
+                                       const uint32_t** stop_at = nullptr) {
+	const auto gave_up = [&](uint32_t key, const uint32_t* at) -> const uint32_t* {
+		if (stop != nullptr) *stop = key;
+		if (stop_at != nullptr) *stop_at = at;
+		return nullptr;
+	};
 	while (p < end) {
 		const uint32_t header = p[0];
 		if (header == 0x80000000u) {
@@ -3132,12 +3579,13 @@ static const uint32_t* NextRunDispatch(const uint32_t* p, const uint32_t* end,
 			continue;
 		}
 		if ((header >> 30u) != 3u || (header & 1u) != 0) {
-			return nullptr; // not a type-3 packet, or predicated
+			// not a type-3 packet, or predicated
+			return gave_up((header >> 30u) != 3u ? 2u << 24u : 3u << 24u, nullptr);
 		}
 		const uint32_t op  = (header >> 8u) & 0xffu;
 		const uint32_t len = KYTY_PM4_LEN(header);
 		if (len < 2 || len > static_cast<uint64_t>(end - p)) {
-			return nullptr;
+			return gave_up(4u << 24u, nullptr);
 		}
 		if (op == Pm4::IT_DISPATCH_DIRECT || op == Pm4::IT_DISPATCH_INDIRECT) {
 			return p;
@@ -3162,9 +3610,46 @@ static const uint32_t* NextRunDispatch(const uint32_t* p, const uint32_t* end,
 				continue;
 			}
 		}
+		if (stop != nullptr) {
+			uint32_t sub = 0;
+			if (op == Pm4::IT_NOP) {
+				sub = KYTY_PM4_R(header);
+			} else if (op == Pm4::IT_EVENT_WRITE || op == Pm4::IT_EVENT_WRITE_EOP ||
+			           op == Pm4::IT_EVENT_WRITE_EOS) {
+				sub = p[1] & 0x3fu;
+			} else if (op >= 0x68u && op <= 0x7bu) { // the SET_*_REG family: the first register
+				sub = p[1] & 0xffffu;
+			}
+			return gave_up((op << 16u) | sub, p);
+		}
 		return nullptr;
 	}
-	return nullptr;
+	return gave_up(1u << 24u, nullptr);
+}
+
+// [run-breaks]: whether a dispatch follows the packet a run stopped at, within 64 packets of the
+// same command buffer (the stopping packet itself is skipped).
+static bool RunBreakThenDispatch(const uint32_t* p, const uint32_t* end) {
+	for (uint32_t n = 0; p != nullptr && p < end && n < 65u; n++) {
+		const uint32_t header = p[0];
+		if (header == 0x80000000u) {
+			p++;
+			continue;
+		}
+		if ((header >> 30u) != 3u) {
+			return false;
+		}
+		const uint32_t len = KYTY_PM4_LEN(header);
+		if (len < 2 || len > static_cast<uint64_t>(end - p)) {
+			return false;
+		}
+		const uint32_t op = (header >> 8u) & 0xffu;
+		if (n != 0 && (op == Pm4::IT_DISPATCH_DIRECT || op == Pm4::IT_DISPATCH_INDIRECT)) {
+			return true;
+		}
+		p += len;
+	}
+	return false;
 }
 
 // packet, end: the dispatch packet and the end of its command buffer (nullptr: unknown).
@@ -3174,12 +3659,23 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 	run.packet    = nullptr;
 	run.continues = false;
 	run.more      = false;
+	run.why       = 0;
+	static const bool reasons = BarrierReason::Enabled();
 	if (!DispatchRunsEnabled() || packet == nullptr) {
 		g_run_expected_next = nullptr;
+		if (reasons) {
+			run.why         = DispatchRunsEnabled() ? BarrierReason::WhyNoPacket : BarrierReason::WhyRunsOff;
+			g_run_last_stop = BarrierReason::WhyNoPacket;
+		}
 		return;
 	}
 	run.packet             = packet;
 	run.continues          = packet == g_run_expected_next;
+	if (reasons && !run.continues) {
+		run.why = g_run_expected_next != nullptr ? static_cast<uint32_t>(BarrierReason::WhyMismatch)
+		                                         : g_run_last_stop;
+		if (run.why == 0) run.why = BarrierReason::WhySlice; // the thread's first dispatch
+	}
 	if (!run.continues && !run.converted.empty()) {
 		// Converted counts belong to the run instance that converted them. A command buffer the
 		// game submits again (or a run resumed after KYTY_SRT_DEFER) reaches the same packets
@@ -3230,7 +3726,15 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 	}
 	run.runs += run.continues ? 0 : 1;
 	run.members++;
-	const uint32_t* next = NextRunDispatch(packet + KYTY_PM4_LEN(packet[0]), end, nullptr);
+	static const bool run_breaks = QueueStatsEnabled();
+	uint32_t          stop       = 0;
+	const uint32_t*   stop_at    = nullptr;
+	const uint32_t* next = NextRunDispatch(packet + KYTY_PM4_LEN(packet[0]), end, nullptr,
+	                                       run_breaks || reasons ? &stop : nullptr, &stop_at);
+	if (reasons) g_run_last_stop = next == nullptr ? stop : 0u;
+	if (run_breaks && next == nullptr) {
+		QueueStatsNoteRunBreak(stop, RunBreakThenDispatch(stop_at, end));
+	}
 	run.more             = next != nullptr;
 	g_run_expected_next  = next;
 	if (!indirect || run.converted.contains(packet)) {
@@ -3398,6 +3902,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 				run_packet         = cursor.commands.data() + cursor.offset_dw;
 				run_end            = cursor.commands.data() + cursor.commands.size();
 			}
+			const CpuCost::Phase scan_phase_("Dispatch::RunScan");
 			PrepareDispatchRun(*this, false, run_packet, run_end);
 		}
 		ReportDispatchRuns();
@@ -3417,6 +3922,11 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			                                            .count()));
 		}
 	}
+}
+
+void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
+	EXIT_NOT_IMPLEMENTED(IsAsyncComputeQueue());
+	m_renderer.GetRenderExecutor().ProcessPssr(CurrentBuffer(), request);
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
@@ -3501,6 +4011,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 			run_packet         = cursor.commands.data() + cursor.offset_dw;
 			run_end            = cursor.commands.data() + cursor.commands.size();
 		}
+		const CpuCost::Phase scan_phase_("Dispatch::RunScan");
 		PrepareDispatchRun(*this, (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0,
 		                   run_packet, run_end);
 	}
@@ -3701,10 +4212,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
 			                                    sizeof(data));
 		} else {
+			const CpuCost::Phase label_phase_("Eop::LabelWrite");
 			SettleUploadReads();
 			std::memcpy(dst, &data, sizeof(data));
+			LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Label);
 		}
 
+		const CpuCost::Phase record_phase_("Eop::Record");
 		if (with_interrupt) {
 			if (with_writeback) {
 				Sync::WriteAtEndOfPipeWithInterruptWriteBack32(m_submit_id, command, dst,
@@ -3761,9 +4275,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
 						                                    value, sizeof(value));
 					} else {
+						const CpuCost::Phase label_phase_("Eop::LabelWrite");
 						SettleUploadReads();
 						std::memcpy(dst, &value, sizeof(value));
+						LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Label);
 					}
+					const CpuCost::Phase record_phase_("Eop::Record");
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -4095,6 +4612,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 
 	SettleUploadReads();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Label);
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -4121,6 +4639,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	}
 	SettleUploadReads();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Label);
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(

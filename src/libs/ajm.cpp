@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Audio::Ajm {
@@ -349,9 +350,31 @@ static void AjmWriteCodecInfo(AjmDecoder* decoder, void* result, size_t result_s
 	                        result_size - AJM_SIDEBAND_RESULT_SIZE, decode_result);
 }
 
+// v446k: the order of the sideband outputs after the result, as the AJM library lays them out
+// (shadPS4 ajm_batch.cpp AjmJobFromBatchBuffer): stream, format, gapless decode, multiple frames,
+// codec info. This wrote codec info, resample info, gapless, format, stream, multiple frames, which
+// agreed only for jobs with stream and multiple frames alone; a job with format or gapless decode as
+// well read its stream counts from the wrong place (Mac 11-22: the game's audio thread overran a
+// buffer when he picked up a collectible, on a count of ~0x0c0c0c0c). Resample info, which that
+// layout does not have, goes last. The first job of each new flag combination is logged.
 static void AjmWriteSideband(uint64_t flags, void* sideband_output, size_t sideband_output_size,
                              AjmDecoder* decoder, const AjmGaplessState* gapless,
                              const AjmDecodeResult& decode_result) {
+	{
+		static std::mutex                   seen_mutex;
+		static std::unordered_set<uint64_t> seen;
+		const uint64_t                      key = flags & 0xffff'f000'0000'0000ull;
+		std::scoped_lock                    lock(seen_mutex);
+		if (seen.size() < 64 && seen.insert(key).second) {
+			std::fprintf(stderr,
+			             "[ajm-sideband] new job flags 0x%016llx: sideband output %llu bytes, result 0x%x, "
+			             "consumed %llu, produced %llu, frames %u\n",
+			             static_cast<unsigned long long>(flags),
+			             static_cast<unsigned long long>(sideband_output_size), decode_result.result,
+			             static_cast<unsigned long long>(decode_result.input_consumed),
+			             static_cast<unsigned long long>(decode_result.output_written), decode_result.frames);
+		}
+	}
 	if (sideband_output == nullptr || sideband_output_size == 0) {
 		return;
 	}
@@ -359,57 +382,52 @@ static void AjmWriteSideband(uint64_t flags, void* sideband_output, size_t sideb
 	AjmWriteResult(sideband_output, sideband_output_size, decode_result);
 
 	size_t offset = AJM_SIDEBAND_RESULT_SIZE;
-
-	if ((flags & AJM_FLAG_RUN_GET_CODEC_INFO) != 0 && decoder != nullptr) {
-		const auto codec_info_size = decoder->CodecInfoSize();
-		if (offset + codec_info_size <= sideband_output_size) {
-			decoder->WriteCodecInfo(static_cast<uint8_t*>(sideband_output) + offset,
-			                        sideband_output_size - offset, decode_result);
-			offset += codec_info_size;
-		}
-	}
-
-	if ((flags & AJM_FLAG_SIDEBAND_RESAMPLE_INFO) != 0 &&
-	    offset + AJM_SIDEBAND_RESAMPLE_INFO_SIZE <= sideband_output_size) {
-		auto* info = reinterpret_cast<AjmSidebandResampleInfo*>(
-		    static_cast<uint8_t*>(sideband_output) + offset);
-		info->ratio = 1.0f;
-		offset += AJM_SIDEBAND_RESAMPLE_INFO_SIZE;
-	}
-
-	if ((flags & AJM_FLAG_SIDEBAND_GAPLESS) != 0 &&
-	    offset + AJM_SIDEBAND_GAPLESS_SIZE <= sideband_output_size) {
-		auto* gapless_output = reinterpret_cast<AjmSidebandGaplessDecode*>(
-		    static_cast<uint8_t*>(sideband_output) + offset);
-		if (gapless != nullptr) {
-			*gapless_output = gapless->current;
-		}
-		offset += AJM_SIDEBAND_GAPLESS_SIZE;
-	}
-
-	if ((flags & AJM_FLAG_SIDEBAND_FORMAT) != 0 &&
-	    offset + AJM_SIDEBAND_FORMAT_SIZE <= sideband_output_size) {
-		auto* format =
-		    reinterpret_cast<AjmSidebandFormat*>(static_cast<uint8_t*>(sideband_output) + offset);
-		*format = decode_result.format;
-		offset += AJM_SIDEBAND_FORMAT_SIZE;
-	}
+	auto*  base   = static_cast<uint8_t*>(sideband_output);
 
 	if ((flags & AJM_FLAG_SIDEBAND_STREAM) != 0 &&
 	    offset + AJM_SIDEBAND_STREAM_SIZE <= sideband_output_size) {
-		auto* stream =
-		    reinterpret_cast<AjmSidebandStream*>(static_cast<uint8_t*>(sideband_output) + offset);
+		auto* stream                  = reinterpret_cast<AjmSidebandStream*>(base + offset);
 		stream->size_consumed         = AjmClampInt32(decode_result.input_consumed);
 		stream->size_produced         = AjmClampInt32(decode_result.output_written);
 		stream->total_decoded_samples = decode_result.total_decoded_samples;
 		offset += AJM_SIDEBAND_STREAM_SIZE;
 	}
 
+	if ((flags & AJM_FLAG_SIDEBAND_FORMAT) != 0 &&
+	    offset + AJM_SIDEBAND_FORMAT_SIZE <= sideband_output_size) {
+		auto* format = reinterpret_cast<AjmSidebandFormat*>(base + offset);
+		*format      = decode_result.format;
+		offset += AJM_SIDEBAND_FORMAT_SIZE;
+	}
+
+	if ((flags & AJM_FLAG_SIDEBAND_GAPLESS) != 0 &&
+	    offset + AJM_SIDEBAND_GAPLESS_SIZE <= sideband_output_size) {
+		auto* gapless_output = reinterpret_cast<AjmSidebandGaplessDecode*>(base + offset);
+		if (gapless != nullptr) {
+			*gapless_output = gapless->current;
+		}
+		offset += AJM_SIDEBAND_GAPLESS_SIZE;
+	}
+
 	if ((flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0 &&
 	    offset + AJM_SIDEBAND_MFRAME_SIZE <= sideband_output_size) {
-		auto* mframe =
-		    reinterpret_cast<AjmSidebandMFrame*>(static_cast<uint8_t*>(sideband_output) + offset);
+		auto* mframe       = reinterpret_cast<AjmSidebandMFrame*>(base + offset);
 		mframe->num_frames = decode_result.frames;
+		offset += AJM_SIDEBAND_MFRAME_SIZE;
+	}
+
+	if ((flags & AJM_FLAG_RUN_GET_CODEC_INFO) != 0 && decoder != nullptr) {
+		const auto codec_info_size = decoder->CodecInfoSize();
+		if (offset + codec_info_size <= sideband_output_size) {
+			decoder->WriteCodecInfo(base + offset, sideband_output_size - offset, decode_result);
+			offset += codec_info_size;
+		}
+	}
+
+	if ((flags & AJM_FLAG_SIDEBAND_RESAMPLE_INFO) != 0 &&
+	    offset + AJM_SIDEBAND_RESAMPLE_INFO_SIZE <= sideband_output_size) {
+		auto* info  = reinterpret_cast<AjmSidebandResampleInfo*>(base + offset);
+		info->ratio = 1.0f;
 	}
 }
 

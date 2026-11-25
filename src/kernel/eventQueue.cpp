@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/timeline.h"
+#include "kernel/guestWait.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -188,6 +189,7 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	uint32_t      elapsed = 0;
 	Common::Timer t;
 	t.Start();
+	GuestWait::Scope guest_wait; // KYTY_GUEST_WAIT_STATS: started when the call has to wait
 
 	for (;;) {
 		int ret = GetTriggeredEvents(ev, num);
@@ -198,6 +200,7 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 
 		uint32_t   timer_wait = 0;
 		const bool has_timer  = GetNextTimerWaitMicros(MonotonicTimeNs(), &timer_wait);
+		guest_wait.Begin(GuestWait::Prim::Equeue, this, m_name.c_str());
 		if (micros == 0 && !has_timer) {
 			m_cond_var.Wait(&m_mutex);
 		} else {

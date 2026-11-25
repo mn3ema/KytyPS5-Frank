@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "kernel/memory.h"
 
 #include <atomic>
 #include <cinttypes>
@@ -82,9 +83,21 @@ inline uint64_t PointerAt(const uint32_t* dw) {
 	return p != 0 && (p & 3u) == 0 && Readable(p, kInnerDwords * 4u) ? p : 0;
 }
 
-// Returns the dword offset of a matching descriptor in the table at address, or -1.
-inline int ScanTable(uint64_t address, uint32_t dwords, uint64_t watched) {
-	const auto* table = reinterpret_cast<const uint32_t*>(address);
+// Copies a table out before it is scanned (v438zw). Readable caches its answer, and a page that
+// was readable then can be no-access now: the tracker protects GPU-written pages. Reading such a
+// table in place faulted the scan on a host thread (2026-11-17, a user SGPR pair holding the
+// watched image's own address). Through the backing store where the range has one, which no
+// protection affects; otherwise directly, after a fresh check.
+inline bool CopyTable(uint64_t address, uint32_t dwords, uint32_t* out) {
+	const uint64_t bytes = uint64_t {dwords} * 4u;
+	if (Libs::LibKernel::Memory::TryReadBacking(address, out, bytes)) return true;
+	if (!HostMemoryRangeIsReadable(address, bytes)) return false;
+	std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
+	return true;
+}
+
+// Returns the dword offset of a matching descriptor in the copied table, or -1.
+inline int ScanTable(const uint32_t* table, uint32_t dwords, uint64_t watched) {
 	for (uint32_t i = 0; i + 1 < dwords; i++) {
 		if (IsDescriptor(table + i, watched)) return static_cast<int>(i);
 	}
@@ -131,11 +144,14 @@ inline void Scan(const char* kind, uint64_t shader, const HW::UserSgprInfo& user
 				return;
 			}
 		}
-		char suffix[128] {};
-		if (const int at = ScanTable(table, dwords, watched); at >= 0) {
+		char     suffix[128] {};
+		uint32_t outer[kOuterDwords];
+		if (!CopyTable(table, dwords, outer)) {
+			// Not readable any more: no match from this table in this frame.
+		} else if (const int at = ScanTable(outer, dwords, watched); at >= 0) {
 			std::snprintf(suffix, sizeof(suffix), " +0x%x", at * 4);
 		} else {
-			const auto* dw = reinterpret_cast<const uint32_t*>(table);
+			const auto* dw = outer;
 			for (uint32_t j = 0; j + 1 < dwords; j++) {
 				const uint64_t inner = PointerAt(dw + j);
 				if (inner == 0) continue;
@@ -143,7 +159,11 @@ inline void Scan(const char* kind, uint64_t shader, const HW::UserSgprInfo& user
 					std::lock_guard lock(cache_mutex);
 					if (inner_misses.contains(inner)) continue;
 				}
-				if (const int in_at = ScanTable(inner, kInnerDwords, watched); in_at >= 0) {
+				uint32_t inner_copy[kInnerDwords];
+				if (const int in_at = CopyTable(inner, kInnerDwords, inner_copy)
+				                          ? ScanTable(inner_copy, kInnerDwords, watched)
+				                          : -1;
+				    in_at >= 0) {
 					std::snprintf(suffix, sizeof(suffix), " +0x%x -> 0x%" PRIx64 " +0x%x", j * 4, inner,
 					              in_at * 4);
 					break;

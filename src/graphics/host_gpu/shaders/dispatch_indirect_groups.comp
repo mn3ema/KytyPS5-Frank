@@ -41,6 +41,7 @@ layout(push_constant) uniform Push {
     uvec2 report_address;
     uint  hash_low;
     uint  hash_high;
+    uint  rt_mode; // v440p: 1 = a callable split's group counts (see main)
 } pc;
 
 uint GroupCount(uint threads, uint local_size) {
@@ -50,6 +51,28 @@ uint GroupCount(uint threads, uint local_size) {
 void main() {
     ThreadCounts counts = ThreadCounts(pc.threads_address);
     const uvec3 threads = uvec3(counts.threads[0], counts.threads[1], counts.threads[2]);
+    if (pc.rt_mode != 0u) {
+        // A callable split launches (threads x groups, 1, 1) ray-generation invocations: the entry
+        // holds the thread extents per axis (the shader reads them by address) and the
+        // vkCmdTraceRaysIndirectKHR command {width, 1, 1}. The arguments are group counts.
+        const uvec3 g = threads; // group counts
+        uvec3 total = g * uvec3(max(pc.local_size_x, 1u), max(pc.local_size_y, 1u), max(pc.local_size_z, 1u));
+        const uint threads_per_group = max(pc.local_size_x, 1u) * max(pc.local_size_y, 1u) * max(pc.local_size_z, 1u);
+        const uint group_total = (g.x == 0u || g.y == 0u || g.z == 0u) ? 0u : g.x * g.y * g.z;
+        const bool fits = g.x <= 0x3fffffffu / max(g.y, 1u) && g.x * g.y <= 0x3fffffffu / max(g.z, 1u) &&
+                          group_total <= (1u << 30u) / threads_per_group &&
+                          (pc.max_total == 0u || group_total <= pc.max_total);
+        if (!fits) {
+            total = uvec3(0u);
+        }
+        groups[pc.output_dword + 0u] = total.x;
+        groups[pc.output_dword + 1u] = total.y;
+        groups[pc.output_dword + 2u] = total.z;
+        groups[pc.output_dword + 4u] = fits ? group_total * threads_per_group : 0u;
+        groups[pc.output_dword + 5u] = 1u;
+        groups[pc.output_dword + 6u] = 1u;
+        return;
+    }
     uvec3 g = uvec3(GroupCount(threads.x, pc.local_size_x), GroupCount(threads.y, pc.local_size_y),
                     GroupCount(threads.z, pc.local_size_z));
     if (pc.max_total != 0u) {

@@ -10,7 +10,6 @@
 # EXTRA       text hashed with the files (compiler, build type)
 # OUTPUT      the generated header
 # STAMP       touched at every run
-# VERSION_OVERRIDE  optional: 16 hex digits used instead of the hash (KYTY_SHADER_CACHE_SOURCE_VERSION)
 #
 # The project headers the seeds include are followed transitively and hashed too. The KYTY_*
 # environment switches named in the shader sources are listed, so the session key can record
@@ -93,11 +92,6 @@ endforeach()
 
 string(SHA256 version "${manifest}")
 string(SUBSTRING "${version}" 0 16 version)
-if(VERSION_OVERRIDE)
-	# A rebuild of a release whose recompiler sources are unchanged in content but were checked
-	# out with other line endings keeps the release's version, so its shader caches stay valid.
-	set(version "${VERSION_OVERRIDE}")
-endif()
 list(REMOVE_DUPLICATES switches)
 list(SORT switches)
 list(APPEND switches "\"\"")

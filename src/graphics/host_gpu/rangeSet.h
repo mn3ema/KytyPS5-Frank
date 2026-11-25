@@ -7,8 +7,11 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -42,9 +45,9 @@ public:
 		while (it != m_ranges.end() && it->first <= last) {
 			begin = std::min(begin, it->first);
 			last  = std::max(last, it->second);
-			it    = m_ranges.erase(it);
+			it    = Erase(it);
 		}
-		m_ranges.emplace(begin, last);
+		Emplace(begin, last);
 		if (m_filter) {
 			m_filter->Mark(address, end);
 		}
@@ -59,12 +62,12 @@ public:
 		while (it != m_ranges.end() && it->first < end) {
 			const auto begin = it->first;
 			const auto last  = it->second;
-			it               = m_ranges.erase(it);
+			it               = Erase(it);
 			if (begin < address) {
-				m_ranges.emplace(begin, address);
+				Emplace(begin, address);
 			}
 			if (last > end) {
-				m_ranges.emplace(end, last);
+				Emplace(end, last);
 				break;
 			}
 		}
@@ -260,7 +263,48 @@ private:
 		return address + size;
 	}
 
-	std::map<uint64_t, uint64_t> m_ranges;
+	// v438zl: a removed range's map node is kept (up to MaxSpare) and the next added range reuses
+	// it, so a set that changes all the time (the GPU-written ranges: marked at every writing
+	// dispatch, cleared at every download) stops going to the heap twice per change. In the fight
+	// 48-byte nodes from the obtain and dispatch paths were ~110,000 of 1.2 million allocations a
+	// second (A6, 2026-11-16). The map's content and order are those of erase and emplace: an
+	// extracted node re-inserted under a new key is what emplace would have made, and emplace's
+	// "the key is already there: nothing changes" is insert's too (the node is then dropped).
+	// Spare nodes are not copied; a move takes them along.
+	// KYTY_RANGE_NODE_REUSE=0 turns it off (for an A/B).
+	using Map = std::map<uint64_t, uint64_t>;
+	static constexpr size_t MaxSpare = 64;
+	static bool NodeReuse() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_RANGE_NODE_REUSE");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	Map::iterator Erase(Map::iterator it) {
+		const auto next = std::next(it);
+		if (NodeReuse() && m_spare.size() < MaxSpare) {
+			m_spare.push_back(m_ranges.extract(it));
+		} else {
+			m_ranges.erase(it);
+		}
+		return next;
+	}
+	void Emplace(uint64_t begin, uint64_t last) {
+		if (m_spare.empty()) {
+			m_ranges.emplace(begin, last);
+			return;
+		}
+		auto node = std::move(m_spare.back());
+		m_spare.pop_back();
+		node.key()    = begin;
+		node.mapped() = last;
+		m_ranges.insert(std::move(node));
+	}
+
+	Map                          m_ranges;
+	std::vector<Map::node_type>  m_spare;
 	std::unique_ptr<Filter>      m_filter;
 };
 

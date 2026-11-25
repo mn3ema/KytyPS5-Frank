@@ -293,13 +293,12 @@ void Inst::RemoveUse(Inst* used, size_t operand) {
 	list.erase(std::next(found).base());
 }
 
-void Inst::ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
-                                 std::vector<Inst*>& touched) {
+void Inst::ReplaceUsesForRemoval(Value replacement, std::vector<Inst*>& touched) {
 	auto  old_uses         = std::move(uses);
 	auto* replacement_inst = replacement.TryInstruction();
 	uses.clear();
 	for (const auto& use: old_uses) {
-		if (use.user == this || removed.contains(use.user)) {
+		if (use.user == this || use.user->removed) {
 			continue;
 		}
 		EXIT_IF(use.operand >= use.user->NumArgs() ||
@@ -315,19 +314,19 @@ void Inst::ReplaceUsesForRemoval(Value replacement, const std::unordered_set<con
 		}
 	}
 	ResetArgStorage();
-	opcode = ValueOpcode::Void;
+	opcode  = ValueOpcode::Void;
+	removed = true;
 }
 
-void Inst::DropRemovedUses(std::span<Inst* const>              touched,
-                           const std::unordered_set<const Inst*>& removed) {
+void Inst::DropRemovedUses(std::span<Inst* const> touched) {
 	// Each target once: a value many identities folded into would be filtered once per identity.
 	std::vector<Inst*> targets(touched.begin(), touched.end());
 	std::ranges::sort(targets);
 	targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
 	for (auto* target: targets) {
-		// A removed target is erased already; the others drop their removed users in one pass.
-		if (!removed.contains(target)) {
-			std::erase_if(target->uses, [&](const Use& use) { return removed.contains(use.user); });
+		// A removed target is erased with the others; the rest drop their removed users in one pass.
+		if (!target->removed) {
+			std::erase_if(target->uses, [](const Use& use) { return use.user->removed; });
 		}
 	}
 }

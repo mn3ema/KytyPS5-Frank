@@ -290,6 +290,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
@@ -442,6 +444,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
+	"${gpu_tiler_shader_dir}/gpu_pssr_linear.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -461,6 +464,149 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	list(APPEND gpu_blit_shader_headers "${shader_header}")
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
+
+# FSR 3.1's passes (3rdparty/FidelityFX-SDK), one SPIR-V per permutation Kyty's contexts ask for:
+# HDR colour and render-size motion vectors without jitter; inverted depth and the Lanczos LUT vary.
+set(fsr3_shader_dir "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/fsr3upscaler")
+set(fsr3_gpu_dir "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/include/FidelityFX/gpu")
+set(fsr3_generated_dir "${PROJECT_BINARY_DIR}/fsr3_shaders")
+file(GLOB_RECURSE fsr3_shader_includes CONFIGURE_DEPENDS "${fsr3_gpu_dir}/*.h")
+set(fsr3_headers "")
+set(fsr3_includes "")
+set(fsr3_table "")
+# FfxFsr3UpscalerPass ids and their shaders; 7 is the accumulate pass with sharpening.
+foreach(entry "0:prepare_inputs" "1:luma_pyramid" "2:shading_change_pyramid" "3:shading_change"
+              "4:prepare_reactivity" "5:luma_instability" "6:accumulate" "7:accumulate" "8:rcas"
+              "9:debug_view" "10:autogen_reactive")
+	string(REPLACE ":" ";" entry "${entry}")
+	list(GET entry 0 pass)
+	list(GET entry 1 pass_file)
+	set(sharpen 0)
+	if(pass EQUAL 7)
+		set(sharpen 1)
+	endif()
+	foreach(inverted 0 1)
+		foreach(lut 0 1)
+			# FSR3UPSCALER_SHADER_PERMUTATION_*: LUT 1, HDR 2, low-res motion 4, inverted depth 16, sharpening 32.
+			math(EXPR bits "${lut} + 2 + 4 + ${inverted} * 16 + ${sharpen} * 32")
+			set(symbol "FSR3_${pass}_${bits}")
+			set(header "${fsr3_generated_dir}/fsr3_${pass}_${bits}.h")
+			set(source "${fsr3_shader_dir}/ffx_fsr3upscaler_${pass_file}_pass.glsl")
+			# The defines the SDK's own build passes (CMakeCompileFSR3UpscalerShaders.txt), then the permutation's.
+			add_custom_command(
+				OUTPUT "${header}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${fsr3_generated_dir}"
+				COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -S comp -e main -Os
+				        -DFFX_GLSL=1 -DFFX_GPU=1
+				        -DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0
+				        -DFFX_FSR3UPSCALER_OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0
+				        -DFFX_FSR3UPSCALER_OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1
+				        -DFFX_FSR3UPSCALER_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0
+				        -DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2
+				        -DFFX_FSR3UPSCALER_OPTION_REPROJECT_USE_LANCZOS_TYPE=${lut}
+				        -DFFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT=1
+				        -DFFX_FSR3UPSCALER_OPTION_LOW_RESOLUTION_MOTION_VECTORS=1
+				        -DFFX_FSR3UPSCALER_OPTION_JITTERED_MOTION_VECTORS=0
+				        -DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=${inverted}
+				        -DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING=${sharpen}
+				        "-I${fsr3_gpu_dir}" "-I${fsr3_gpu_dir}/fsr3upscaler" --vn ${symbol}
+				        -o "${header}" "${source}"
+				DEPENDS "${source}" ${fsr3_shader_includes}
+				VERBATIM
+			)
+			list(APPEND fsr3_headers "${header}")
+			string(APPEND fsr3_includes "#include \"fsr3_${pass}_${bits}.h\"\n")
+			string(APPEND fsr3_table "\t{${pass}, ${bits}, ${symbol}, sizeof(${symbol})},\n")
+		endforeach()
+	endforeach()
+endforeach()
+file(CONFIGURE OUTPUT "${fsr3_generated_dir}/fsr3_permutations.h" @ONLY CONTENT
+"#pragma once\n#include <cstddef>\n#include <cstdint>\n${fsr3_includes}
+struct Fsr3Permutation {\n\tuint32_t pass;\n\tuint32_t bits;\n\tconst uint32_t* code;\n\tsize_t size;\n};
+static const Fsr3Permutation FSR3_PERMUTATIONS[] = {\n${fsr3_table}};\n")
+list(APPEND kyty_emulator_src ${fsr3_headers})
+
+# Frame generation's passes (3rdparty/FidelityFX-SDK, FSR 3.1): frame interpolation with
+# render-size motion vectors without jitter, inverted depth varying; optical flow with SDR input
+# bits (its colour is read through a transfer function at run time).
+set(fsr3_fg_headers "")
+set(fsr3_fg_includes "")
+set(fsr3_fi_table "")
+set(fsr3_of_table "")
+# FfxFrameInterpolationPass ids and their shaders.
+foreach(entry "0:reconstruct_and_dilate" "1:setup" "2:reconstruct_previous_depth" "3:game_motion_vector_field"
+              "4:optical_flow_vector_field" "5:disocclusion_mask" "6:-" "7:compute_inpainting_pyramid" "8:inpainting"
+              "9:compute_game_vector_field_inpainting_pyramid" "10:debug_view")
+	string(REPLACE ":" ";" entry "${entry}")
+	list(GET entry 0 pass)
+	list(GET entry 1 pass_file)
+	if(NOT pass_file STREQUAL "-") # pass 6, interpolation itself, is ffx_frameinterpolation_pass.glsl
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_${pass_file}_pass.glsl")
+	else()
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/frameinterpolation/ffx_frameinterpolation_pass.glsl")
+	endif()
+	foreach(inverted 0 1)
+		# FRAMEINTERPOLATION_SHADER_PERMUTATION_*: low-res motion 1, jittered motion 2, inverted depth 4.
+		math(EXPR bits "1 + ${inverted} * 4")
+		set(symbol "FSR3_FI_${pass}_${bits}")
+		set(header "${fsr3_generated_dir}/fsr3_fi_${pass}_${bits}.h")
+		# The defines of the SDK's build (CMakeCompileFrameinterpolationShaders.txt), then the permutation's.
+		add_custom_command(
+			OUTPUT "${header}"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${fsr3_generated_dir}"
+			COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -S comp -e main -Os
+			        -DFFX_GLSL=1 -DFFX_GPU=1
+			        -DFFX_FRAMEINTERPOLATION_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1
+			        -DFFX_FRAMEINTERPOLATION_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2
+			        -DFFX_FRAMEINTERPOLATION_OPTION_LOW_RES_MOTION_VECTORS=1
+			        -DFFX_FRAMEINTERPOLATION_OPTION_JITTER_MOTION_VECTORS=0
+			        -DFFX_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH=${inverted}
+			        "-I${fsr3_gpu_dir}" "-I${fsr3_gpu_dir}/frameinterpolation" --vn ${symbol}
+			        -o "${header}" "${source}"
+			DEPENDS "${source}" ${fsr3_shader_includes}
+			VERBATIM
+		)
+		list(APPEND fsr3_fg_headers "${header}")
+		string(APPEND fsr3_fg_includes "#include \"fsr3_fi_${pass}_${bits}.h\"\n")
+		string(APPEND fsr3_fi_table "\t{${pass}, ${bits}, ${symbol}, sizeof(${symbol})},\n")
+	endforeach()
+endforeach()
+# FfxOpticalflowPass ids and their shaders.
+foreach(entry "0:prepare_luma" "1:compute_luminance_pyramid" "2:generate_scd_histogram" "3:compute_scd_divergence"
+              "4:compute_optical_flow_advanced_pass_v5" "5:filter_optical_flow_pass_v5" "6:scale_optical_flow_advanced_pass_v5")
+	string(REPLACE ":" ";" entry "${entry}")
+	list(GET entry 0 pass)
+	list(GET entry 1 pass_file)
+	string(REGEX REPLACE "_pass_v5$" "" pass_stem "${pass_file}")
+	if(pass_stem STREQUAL pass_file)
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/opticalflow/ffx_opticalflow_${pass_file}_pass.glsl")
+	else()
+		set(source "${KYTY_THIRD_PARTY_DIR}/FidelityFX-SDK/sdk/src/backends/vk/shaders/opticalflow/ffx_opticalflow_${pass_file}.glsl")
+	endif()
+	set(symbol "FSR3_OF_${pass}_0")
+	set(header "${fsr3_generated_dir}/fsr3_of_${pass}_0.h")
+	add_custom_command(
+		OUTPUT "${header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${fsr3_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -S comp -e main -Os
+		        -DFFX_GLSL=1 -DFFX_GPU=1 -DFFX_OPTICALFLOW_OPTION_HDR_COLOR_INPUT=0
+		        "-I${fsr3_gpu_dir}" "-I${fsr3_gpu_dir}/opticalflow" --vn ${symbol}
+		        -o "${header}" "${source}"
+		DEPENDS "${source}" ${fsr3_shader_includes}
+		VERBATIM
+	)
+	list(APPEND fsr3_fg_headers "${header}")
+	string(APPEND fsr3_fg_includes "#include \"fsr3_of_${pass}_0.h\"\n")
+	string(APPEND fsr3_of_table "\t{${pass}, 0, ${symbol}, sizeof(${symbol})},\n")
+endforeach()
+file(CONFIGURE OUTPUT "${fsr3_generated_dir}/fsr3_fg_permutations.h" @ONLY CONTENT
+"#pragma once\n#include \"fsr3_permutations.h\"\n${fsr3_fg_includes}
+static const Fsr3Permutation FSR3_FI_PERMUTATIONS[] = {\n${fsr3_fi_table}};
+static const Fsr3Permutation FSR3_OF_PERMUTATIONS[] = {\n${fsr3_of_table}};\n")
+list(APPEND kyty_emulator_src ${fsr3_fg_headers})
 
 # The shader disk cache's source version (src/shader_cache_version.cmake): a hash over the files
 # the shader recompiler is built from and the project headers they include, computed at build
@@ -498,9 +644,6 @@ file(GLOB_RECURSE shader_cache_headers CONFIGURE_DEPENDS
 set(shader_cache_seeds_file "${PROJECT_BINARY_DIR}/shaderCacheSeeds.txt")
 list(JOIN shader_cache_seeds "\n" shader_cache_seeds_text)
 file(CONFIGURE OUTPUT "${shader_cache_seeds_file}" CONTENT "${shader_cache_seeds_text}\n" @ONLY)
-# Empty: the hash. A release rebuilt from the same recompiler sources on a checkout with other line
-# endings can name the release's version here (16 hex digits) to keep its shader caches valid.
-set(KYTY_SHADER_CACHE_SOURCE_VERSION "" CACHE STRING "Shader disk cache source version override (empty: hash of the sources)")
 set(shader_cache_version_header "${PROJECT_BINARY_DIR}/shaderCacheVersion.h")
 set(shader_cache_version_stamp "${PROJECT_BINARY_DIR}/shaderCacheVersion.stamp")
 add_custom_command(
@@ -513,7 +656,6 @@ add_custom_command(
 	        "-DEXTRA=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE} ${CMAKE_SYSTEM_PROCESSOR}"
 	        "-DOUTPUT=${shader_cache_version_header}"
 	        "-DSTAMP=${shader_cache_version_stamp}"
-	        "-DVERSION_OVERRIDE=${KYTY_SHADER_CACHE_SOURCE_VERSION}"
 	        -P "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
 	DEPENDS ${shader_cache_seeds} ${shader_cache_headers} "${shader_cache_seeds_file}"
 	        "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
@@ -532,7 +674,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+set(kyty_emulator_link_libraries common Vulkan::Headers fidelityfx_fsr3 spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 
 # Linux system libraries.
 if(LINUX)
@@ -550,6 +692,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
+	${KYTY_THIRD_PARTY_DIR}/ffx-api
 )
 
 if (KYTY_CLANG_CL)

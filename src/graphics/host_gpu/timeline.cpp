@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <memory>
 #include <mutex>
 #include "common/profiler.h"
@@ -178,34 +179,8 @@ void Present(uint64_t frame) {
 
 namespace Libs::Graphics::CpuCost {
 
-bool Enabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_CPU_COST");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
-}
-
 namespace {
-struct CostEntry {
-	uint64_t count = 0;
-	uint64_t ns    = 0;
-};
-std::mutex& CostMutex() {
-	static std::mutex mutex;
-	return mutex;
-}
-// (kind, phase name) -> time; the names are string literals.
-std::map<std::pair<char, std::string_view>, CostEntry>& Phases() {
-	static std::map<std::pair<char, std::string_view>, CostEntry> phases;
-	return phases;
-}
-std::map<std::pair<char, std::string_view>, CostEntry>& SelfPhases() {
-	static std::map<std::pair<char, std::string_view>, CostEntry> phases;
-	return phases;
-}
-// KYTY_HITCH_COST_MS: the same two tables for the guest frame in progress (FrameEnd). The
-// phases by the address of their name (a string literal) and the kind: one hash lookup a phase.
+
 int64_t HitchCostMs() {
 	static const int64_t ms = [] {
 		const char* value = std::getenv("KYTY_HITCH_COST_MS");
@@ -213,181 +188,315 @@ int64_t HitchCostMs() {
 	}();
 	return ms;
 }
-struct FramePhase {
-	const char* name  = nullptr;
-	char        kind  = 0;
-	uint64_t    count = 0;
-	uint64_t    ns    = 0;
-};
-std::unordered_map<uint64_t, FramePhase>& FrameSelfPhases() {
-	static std::unordered_map<uint64_t, FramePhase> phases;
-	return phases;
-}
-std::unordered_map<uint64_t, CostEntry>& FrameEntries() {
-	static std::unordered_map<uint64_t, CostEntry> entries;
-	return entries;
-}
-} // namespace
 
-void FrameEnd(double frame_ms) {
-	if (!Enabled() || HitchCostMs() <= 0) {
-		return;
+// The guest frame count and the last frame's length, written by the flip (the presenter's
+// thread) and read by the recording threads.
+std::atomic<uint64_t> g_frame_count {0};
+std::atomic<uint64_t> g_frame_us {0};
+std::atomic<uint32_t> g_hitches_printed {0};
+
+// The calling thread's user and kernel CPU time so far, in ns.
+void ThreadCpuNs(uint64_t out[2]) {
+	out[0] = out[1] = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	FILETIME creation {}, exited {}, kernel {}, user {};
+	if (GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user) != 0) {
+		out[0] = ((static_cast<uint64_t>(user.dwHighDateTime) << 32u) | user.dwLowDateTime) * 100u;
+		out[1] = ((static_cast<uint64_t>(kernel.dwHighDateTime) << 32u) | kernel.dwLowDateTime) * 100u;
 	}
-	std::string text;
-	{
-		std::lock_guard lock(CostMutex());
-		static uint32_t printed = 0;
-		if (frame_ms >= static_cast<double>(HitchCostMs()) && printed < 400) {
-			printed++;
-			// One literal can have several addresses (one per file that names the phase): merged here.
-			std::map<std::pair<char, std::string_view>, CostEntry> merged;
-			for (const auto& entry: FrameSelfPhases()) {
-				auto& m = merged[{entry.second.kind, std::string_view(entry.second.name)}];
-				m.count += entry.second.count;
-				m.ns    += entry.second.ns;
+#else
+	timespec ts {};
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+		out[0] = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+	}
+#endif
+}
+
+struct Row {
+	uint64_t count = 0;
+	uint64_t ticks = 0;
+	uint64_t self  = 0;
+};
+using RowKey = std::pair<char, std::string_view>;
+
+// [hitch-cost]: the frame that just ended, from the frame fields, which are then cleared.
+void FrameReport(Detail::ThreadTable& table, uint64_t frame_count, double ns_per_tick) {
+	table.frame_seen     = frame_count;
+	const double frame_ms = static_cast<double>(g_frame_us.load(std::memory_order_relaxed)) / 1e3;
+	std::string  text;
+	if (frame_ms >= static_cast<double>(HitchCostMs()) &&
+	    g_hitches_printed.fetch_add(1, std::memory_order_relaxed) < 400u) {
+		// One literal can have several addresses (one per file that names the phase): merged here.
+		std::map<RowKey, Row> merged;
+		for (const auto& slot: table.phases) {
+			if (slot.name != nullptr && slot.frame_count != 0) {
+				auto& m = merged[{slot.kind, std::string_view(slot.name)}];
+				m.count += slot.frame_count;
+				m.self  += slot.frame_self;
 			}
-			std::vector<std::pair<std::pair<char, std::string_view>, CostEntry>> self(merged.begin(), merged.end());
-			std::sort(self.begin(), self.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-			uint64_t total_ns = 0;
-			for (const auto& entry: self) {
-				total_ns += entry.second.ns;
-			}
-			char line[224];
-			std::snprintf(line, sizeof(line), "[hitch-cost] frame %.0f ms: GPU-thread phases %.0f ms (self time, ms x calls):",
-			              frame_ms, static_cast<double>(total_ns) / 1e6);
-			text += line;
-			for (size_t i = 0; i < self.size() && i < 16 && self[i].second.ns >= 500000u; i++) {
-				std::snprintf(line, sizeof(line), " %c %.*s %.1f x%llu |", self[i].first.first,
-				              static_cast<int>(self[i].first.second.size()), self[i].first.second.data(),
-				              static_cast<double>(self[i].second.ns) / 1e6,
-				              static_cast<unsigned long long>(self[i].second.count));
-				text += line;
-			}
-			text += "\n";
-			std::vector<std::pair<uint64_t, CostEntry>> list(FrameEntries().begin(), FrameEntries().end());
-			std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-			text += "[hitch-cost]   heaviest draws (A..) and dispatches (X, I) by shader:";
-			for (size_t i = 0; i < list.size() && i < 10 && list[i].second.ns >= 500000u; i++) {
-				std::snprintf(line, sizeof(line), " %c %014llx %.1f x%llu |", static_cast<char>(list[i].first >> 56u),
-				              static_cast<unsigned long long>(list[i].first & ((uint64_t {1} << 56u) - 1u)),
-				              static_cast<double>(list[i].second.ns) / 1e6,
-				              static_cast<unsigned long long>(list[i].second.count));
-				text += line;
-			}
-			text += "\n";
 		}
-		FrameSelfPhases().clear();
-		FrameEntries().clear();
+		std::vector<std::pair<RowKey, Row>> self(merged.begin(), merged.end());
+		std::sort(self.begin(), self.end(), [](const auto& a, const auto& b) { return a.second.self > b.second.self; });
+		uint64_t total = 0;
+		for (const auto& entry: self) {
+			total += entry.second.self;
+		}
+		const double ms_per_tick = ns_per_tick / 1e6;
+		char         line[224];
+		std::snprintf(line, sizeof(line), "[hitch-cost] frame %.0f ms: GPU-thread phases %.0f ms (self time, ms x calls):",
+		              frame_ms, static_cast<double>(total) * ms_per_tick);
+		text += line;
+		for (size_t i = 0; i < self.size() && i < 16 && static_cast<double>(self[i].second.self) * ms_per_tick >= 0.5;
+		     i++) {
+			std::snprintf(line, sizeof(line), " %c %.*s %.1f x%llu |", self[i].first.first,
+			              static_cast<int>(self[i].first.second.size()), self[i].first.second.data(),
+			              static_cast<double>(self[i].second.self) * ms_per_tick,
+			              static_cast<unsigned long long>(self[i].second.count));
+			text += line;
+		}
+		text += "\n";
+		std::vector<Detail::CostSlot> list;
+		for (const auto& slot: table.costs) {
+			if (slot.key != 0 && slot.frame_count != 0) {
+				list.push_back(slot);
+			}
+		}
+		std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.frame_ticks > b.frame_ticks; });
+		text += "[hitch-cost]   heaviest draws (A..) and dispatches (X, I) by shader:";
+		for (size_t i = 0; i < list.size() && i < 10 && static_cast<double>(list[i].frame_ticks) * ms_per_tick >= 0.5;
+		     i++) {
+			std::snprintf(line, sizeof(line), " %c %014llx %.1f x%llu |", static_cast<char>(list[i].key >> 56u),
+			              static_cast<unsigned long long>(list[i].key & ((uint64_t {1} << 56u) - 1u)),
+			              static_cast<double>(list[i].frame_ticks) * ms_per_tick,
+			              static_cast<unsigned long long>(list[i].frame_count));
+			text += line;
+		}
+		text += "\n";
+	}
+	for (auto& slot: table.phases) {
+		slot.frame_count = slot.frame_self = 0;
+	}
+	table.phase_overflow.frame_count = table.phase_overflow.frame_self = 0;
+	for (auto& slot: table.costs) {
+		slot.frame_count = slot.frame_ticks = 0;
 	}
 	if (!text.empty()) {
 		std::fputs(text.c_str(), stderr);
 	}
 }
 
+// ns per tick of the window so far (the time-stamp counter against the steady clock).
+double NsPerTick(const Detail::ThreadTable& table, std::chrono::steady_clock::time_point now, uint64_t ticks_now) {
+	const auto ticks = ticks_now - table.window_ticks;
+	const auto ns    = std::chrono::duration<double, std::nano>(now - table.window_time).count();
+	return ticks != 0 && ns > 0.0 ? ns / static_cast<double>(ticks) : 1.0;
+}
+
+} // namespace
+
+namespace Detail {
+
+ThreadTable* CreateTable() {
+	auto* table        = new ThreadTable(); // one per recording thread, never freed
+	table->window_time  = std::chrono::steady_clock::now();
+	table->window_ticks = Ticks();
+	table->gpu_thread   = OnGpuThread();
+	table->frame_seen   = g_frame_count.load(std::memory_order_relaxed);
+	ThreadCpuNs(table->window_cpu_ns);
+	t_table = table;
+	return table;
+}
+
+void Report(ThreadTable& table) {
+	const auto   now       = std::chrono::steady_clock::now();
+	const auto   ticks_now = Ticks();
+	const double s         = std::chrono::duration<double>(now - table.window_time).count();
+	if (s <= 0.0) {
+		return;
+	}
+	const double ns_per_tick = NsPerTick(table, now, ticks_now);
+	const auto   ms_per_s    = [&](uint64_t ticks) { return static_cast<double>(ticks) * ns_per_tick / 1e6 / s; };
+	const auto   avg_us      = [&](uint64_t ticks, uint64_t count) {
+        return count != 0 ? static_cast<double>(ticks) * ns_per_tick / 1e3 / static_cast<double>(count) : 0.0;
+	};
+	const char* const thread = table.gpu_thread ? "" : " (not the GPU thread)";
+	std::string       text   = std::string("[cpu-cost] by kind") + thread + ":";
+	uint64_t          scope_ticks = 0;
+	char              line[256];
+	for (size_t i = 0; i < 128; i++) {
+		if (table.kind_count[i] == 0) continue;
+		std::snprintf(line, sizeof(line), " %c %.0f/s %.1f ms/s |", static_cast<char>(i),
+		              static_cast<double>(table.kind_count[i]) / s, ms_per_s(table.kind_ticks[i]));
+		text += line;
+		scope_ticks += table.kind_ticks[i];
+		table.kind_count[i] = table.kind_ticks[i] = 0;
+	}
+	text += "\n";
+	{
+		std::vector<CostSlot> list;
+		for (const auto& slot: table.costs) {
+			if (slot.key != 0 && slot.count != 0) {
+				list.push_back(slot);
+			}
+		}
+		if (table.cost_overflow.count != 0) {
+			list.push_back(table.cost_overflow);
+		}
+		std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.ticks > b.ticks; });
+		for (size_t i = 0; i < list.size() && i < 30; i++) {
+			std::snprintf(line, sizeof(line), "[cpu-cost]   %c %014llx %7.0f/s %6.2f ms/s avg %6.1f us\n",
+			              list[i].key != 0 ? static_cast<char>(list[i].key >> 56u) : '?',
+			              static_cast<unsigned long long>(list[i].key & ((uint64_t {1} << 56u) - 1u)),
+			              static_cast<double>(list[i].count) / s, ms_per_s(list[i].ticks),
+			              avg_us(list[i].ticks, list[i].count));
+			text += line;
+		}
+		// Programs change from window to window: the table starts empty again.
+		for (auto& slot: table.costs) {
+			slot = {};
+		}
+		table.cost_overflow = {};
+		table.costs_used    = 0;
+	}
+	// One literal can have several addresses (one per file that names the phase): merged by text.
+	std::map<RowKey, Row> merged;
+	const auto            merge = [&](PhaseSlot& slot, const char* name) {
+        if (slot.count == 0) {
+            return;
+        }
+        auto& m = merged[{slot.kind != 0 ? slot.kind : '?', std::string_view(name)}];
+        m.count += slot.count;
+        m.ticks += slot.ticks;
+        m.self  += slot.self_ticks;
+        slot.count = slot.ticks = slot.self_ticks = 0;
+	};
+	for (auto& slot: table.phases) {
+		if (slot.name != nullptr) {
+			merge(slot, slot.name);
+		}
+	}
+	const bool overflowed = table.phase_overflow.count != 0;
+	merge(table.phase_overflow, "(phase table full)");
+	std::vector<std::pair<RowKey, Row>> rows(merged.begin(), merged.end());
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+	for (const auto& [key, row]: rows) {
+		std::snprintf(line, sizeof(line), "[cpu-phase]   %c %-40.*s %8.0f/s %7.2f ms/s avg %6.1f us\n", key.first,
+		              static_cast<int>(key.second.size()), key.second.data(), static_cast<double>(row.count) / s,
+		              ms_per_s(row.ticks), avg_us(row.ticks, row.count));
+		text += line;
+	}
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.self > b.second.self; });
+	uint64_t self_sum = 0, self_outside = 0, self_wait = 0;
+	for (const auto& [key, row]: rows) {
+		std::snprintf(line, sizeof(line), "[cpu-self]    %c %-40.*s %8.0f/s %7.2f ms/s avg %6.1f us\n", key.first,
+		              static_cast<int>(key.second.size()), key.second.data(), static_cast<double>(row.count) / s,
+		              ms_per_s(row.self), avg_us(row.self, row.count));
+		text += line;
+		self_sum += row.self;
+		if (key.first == '.') {
+			self_outside += row.self;
+		}
+		// The GPU thread's own waits for work (graphicsRun.cpp, "Thread::Wait...").
+		if (key.second.substr(0, 12) == "Thread::Wait") {
+			self_wait += row.self;
+		}
+	}
+	// What one record costs: two counter reads and a slot lookup, measured here.
+	double record_ns = 0.0;
+	{
+		constexpr uint32_t Rounds = 2048;
+		uint64_t           sink   = 0;
+		const auto         begin  = Ticks();
+		for (uint32_t i = 0; i < Rounds; i++) {
+			const auto a = Ticks();
+			sink += FindPhase(table, ScopeSelfName, 'D').count;
+			sink += Ticks() - a;
+		}
+		record_ns = static_cast<double>(Ticks() - begin) * ns_per_tick / Rounds + static_cast<double>(sink & 1u) * 0.0;
+	}
+	uint64_t cpu_ns[2];
+	ThreadCpuNs(cpu_ns);
+	const double user_ms   = static_cast<double>(cpu_ns[0] - table.window_cpu_ns[0]) / 1e6 / s;
+	const double kernel_ms = static_cast<double>(cpu_ns[1] - table.window_cpu_ns[1]) / 1e6 / s;
+	const double sum_ms    = ms_per_s(self_sum);
+	const double wait_ms   = ms_per_s(self_wait);
+	std::snprintf(line, sizeof(line),
+	              "[cpu-total]%s window %.2f s: wall 1000.0 ms/s | thread CPU %.1f ms/s (user %.1f, kernel %.1f) | "
+	              "self times sum %.1f ms/s = %.1f%% of wall",
+	              thread, s, user_ms + kernel_ms, user_ms, kernel_ms, sum_ms, sum_ms / 10.0);
+	text += line;
+	std::snprintf(line, sizeof(line),
+	              " (waiting for work %.1f, working %.1f: outside draws and dispatches '.' %.1f, inside %.1f) | "
+	              "draws and dispatches by kind %.1f ms/s",
+	              wait_ms, sum_ms - wait_ms, ms_per_s(self_outside) - wait_ms, sum_ms - ms_per_s(self_outside),
+	              ms_per_s(scope_ticks));
+	text += line;
+	std::snprintf(line, sizeof(line),
+	              " | rows %zu%s | profiler: %.0f records/s x %.0f ns = about %.1f ms/s inside these numbers\n",
+	              rows.size(), overflowed ? " (PHASE TABLE FULL)" : "", static_cast<double>(table.records) / s, record_ns,
+	              static_cast<double>(table.records) / s * record_ns / 1e6);
+	text += line;
+	table.records      = 0;
+	table.window_time  = now;
+	table.window_ticks = ticks_now;
+	table.window_cpu_ns[0] = cpu_ns[0];
+	table.window_cpu_ns[1] = cpu_ns[1];
+	std::fputs(text.c_str(), stderr);
+}
+
+} // namespace Detail
+
+void FrameEnd(double frame_ms) {
+	if (!Enabled() || HitchCostMs() <= 0) {
+		return;
+	}
+	g_frame_us.store(static_cast<uint64_t>(frame_ms * 1e3), std::memory_order_relaxed);
+	g_frame_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool OnGpuThread() {
 	return Profiler::t_gpu_thread;
 }
 
-void RecordPhase(char kind, const char* name, uint64_t ns) {
-	std::lock_guard lock(CostMutex());
-	auto& e = Phases()[{kind, std::string_view(name)}];
-	e.count++;
-	e.ns += ns;
-}
-
-void RecordPhaseSelf(char kind, const char* name, uint64_t ns) {
-	std::lock_guard lock(CostMutex());
-	auto& e = SelfPhases()[{kind, std::string_view(name)}];
-	e.count++;
-	e.ns += ns;
-	if (HitchCostMs() > 0) {
-		auto& f = FrameSelfPhases()[(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(name)) << 8u) |
-		                            static_cast<uint8_t>(kind)];
-		f.name = name;
-		f.kind = kind;
-		f.count++;
-		f.ns += ns;
+void Record(char kind, uint64_t hash, uint64_t ticks) {
+	auto&      table = Detail::Table();
+	const auto key   = (static_cast<uint64_t>(static_cast<uint8_t>(kind)) << 56u) | (hash & ((uint64_t {1} << 56u) - 1u));
+	Detail::CostSlot* found = &table.cost_overflow;
+	auto index = static_cast<size_t>((key * 0x9e3779b97f4a7c15ull) >> 40u) & (Detail::CostSlotCount - 1u);
+	for (size_t probe = 0; probe < 64; probe++, index = (index + 1u) & (Detail::CostSlotCount - 1u)) {
+		auto& slot = table.costs[index];
+		if (slot.key == key) {
+			found = &slot;
+			break;
+		}
+		if (slot.key == 0) {
+			if (table.costs_used < Detail::CostSlotCount / 2u) {
+				table.costs_used++;
+				slot.key = key;
+				found    = &slot;
+			}
+			break;
+		}
 	}
-}
-
-void Record(char kind, uint64_t hash, uint64_t ns) {
-	using Entry = CostEntry;
-	static std::unordered_map<uint64_t, Entry>          entries;
-	static std::array<Entry, 128>                       kinds {};
-	static auto                                         window = std::chrono::steady_clock::now();
-	std::lock_guard                                     lock(CostMutex());
-	const auto key = (static_cast<uint64_t>(static_cast<uint8_t>(kind)) << 56u) ^ (hash & ((uint64_t {1} << 56u) - 1u));
-	auto&      e   = entries[key];
-	e.count++;
-	e.ns += ns;
-	auto& k = kinds[static_cast<uint8_t>(kind) & 127u];
-	k.count++;
-	k.ns += ns;
-	if (HitchCostMs() > 0) {
-		auto& f = FrameEntries()[key];
-		f.count++;
-		f.ns += ns;
+	found->count++;
+	found->ticks += ticks;
+	found->frame_count++;
+	found->frame_ticks += ticks;
+	table.kind_count[static_cast<uint8_t>(kind) & 127u]++;
+	table.kind_ticks[static_cast<uint8_t>(kind) & 127u] += ticks;
+	if (HitchCostMs() > 0 && table.gpu_thread) {
+		if (const auto frames = g_frame_count.load(std::memory_order_relaxed); frames != table.frame_seen) {
+			FrameReport(table, frames, NsPerTick(table, std::chrono::steady_clock::now(), Detail::Ticks()));
+		}
 	}
-	const auto now = std::chrono::steady_clock::now();
-	const auto s   = std::chrono::duration<double>(now - window).count();
-	if (s < 5.0) {
+	// The clock is read every 64th draw or dispatch.
+	static thread_local uint32_t calls = 0;
+	if ((++calls & 63u) != 0) {
 		return;
 	}
-	window = now;
-	std::string text = "[cpu-cost] by kind:";
-	for (size_t i = 0; i < kinds.size(); i++) {
-		if (kinds[i].count == 0) continue;
-		char line[128];
-		std::snprintf(line, sizeof(line), " %c %.0f/s %.1f ms/s |", static_cast<char>(i),
-		              static_cast<double>(kinds[i].count) / s, static_cast<double>(kinds[i].ns) / 1e6 / s);
-		text += line;
-		kinds[i] = {};
+	if (std::chrono::steady_clock::now() - table.window_time >= std::chrono::seconds(5)) {
+		Detail::Report(table);
 	}
-	std::vector<std::pair<uint64_t, Entry>> list(entries.begin(), entries.end());
-	std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-	text += "\n";
-	for (size_t i = 0; i < list.size() && i < 30; i++) {
-		char line[192];
-		std::snprintf(line, sizeof(line), "[cpu-cost]   %c %014llx %7.0f/s %6.2f ms/s avg %6.1f us\n",
-		              static_cast<char>(list[i].first >> 56u),
-		              static_cast<unsigned long long>(list[i].first & ((uint64_t {1} << 56u) - 1u)),
-		              static_cast<double>(list[i].second.count) / s,
-		              static_cast<double>(list[i].second.ns) / 1e6 / s,
-		              static_cast<double>(list[i].second.ns) / 1e3 / static_cast<double>(list[i].second.count));
-		text += line;
-	}
-	entries.clear();
-	{
-		std::vector<std::pair<std::pair<char, std::string_view>, Entry>> phases(Phases().begin(),
-		                                                                       Phases().end());
-		std::sort(phases.begin(), phases.end(),
-		          [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-		for (size_t i = 0; i < phases.size() && i < 60; i++) {
-			char line[192];
-			std::snprintf(line, sizeof(line), "[cpu-phase]   %c %-34.*s %8.0f/s %7.2f ms/s avg %6.1f us\n",
-			              phases[i].first.first, static_cast<int>(phases[i].first.second.size()),
-			              phases[i].first.second.data(), static_cast<double>(phases[i].second.count) / s,
-			              static_cast<double>(phases[i].second.ns) / 1e6 / s,
-			              static_cast<double>(phases[i].second.ns) / 1e3 /
-			                  static_cast<double>(phases[i].second.count));
-			text += line;
-		}
-		Phases().clear();
-		std::vector<std::pair<std::pair<char, std::string_view>, CostEntry>> self(SelfPhases().begin(),
-		                                                                         SelfPhases().end());
-		std::sort(self.begin(), self.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-		for (size_t i = 0; i < self.size() && i < 60; i++) {
-			char line[192];
-			std::snprintf(line, sizeof(line), "[cpu-self]    %c %-34.*s %8.0f/s %7.2f ms/s avg %6.1f us\n",
-			              self[i].first.first, static_cast<int>(self[i].first.second.size()),
-			              self[i].first.second.data(), static_cast<double>(self[i].second.count) / s,
-			              static_cast<double>(self[i].second.ns) / 1e6 / s,
-			              static_cast<double>(self[i].second.ns) / 1e3 / static_cast<double>(self[i].second.count));
-			text += line;
-		}
-		SelfPhases().clear();
-	}
-	std::fputs(text.c_str(), stderr);
 }
 
 } // namespace Libs::Graphics::CpuCost

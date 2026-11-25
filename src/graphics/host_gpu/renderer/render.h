@@ -9,6 +9,8 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/fsr3.h"
+#include "graphics/host_gpu/renderer/upscaler/upscaler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <source_location>
@@ -185,9 +187,18 @@ private:
 	friend class CommandScheduler;
 };
 
+// v445b (renderCompute.cpp): KYTY_DISPATCH_DELTA=0 turns the dispatch delta path off;
+// KYTY_DISPATCH_DELTA_VERIFY=1 also runs the full path and compares.
+[[nodiscard]] bool DispatchDeltaEnabled();
+[[nodiscard]] bool DispatchDeltaVerify();
+namespace Pssr {
+struct Request;
+}
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	// KYTY_DRAW_PIPE (drawPipe.h), the command processor: the programs a direct draw's
@@ -217,6 +228,7 @@ public:
 	[[nodiscard]] static size_t QueuedDispatchCount() noexcept;
 	// The CS address of the last queued dispatch (0: none queued).
 	[[nodiscard]] static uint64_t LastQueuedShader() noexcept;
+	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
@@ -260,6 +272,14 @@ public:
 	// False: draw it in full (nothing was recorded).
 	void BeginMultiDraw();
 	void EndMultiDraw();
+	// A base stands inside a multi-draw packet (the sub-draw just drawn in full captured one).
+	[[nodiscard]] bool MultiDrawBaseValid() const noexcept { return m_replay.active && m_replay.valid; }
+	// KYTY_RENDER_STATS census ([multi-packets], RenderStats::MultiPacketNote); nothing is drawn
+	// or changed by these. First: before a replayed packet's first sub-draw. End: before
+	// EndMultiDraw. Indexed: around an indexed packet's loop.
+	void CensusMultiDrawFirst(CommandBuffer& buffer);
+	void CensusMultiDrawEnd(CommandBuffer& buffer);
+	void CensusMultiDrawIndexed(bool inside) noexcept { m_replay.census_indexed = inside; }
 	[[nodiscard]] bool ReplayMultiDraw(uint64_t submit_id, CommandBuffer& buffer,
 	                                   uint32_t vertex_count, uint32_t instance_count,
 	                                   uint32_t first_vertex, uint32_t first_instance);
@@ -326,6 +346,24 @@ private:
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                                  Dlss::Inputs& inputs);
+
+	// A null feature is one the upscaler refused or failed.
+	struct UpscalerContext {
+		uint64_t                           context;
+		Dlss::Creation                     creation;
+		std::unique_ptr<Upscaler::Feature> feature;
+	};
+	[[nodiscard]] bool UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& request,
+	                              const Fsr3::Inputs& inputs);
+
+	// FSR 3.1 history of a PSSR context; a null fsr is one FSR refused or failed.
+	struct FsrContext {
+		uint64_t        context;
+		Fsr3::Creation  creation;
+		Fsr3::Context*  fsr;
+	};
 
 	// KYTY_MULTI_DRAW_REPLAY: called at the end of a draw recorded in full inside a multi-draw.
 	void CaptureReplayBase(CommandBuffer& buffer, const DrawCallInfo& draw, const DrawRenderState& state,
@@ -360,6 +398,68 @@ private:
 		int32_t                        stage0_push_start = -1;
 	};
 	LastCommit m_last_commit;
+
+	// v445b, KYTY_DISPATCH_DELTA (renderCompute.cpp): what the last guest dispatch recorded here
+	// resolved and left on the compute bind point. The next dispatch of the same shader on the same
+	// queue, in the same command buffer (tick), takes from it the read-only buffer bindings whose
+	// source is unchanged and CPU-clean, the pipeline, and pushes only the descriptors that differ.
+	struct DispatchDelta {
+		bool        valid      = false;
+		const void* owner      = nullptr; // the queue's compute registers (one per command processor)
+		const void* program    = nullptr; // ShaderStageRuntime::program
+		uint64_t    program_id = 0;
+		void*       pipeline   = nullptr; // PipelineCache::GetComputePipeline's
+		bool        thread_dimensions   = false;
+		bool        dimensions_indirect = false;
+		// As they were when the base's dispatch bound its pipeline (v445d: not at its end, which may
+		// come after a flush): the tick, the command buffer, the compute bind point's serial and the
+		// unregister epoch its bindings were resolved under; and the pipeline handle it bound.
+		uint64_t     tick = 0, unregister_epoch = 0, compute_serial = 0, command_serial = 0;
+		vk::Pipeline bound_pipeline;
+		std::vector<PreparedBindings::BufferSource> sources;
+		std::vector<vk::DescriptorBufferInfo>       buffers;
+		std::vector<uint32_t>                       shader_data;
+		// The writes last pushed to the compute bind point's set 0 under `layout`, flattened
+		// (PushDescriptorsDelta); writes_valid: they are what the bind point holds while
+		// compute_serial and tick stand.
+		bool                  writes_valid = false;
+		vk::PipelineLayout    layout;
+		size_t                write_count = 0;
+		std::vector<uint64_t> writes;
+	};
+	DispatchDelta        m_dispatch_delta;
+	const DispatchDelta* m_delta_reuse = nullptr; // set around RebindBuffers: slots may come from it
+	bool                 m_delta_push  = false;   // set around CommitBindings: push only what differs
+	uint32_t             m_delta_reused = 0, m_delta_pushed = 0, m_delta_writes = 0; // the last rebind's and commit's
+	std::vector<uint64_t>               m_delta_flat;    // PushDescriptorsDelta scratch
+	// KYTY_RENDER_STATS census ([draw-delta], descriptors.cpp): what the previous draw's stage at
+	// each position resolved. Nothing is bound from it.
+	std::array<DispatchDelta, 4> m_draw_census;
+	void NoteDrawDeltaBefore(uint32_t stage, const PreparedBindings& prepared);
+	void NoteDrawDeltaAfter(uint32_t stage, const PreparedBindings& prepared);
+	std::vector<vk::WriteDescriptorSet> m_delta_changed; // PushDescriptorsDelta scratch
+	std::vector<vk::DescriptorBufferInfo> m_delta_verify_buffers; // KYTY_DISPATCH_DELTA_VERIFY
+	std::vector<uint32_t>                 m_delta_verify_data;
+	[[nodiscard]] const DispatchDelta* DispatchDeltaBase(const void* owner, const ShaderComputeInputInfo& input,
+	                                                     const ShaderProgram& program) const;
+	[[nodiscard]] bool DispatchDeltaStateKept(const DispatchDelta* delta, const void* pipeline,
+	                                          vk::Pipeline handle) const;
+	// The scheduler's state at a dispatch's pipeline bind, for CaptureDispatchDelta.
+	struct DispatchDeltaMark {
+		uint64_t tick = 0, command_serial = 0, compute_serial = 0, unregister_epoch = 0;
+		bool     set = false;
+	};
+	[[nodiscard]] DispatchDeltaMark MarkDispatchDelta(uint64_t unregister_epoch) const;
+	// RebindBuffers with the base's slots; with KYTY_DISPATCH_DELTA_VERIFY the full path runs after
+	// it, the two are compared, and `delta` is cleared (the dispatch commits and binds in full).
+	void RebindBuffersDelta(PreparedBindings& bindings, const DispatchDelta*& delta, uint64_t shader_hash);
+	void CaptureDispatchDelta(const void* owner, const ShaderComputeInputInfo& input, const ShaderProgram& program,
+	                          void* pipeline, vk::Pipeline handle, const PreparedBindings& bindings,
+	                          const DispatchDeltaMark& mark, bool usable);
+	[[nodiscard]] bool DeltaSlotReusable(uint32_t slot, const PreparedBindings::BufferSource& source, bool written,
+	                                     bool table_read, bool formatted, uint32_t offset_dword) const;
+	void PushDescriptorsDelta(const CommandRecorder& recorder, vk::PipelineBindPoint bind_point,
+	                          vk::PipelineLayout layout);
 
 	struct MultiDrawReplayBase {
 		bool                     active = false; // inside a DRAW_INDIRECT_MULTI
@@ -396,6 +496,16 @@ private:
 		std::vector<uint8_t>     ctx_snapshot;
 		std::vector<uint8_t>     ucfg_snapshot;
 		std::vector<uint8_t>     sh_snapshot; // HW::Shader bytes, GS/PS user SGPR values zeroed
+		// KYTY_RENDER_STATS census ([multi-packets]): the state the last replayed packet ended
+		// with, while its base still stood (the other base fields are that base's).
+		bool                     census_indexed = false; // inside an indexed multi-draw packet
+		bool                     census_valid   = false;
+		uint64_t                 census_tick    = 0;
+		uint64_t                 census_commit_generation = 0;
+		std::vector<uint8_t>     census_ctx;
+		std::vector<uint8_t>     census_ucfg;
+		std::vector<uint8_t>     census_sh;
+		std::vector<uint8_t>     census_scratch;
 	};
 	MultiDrawReplayBase m_replay;
 
@@ -412,6 +522,8 @@ private:
 	                    int32_t host_vertex_offset, uint32_t host_first_instance, bool indirect);
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
+	// v439b: (value heap, key) pairs ProcessValueRequests created this round.
+	std::vector<std::pair<BindlessTable::Heap*, uint32_t>> m_bindless_value_created;
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
 	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
 	std::vector<ImageId>                       m_bindless_changed;
@@ -441,12 +553,19 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
+	// v440p: set by DispatchIndirectRecord around a callable split's GPU-converted launch.
+	const IndirectDispatchGroups::RtLaunch* m_rt_indirect_launch = nullptr;
 	// Created at the first indirect fast-launch mesh draw with counts on the GPU.
 	std::unique_ptr<MeshIndirectArgs>       m_mesh_args;
 	// Ring of VkDrawMeshTasksIndirectCommandEXT for indirect fast-launch mesh draws (16 bytes an
 	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
 	std::unique_ptr<Buffer>                 m_mesh_indirect;
 	uint32_t                                m_mesh_indirect_next = 0;
+	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	std::vector<UpscalerContext>          m_upscaler_contexts;
+	std::vector<FsrContext>               m_fsr_contexts;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

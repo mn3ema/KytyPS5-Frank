@@ -38,6 +38,17 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	return ConstantU32(state, 0);
 }
 
+uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t base, uint32_t index) {
+	EXIT_IF(state.program.bindings.UsesPushData() || state.shader_data_storage_variable == 0);
+	const auto dword   = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, base));
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.shader_data_storage_variable, ConstantU32(state, 0), dword);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeU32(state), ret, lhs, rhs);
@@ -96,6 +107,10 @@ uint32_t StorageBufferStrideData(EmitterState& state, const IR::MemoryInfo& mem)
 	if (mem.resource < state.buffer_stride_values.size() && state.buffer_stride_values[mem.resource] != 0u) {
 		return state.buffer_stride_values[mem.resource];
 	}
+	if (state.rt_relocate) {
+		return EmitShaderDataDwordLoadAt(state, state.program.bindings.BufferStrideDword(),
+		                                 RtPlaced(state, RtRecordSlot::BufferResource, mem.resource, mem.resource));
+	}
 	return EmitShaderDataDwordLoad(state, state.program.bindings.BufferStrideDword() + mem.resource);
 }
 
@@ -137,13 +152,112 @@ uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryIn
 	           ? 32u : info.component_bits[0];
 }
 
+// v442: whether the function entry preloads a buffer's data (EmitMemoryOffsets). A module of a
+// callable split with the fixed layout preloads its own buffers' only (the other modules' buffers
+// are not its business, and their number grows with the call targets).
+static bool PreloadsBuffer(const EmitterState& state, uint32_t resource) {
+	return !state.program.bindings.rt_fixed ||
+	       std::ranges::find(state.rt_module_buffers, resource) != state.rt_module_buffers.end();
+}
+
+static uint32_t BufferOfBinding(const EmitterState& state, uint32_t index) {
+	const auto* group = IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Buffers);
+	return group != nullptr && index < group->resources.size() ? group->resources[index] : UINT32_MAX;
+}
+
+// The byte offset of memory binding `index` from its place in the shader data, the index a value.
+static uint32_t MemoryByteOffsetAt(EmitterState& state, uint32_t index) {
+	const auto word  = EmitShaderDataDwordLoadAt(
+	    state, state.program.bindings.memory_offset_dword,
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, index, ConstantU32(state, 2u)));
+	const auto shift = EmitBinaryU32(state, spv::OpShiftLeftLogical,
+	                                 EmitBinaryU32(state, spv::OpBitwiseAnd, index, ConstantU32(state, 3u)),
+	                                 ConstantU32(state, 3u));
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
+	                     ConstantU32(state, 0xffu));
+}
+
+uint32_t BufferBindingIndex(EmitterState& state, uint32_t index) {
+	if (!state.rt_relocate) {
+		return ConstantU32(state, index);
+	}
+	if (const auto preloaded = state.rt_buffer_index_ids.at(index); preloaded != 0u) {
+		return preloaded;
+	}
+	return RtPlaced(state, RtRecordSlot::BufferBinding, index, index);
+}
+
+uint32_t MemoryByteOffset(EmitterState& state, uint32_t index) {
+	if (const auto preloaded = state.memory_byte_offsets[index];
+	    preloaded != 0u || !state.program.bindings.rt_fixed) {
+		return preloaded;
+	}
+	if (state.rt_relocate) {
+		return MemoryByteOffsetAt(state, BufferBindingIndex(state, index));
+	}
+	// Not preloaded: a callable split's module and a buffer its own blocks do not name. That does
+	// not happen (the access being emitted is in its blocks, and CollectMemoryResources lists the
+	// buffer for it as it lists it for the binding); loaded here, uncached, if it ever does.
+	const auto word    = EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + index / 4u);
+	const auto shifted = EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, (index % 4u) * 8u));
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, shifted, ConstantU32(state, 0xffu));
+}
+
+static uint32_t MemoryDwordLength(EmitterState& state, uint32_t index) {
+	if (const auto preloaded = state.memory_dword_lengths[index];
+	    preloaded != 0u || !state.program.bindings.rt_fixed) {
+		return preloaded;
+	}
+	if (state.rt_relocate) {
+		return EmitShaderDataDwordLoadAt(state, state.program.bindings.BufferLengthDword(),
+		                                 BufferBindingIndex(state, index));
+	}
+	return EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + index);
+}
+
+static uint32_t LoadShaderDataU64(EmitterState& state, uint32_t dword) {
+	const auto u64 = TypeScalarU64(state);
+	const auto lo  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
+	const auto hi  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword + 1u));
+	return Binary(state, spv::OpBitwiseOr, u64, lo,
+	              Binary(state, spv::OpShiftLeftLogical, u64, hi, ConstantDeviceAddress(state, 32)));
+}
+
+// The same for the pair at `base` + 2 * `index` (a value).
+static uint32_t LoadShaderDataU64At(EmitterState& state, uint32_t base, uint32_t index) {
+	const auto u64    = TypeScalarU64(state);
+	const auto twice  = EmitBinaryU32(state, spv::OpShiftLeftLogical, index, ConstantU32(state, 1u));
+	const auto lo     = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoadAt(state, base, twice));
+	const auto hi     = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoadAt(state, base + 1u, twice));
+	return Binary(state, spv::OpBitwiseOr, u64, lo,
+	              Binary(state, spv::OpShiftLeftLogical, u64, hi, ConstantDeviceAddress(state, 32)));
+}
+
 void EmitMemoryOffsets(EmitterState& state) {
 	state.buffer_stride_values.fill(0u);
 	for (uint32_t i = 0; i < state.program.bindings.buffer_stride_count && i < state.buffer_stride_values.size(); i++) {
+		if (!PreloadsBuffer(state, i)) {
+			continue; // (StorageBufferStrideData loads a stride that is not preloaded where it is used)
+		}
 		state.buffer_stride_values[i] =
-		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferStrideDword() + i);
+		    state.rt_relocate
+		        ? EmitShaderDataDwordLoadAt(state, state.program.bindings.BufferStrideDword(),
+		                                    RtPlaced(state, RtRecordSlot::BufferResource, i, i))
+		        : EmitShaderDataDwordLoad(state, state.program.bindings.BufferStrideDword() + i);
 	}
 	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+		if (!PreloadsBuffer(state, BufferOfBinding(state, i))) {
+			continue;
+		}
+		if (state.rt_relocate) {
+			// v443: the binding's index comes from the shader record, and with it its data's place.
+			const auto index               = RtPlaced(state, RtRecordSlot::BufferBinding, i, i);
+			state.rt_buffer_index_ids[i]   = index;
+			state.memory_byte_offsets[i]   = MemoryByteOffsetAt(state, index);
+			state.memory_dword_lengths[i]  =
+			    EmitShaderDataDwordLoadAt(state, state.program.bindings.BufferLengthDword(), index);
+			continue;
+		}
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
 		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
@@ -167,7 +281,7 @@ void EmitMemoryOffsets(EmitterState& state) {
 		                                        state.program.bindings.memory_offset_count);
 		for (uint32_t i = 0; i < count; i++) {
 			const auto resource = group->resources[i];
-			if (resource >= state.program.info.buffers.size()) {
+			if (resource >= state.program.info.buffers.size() || !PreloadsBuffer(state, resource)) {
 				continue;
 			}
 			const auto& buffer = state.program.info.buffers[resource];
@@ -219,7 +333,23 @@ void EmitMemoryOffsets(EmitterState& state) {
 			           bound);
 		}
 	}
-	if (state.program.bindings.write_tracking) {
+	if (state.program.bindings.write_tracking && state.program.bindings.rt_fixed) {
+		// v442: only when a buffer of this module is tracked, and only its buffers' bases.
+		const auto start = state.program.bindings.WriteTrackDword();
+		for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+			const auto resource = BufferOfBinding(state, i);
+			if (resource >= state.program.info.buffers.size() || !PreloadsBuffer(state, resource) ||
+			    !state.program.info.buffers[resource].write_tracked) {
+				continue;
+			}
+			if (state.write_bitmap_address == 0) {
+				state.write_bitmap_address = LoadShaderDataU64(state, start);
+			}
+			state.write_track_bases[i] = state.rt_relocate
+			                                 ? LoadShaderDataU64At(state, start + 2u, BufferBindingIndex(state, i))
+			                                 : LoadShaderDataU64(state, start + 2u + 2u * i);
+		}
+	} else if (state.program.bindings.write_tracking) {
 		const auto load64 = [&](uint32_t dword) {
 			const auto u64 = TypeScalarU64(state);
 			const auto lo  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
@@ -349,8 +479,18 @@ void EmitSrtVerify(EmitterState& state) {
 // written. A binding the host does not track in this draw has a base of 0 and skips it.
 void EmitWriteBitmapMark(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
 	const auto u64     = TypeScalarU64(state);
-	const auto tracked = Binary(state, spv::OpINotEqual, TypeBool(state), access.write_base,
+	auto       tracked = Binary(state, spv::OpINotEqual, TypeBool(state), access.write_base,
 	                            ConstantDeviceAddress(state, 0));
+	if (state.program.rt_role != IR::RtRole::None && IR::RtAddressTrap()) {
+		// v443l: a callable split's write bitmap, behind the address trap (spirvEmitterRt.cpp).
+		const auto usable = EmitRtAddressUsable(state, state.write_bitmap_address);
+		if (IR::RtAddressTrapReport()) {
+			EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, TypeBool(state), tracked,
+			                              Unary(state, spv::OpLogicalNot, TypeBool(state), usable)),
+			                [&]() { EmitRtAddressTrapped(state, state.write_bitmap_address, 3u); });
+		}
+		tracked = Binary(state, spv::OpLogicalAnd, TypeBool(state), tracked, usable);
+	}
 	(void)EmitValueOrZeroIfCondition(state, tracked, [&]() {
 		const auto element = Unary(state, spv::OpUConvert, u64, index);
 		const auto shift   = std::countr_zero(std::max(access.element_bits / 8u, 1u));
@@ -471,8 +611,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                          ConstantU32(state, array_index));
-	access.byte_offset = state.memory_byte_offsets[array_index];
+	                          BufferBindingIndex(state, array_index));
+	access.byte_offset = MemoryByteOffset(state, array_index);
 	if (state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
 	    state.program.bindings.write_tracking && mem.resource < state.program.info.buffers.size() &&
 	    state.program.info.buffers[mem.resource].write_tracked) {
@@ -483,11 +623,19 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	// The length is in dwords; the bounds checks index elements of the access's own width (narrow
 	// storage indexes bytes or halfwords, 64-bit atomics qwords). A dword length compared with a
 	// byte index dropped every access past the first quarter of the buffer.
-	auto dwords = state.memory_dword_lengths[array_index];
+	auto dwords = MemoryDwordLength(state, array_index);
 	// The descriptor range is the bound, to the byte (BufferLengthDword is range / 4): the device
 	// checks it itself, unless a GPU-written record count narrows the bound below.
+	// v443m: not in a callable split's modules. They check every buffer access themselves, as on a
+	// device without byte-exact bounds: nothing of theirs then depends on the driver bounds-checking
+	// storage buffers, or reading zero through a null descriptor, in the ray-tracing stages (the
+	// device losses that read at 0x0: g443b, g443c, g443o). KYTY_RT_DEVICE_BOUNDS=1: as before.
+	static const bool rt_device_bounds = [] {
+		const char* value = std::getenv("KYTY_RT_DEVICE_BOUNDS");
+		return value != nullptr && value[0] == '1';
+	}();
 	access.device_bounded =
-	    GetRobustBufferAccess() &&
+	    GetRobustBufferAccess() && (state.program.rt_role == IR::RtRole::None || rt_device_bounds) &&
 	    (mem.kind == IR::ResourceKind::Buffer || mem.kind == IR::ResourceKind::ScalarBuffer) &&
 	    mem.resource < state.program.info.buffers.size() &&
 	    state.program.info.buffers[mem.resource].gpu_records_flat ==
@@ -582,7 +730,7 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			const auto bits = mem.kind == IR::ResourceKind::Buffer
 			                      ? StorageBufferElementBits(state.program, mem) : 32u;
-			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
+			const uint32_t variable = bits == 8u ? state.storage_buffer_u8_variable
 			                      : bits == 16u ? state.storage_buffer_u16_variable
 			                                    : state.storage_buffer_variable;
 			access = PrepareStorageBufferResourceAccess(
@@ -815,7 +963,7 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
-	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+	const auto scope  = kind == IR::ResourceKind::Lds ? LdsMemoryScope(state) : spv::ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {
 			case IR::ResourceKind::Lds:

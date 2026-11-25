@@ -153,11 +153,12 @@ public:
 	// RemoveIdentities: ReplaceUsesWith(replacement, false) for an instruction about to be erased,
 	// leaving its own entries in its arguments' use lists; the caller drops those for every
 	// removed instruction at once (DropRemovedUses), which keeps every list in the same order.
-	// Uses by instructions already in `removed` (erased) are skipped. Arguments go to `touched`.
-	void ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
-	                           std::vector<Inst*>& touched);
-	static void DropRemovedUses(std::span<Inst* const>              touched,
-	                            const std::unordered_set<const Inst*>& removed);
+	// Uses by instructions already removed (marked, erased by the caller afterwards) are skipped.
+	// Marks this instruction removed. Arguments go to `touched`. A mark instead of a set of
+	// removed instructions: a large program has millions of identities.
+	void ReplaceUsesForRemoval(Value replacement, std::vector<Inst*>& touched);
+	static void DropRemovedUses(std::span<Inst* const> touched);
+	[[nodiscard]] bool Removed() const { return removed; }
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
@@ -190,7 +191,8 @@ private:
 
 	ValueOpcode         opcode;
 	uint8_t             num_args;
-	bool                live = false;
+	bool                live : 1    = false;
+	bool                removed : 1 = false;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;

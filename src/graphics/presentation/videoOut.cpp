@@ -1,5 +1,6 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/host_gpu/renderer/syncToggle.h"
+#include "common/floorStats.h"
 #include "common/fpsLog.h"
 #include "common/sampler.h"
 
@@ -20,6 +21,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "kernel/guestWait.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -382,6 +384,11 @@ static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
 static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind kind,
                                   void* trigger_data) {
 	Graphics::DrainProtectionHelper(Graphics::ProtectDrainReason::GuestSignal);
+	if (kind == VideoOutEventKind::Flip) {
+		LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Flip);
+	} else if (kind == VideoOutEventKind::Vblank) {
+		LibKernel::GuestWait::NoteEvent(LibKernel::GuestWait::Event::Vblank);
+	}
 	VideoOutEventQueues queues;
 	{
 		Common::LockGuard lock(video_out.events->mutex);
@@ -912,26 +919,34 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	// game) right away instead of at the next vblank. The vblank count and events keep their
 	// 60 Hz rhythm; only the wait of a late frame for the next vblank goes (a frame that took
 	// 40 ms showed at 50 ms). Flips with a flip rate (30 or 20 FPS caps) keep vblank alignment.
+	// v438x: on by default (A/B 11-16, test route, same exe and caches: frames on the 8.33 ms grid 40%
+	// vs 91%, 28.9 vs 28.0 fps, 1% low 24.0 vs 23.2, frames >= 50 ms 0.5 vs 3.6 per minute);
+	// KYTY_FLIP_IMMEDIATE=0 turns it off.
 	static const bool flip_immediate = [] {
 		const char* value = std::getenv("KYTY_FLIP_IMMEDIATE");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0 && (flip_immediate || Graphics::SyncToggle::FlipNowWindow()) &&
 		    !m_presenter.IsGuestPaused()) {
-			// Wait for the vblank in steps of up to 1 ms, presenting ready flips as they come.
+			// Wait for the vblank, presenting ready flips as they come. v438u: the flip queue sleeps
+			// until a flip is ready or the vblank is due (was: a poll every 1 ms).
 			const auto deadline = sleep_begin + static_cast<uint64_t>(total_wait);
 			for (;;) {
-				(void)m_flip_queue.Flip(0, true);
 				const auto now = Common::Timer::QueryPerformanceCounter();
 				if (now >= deadline || token.stop_requested()) {
 					break;
 				}
 				const auto left_us = (deadline - now) * 1000000u / frequency;
-				Common::Thread::SleepMicro(
-				    static_cast<uint32_t>(std::clamp<uint64_t>(left_us, 1, 1000)));
+				if (!m_flip_queue.Flip(static_cast<uint32_t>(std::clamp<uint64_t>(left_us, 1, 100000)), true)) {
+					// Nothing went out: a group was ready but not due (a flip rate), or the wait ended.
+					const auto after = Common::Timer::QueryPerformanceCounter();
+					if (after - now < frequency / 4000) {
+						Common::Thread::SleepMicro(250); // a ready group that is not due: no spin
+					}
+				}
 			}
 		} else if (total_wait > 0) {
 			const auto remaining_us =
@@ -1012,6 +1027,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 				}
 				cfg.flip_status.flipPendingNum--;
 				cfg.flip_status.gcQueueNum -= it->source == FlipRequestSource::GpuEop;
+				Common::FloorStats::Add(Common::FloorStats::Get().flip_replaced, 1); // v438zk: [long-frame]
 				if (it->state == RequestState::Ready) {
 					m_presenter.Discard(*it->frame);
 					it = queue->erase(it);
@@ -1024,8 +1040,10 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 		m_done_cond_var.SignalAll();
 	}
 	if (cfg.flip_status.flipPendingNum >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
+		Common::FloorStats::Add(Common::FloorStats::Get().flip_refused, 1);
 		return false;
 	}
+	Common::FloorStats::Add(Common::FloorStats::Get().flip_requests, 1);
 	auto& pending = source == FlipRequestSource::GpuEop ? m_requests : m_cpu_requests;
 
 	Request r {};
@@ -1088,6 +1106,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 			if (it->state == RequestState::Reserved || it->state == RequestState::Recording) {
 				auto cancelled = it++;
 				m_cancelled_requests.splice(m_cancelled_requests.end(), *queue, cancelled);
+				Common::FloorStats::Add(Common::FloorStats::Get().flip_cancelled, 1);
 				continue;
 			}
 			if (it->state == RequestState::Presenting) {
@@ -1185,6 +1204,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		                 [request_id](const auto& r) { return r.id == request_id; });
 		if (request != m_requests.end()) {
 			m_cancelled_requests.splice(m_cancelled_requests.end(), m_requests, request);
+			Common::FloorStats::Add(Common::FloorStats::Get().flip_cancelled, 1);
 		}
 		return;
 	}
@@ -1294,7 +1314,22 @@ bool FlipQueue::Flip(uint32_t micros, bool off_vblank) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
-	if (m_requests.empty()) {
+	if (off_vblank && micros != 0) {
+		// v438u: between vblanks, sleep until a group is ready (Complete signals) or the time is up,
+		// instead of the caller polling every millisecond under this mutex (the cost measured for
+		// KYTY_FLIP_IMMEDIATE in October was likely that polling, fresh-eyes review item 15).
+		const auto ready_group = [this] {
+			return std::any_of(m_requests.begin(), m_requests.end(), [this](const auto& owner) {
+				return owner.group == owner.id &&
+				       std::none_of(m_requests.begin(), m_requests.end(), [&owner](const auto& r) {
+					       return r.group == owner.id && r.state != RequestState::Ready;
+				       });
+			});
+		};
+		if (!ready_group()) {
+			m_submit_cond_var.WaitFor(&m_mutex, micros);
+		}
+	} else if (m_requests.empty()) {
 		m_submit_cond_var.WaitFor(&m_mutex, micros);
 	}
 	EXIT_IF(m_processing);
@@ -1344,6 +1379,8 @@ bool FlipQueue::Flip(uint32_t micros, bool off_vblank) {
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
 		Profiler::MarkFrame();
+	} else {
+		Common::FloorStats::Add(Common::FloorStats::Get().flip_held, 1); // v438zk: [long-frame]
 	}
 
 	m_mutex.Lock();
@@ -1945,6 +1982,7 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
+	const LibKernel::GuestWait::Scope guest_wait(LibKernel::GuestWait::Prim::Vblank);
 	Common::LockGuard lock(ctx->mutex);
 	const auto        count = ctx->vblank_status.count;
 	while (ctx->opened && ctx->vblank_status.count == count) {

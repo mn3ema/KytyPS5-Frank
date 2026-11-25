@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -20,6 +21,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
@@ -29,6 +31,7 @@
 #include <condition_variable>
 #include <deque>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdlib>
 #include <limits>
 #include <cstdio>
@@ -37,9 +40,11 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <type_traits>
 
 #include <xxhash.h>
@@ -332,6 +337,19 @@ static uint32_t GplKnob(const char* name) {
 	return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
 }
 
+// v438v: a library creation the driver did not count as an application cache hit is a real compile
+// only when it took at least KYTY_GPL_MISS_MS (default 20): faster ones came from the driver's own
+// disk cache.
+static std::chrono::steady_clock::duration GplRealMissTime() {
+	static const auto t = [] {
+		const char* value = std::getenv("KYTY_GPL_MISS_MS");
+		return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		    std::chrono::duration<double, std::milli>(value != nullptr ? std::strtod(value, nullptr) : 20.0));
+	}();
+	return t;
+}
+
+
 static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
                            uint32_t used_components) {
 	const auto fmt        = res.Format();
@@ -600,6 +618,314 @@ vk::ShaderModule BindlessSet3Twin(vk::ShaderModule module) {
 	std::lock_guard lock(g_twin_mutex);
 	const auto      found = g_twins.find(static_cast<VkShaderModule>(module));
 	return found == g_twins.end() ? vk::ShaderModule {} : found->second;
+}
+
+namespace {
+
+// What the two POPS strip passes below need to know about a module.
+struct PopsSpirvScan {
+	enum class Kind : uint8_t { Other, Images, Buffers };
+	// Variables whose type is an array: of images (UniformConstant) or of storage buffers.
+	std::unordered_map<uint32_t, Kind> variables;
+	// The module polls memory: a load or store with the Volatile operand (the emitter's coherent
+	// buffer accesses, spirvEmitterMemoryHelpers.cpp) or a memory barrier. Without the interlock
+	// the recompiler would still have made its storage buffers Coherent.
+	bool polls = false;
+	// An atomic operation, on anything.
+	bool atomics = false;
+	// A store, an atomic, a copy or a function call through a pointer into a storage buffer array.
+	bool     buffer_stores = false;
+	uint32_t buffer_loads  = 0;
+	bool     interlock     = false; // an interlock execution mode
+	bool     valid         = false;
+};
+
+PopsSpirvScan ScanPopsSpirv(std::span<const uint32_t> spirv) {
+	constexpr uint32_t OpExecutionMode = 16u, OpTypeArray = 28u, OpTypeRuntimeArray = 29u, OpTypePointer = 32u,
+	                   OpFunctionCall = 57u, OpVariable = 59u, OpLoad = 61u, OpStore = 62u, OpCopyMemory = 63u,
+	                   OpCopyMemorySized = 64u, OpAccessChain = 65u, OpInBoundsAccessChain = 66u, OpPtrAccessChain = 67u,
+	                   OpInBoundsPtrAccessChain = 70u, OpCopyObject = 83u, OpMemoryBarrier = 225u, OpAtomicFirst = 227u,
+	                   OpAtomicStore = 228u, OpAtomicLast = 242u, OpAtomicFlagTestAndSet = 318u, OpAtomicFlagClear = 319u;
+	constexpr uint32_t ExecutionModeInterlockFirst = 5366u, ExecutionModeInterlockLast = 5371u;
+	constexpr uint32_t StorageClassUniformConstant = 0u, StorageClassUniform = 2u, StorageClassStorageBuffer = 12u;
+	constexpr uint32_t MemoryAccessVolatile = 1u;
+	PopsSpirvScan scan;
+	if (spirv.size() < 5 || spirv[0] != 0x07230203u) {
+		return scan;
+	}
+	std::unordered_set<uint32_t>                                arrays;
+	std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> pointers; // id -> class, pointee
+	std::unordered_set<uint32_t>                                into_buffers; // pointers into a buffer array
+	for (size_t i = 5; i < spirv.size();) {
+		const uint32_t count  = spirv[i] >> 16u;
+		const uint32_t opcode = spirv[i] & 0xffffu;
+		if (count == 0 || i + count > spirv.size()) {
+			return scan;
+		}
+		const auto* word = spirv.data() + i;
+		switch (opcode) {
+			case OpExecutionMode:
+				scan.interlock |= count >= 3 && word[2] >= ExecutionModeInterlockFirst && word[2] <= ExecutionModeInterlockLast;
+				break;
+			case OpTypeArray:
+			case OpTypeRuntimeArray:
+				if (count >= 3) arrays.insert(word[1]);
+				break;
+			case OpTypePointer:
+				if (count == 4) pointers[word[1]] = {word[2], word[3]};
+				break;
+			case OpVariable:
+				if (count >= 4) {
+					auto kind = PopsSpirvScan::Kind::Other;
+					if (const auto pointer = pointers.find(word[1]);
+					    pointer != pointers.end() && arrays.contains(pointer->second.second)) {
+						const auto storage = pointer->second.first;
+						if (storage == StorageClassUniformConstant) {
+							kind = PopsSpirvScan::Kind::Images;
+						} else if (storage == StorageClassStorageBuffer || storage == StorageClassUniform) {
+							kind = PopsSpirvScan::Kind::Buffers;
+							into_buffers.insert(word[2]);
+						}
+					}
+					scan.variables[word[2]] = kind;
+				}
+				break;
+			case OpAccessChain:
+			case OpInBoundsAccessChain:
+			case OpPtrAccessChain:
+			case OpInBoundsPtrAccessChain:
+			case OpCopyObject:
+				// Result type, result, base (blocks come in dominance order: a base is seen first).
+				if (count >= 4 && into_buffers.contains(word[3])) into_buffers.insert(word[2]);
+				break;
+			case OpLoad:
+				if (count >= 4 && into_buffers.contains(word[3])) scan.buffer_loads++;
+				scan.polls |= count >= 5 && (word[4] & MemoryAccessVolatile) != 0;
+				break;
+			case OpStore:
+				scan.buffer_stores |= count >= 3 && into_buffers.contains(word[1]);
+				scan.polls |= count >= 4 && (word[3] & MemoryAccessVolatile) != 0;
+				break;
+			case OpCopyMemory:
+			case OpCopyMemorySized:
+				scan.buffer_stores |= count >= 3 && into_buffers.contains(word[1]);
+				break;
+			case OpFunctionCall:
+				for (uint32_t argument = 4; argument < count; argument++) {
+					scan.buffer_stores |= into_buffers.contains(word[argument]);
+				}
+				break;
+			case OpMemoryBarrier: scan.polls = true; break;
+			case OpAtomicStore:
+			case OpAtomicFlagClear:
+				// Pointer first.
+				scan.atomics = true;
+				scan.buffer_stores |= count >= 2 && into_buffers.contains(word[1]);
+				break;
+			default:
+				if ((opcode >= OpAtomicFirst && opcode <= OpAtomicLast) || opcode == OpAtomicFlagTestAndSet) {
+					// Result type, result, pointer.
+					scan.atomics = true;
+					scan.buffer_stores |= count >= 4 && into_buffers.contains(word[3]);
+				}
+				break;
+		}
+		i += count;
+	}
+	scan.valid = true;
+	return scan;
+}
+
+} // namespace
+
+bool PopsNoInterlockEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_POPS_NOINTERLOCK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool StripPixelInterlock(std::span<const uint32_t> spirv, std::vector<uint32_t>& out, uint32_t& flags,
+                         uint32_t& removed) {
+	// SPIR-V numbers (spirv.hpp): opcodes, then the operands looked at.
+	constexpr uint32_t OpExtension = 10u, OpExecutionMode = 16u, OpCapability = 17u, OpDecorate = 71u,
+	                   OpMemberDecorate = 72u, OpBeginInvocationInterlock = 5364u, OpEndInvocationInterlock = 5365u;
+	constexpr uint32_t CapabilitySampleInterlock = 5363u, CapabilityShadingRateInterlock = 5372u,
+	                   CapabilityPixelInterlock = 5378u;
+	// PixelInterlockOrdered, PixelInterlockUnordered, SampleInterlock*, ShadingRateInterlock*.
+	constexpr uint32_t ExecutionModeInterlockFirst = 5366u, ExecutionModeInterlockLast = 5371u;
+	constexpr uint32_t DecorationBuiltIn = 11u, DecorationCoherent = 23u, BuiltInPrimitiveId = 7u;
+	constexpr std::string_view InterlockExtension = "SPV_EXT_fragment_shader_interlock";
+	// What becomes of the Coherent decorations the recompiler gives a primitive-ordered shader
+	// (spirvEmitterModule.cpp: its storage image arrays, and every alias of its storage buffer
+	// array). The twin is only drawn one triangle at a time with a barrier before and after, as
+	// any draw of a pixel shader without the interlock that writes shared memory; so it gets the
+	// decorations the recompiler gives such a shader (v438zi; m16: they, not the execution mode,
+	// are what costs: 800 us a call with them, 165 without):
+	// - none on the storage image arrays and the storage buffer arrays,
+	// - unless the module polls memory (ScanPopsSpirv: then the recompiler makes the buffers
+	//   Coherent whatever the interlock) or has an atomic operation (stricter than the
+	//   recompiler, which gives those nothing): then all are kept.
+	// - Shared memory keeps its own, always.
+	// KYTY_POPS_NOINTERLOCK_COHERENT, for A/B runs: 1 keeps them all (v438zh's twin); 3 takes
+	// them from the buffer arrays only, 4 from the image arrays only (which of the two costs);
+	// 0 takes every Coherent decoration whatever it is on (v438zh's measurement, m16; not exact
+	// for a module that polls or has shared memory).
+	static const uint32_t coherent_mode = [] {
+		const char* value = std::getenv("KYTY_POPS_NOINTERLOCK_COHERENT");
+		return value == nullptr ? 2u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	flags   = 0;
+	removed = 0;
+	out.clear();
+	if (spirv.size() < 5 || spirv[0] != 0x07230203u) {
+		return false;
+	}
+	// Which variables are storage image arrays and storage buffer arrays, and whether the module
+	// needs coherent buffers without the interlock (modes 2 to 4).
+	using Kind = PopsSpirvScan::Kind;
+	PopsSpirvScan scan;
+	if (coherent_mode >= 2u && coherent_mode <= 4u) {
+		scan = ScanPopsSpirv(spirv);
+		if (!scan.valid) {
+			return false;
+		}
+	}
+	const auto& variables      = scan.variables;
+	const bool  needs_coherent = scan.polls || scan.atomics;
+	if (needs_coherent) {
+		flags |= PopsTwinCoherentNeeded;
+	}
+	const auto drop_coherent = [&](uint32_t variable) {
+		if (coherent_mode == 0u) {
+			flags |= PopsTwinCoherentRemoved;
+			return true;
+		}
+		if (coherent_mode < 2u || coherent_mode > 4u || needs_coherent) {
+			return false;
+		}
+		const auto found = variables.find(variable);
+		const auto kind  = found != variables.end() ? found->second : Kind::Other;
+		const bool drop  = (kind == Kind::Images && coherent_mode != 3u) || (kind == Kind::Buffers && coherent_mode != 4u);
+		if (drop) {
+			flags |= kind == Kind::Images ? PopsTwinImagesNotCoherent : PopsTwinBuffersNotCoherent;
+		}
+		return drop;
+	};
+	out.reserve(spirv.size());
+	out.insert(out.end(), spirv.begin(), spirv.begin() + 5);
+	bool has_mode = false;
+	for (size_t i = 5; i < spirv.size();) {
+		const uint32_t count  = spirv[i] >> 16u;
+		const uint32_t opcode = spirv[i] & 0xffffu;
+		if (count == 0 || i + count > spirv.size()) {
+			return false;
+		}
+		bool drop = false;
+		switch (opcode) {
+			case OpCapability:
+				drop = count == 2 &&
+				       (spirv[i + 1] == CapabilityPixelInterlock || spirv[i + 1] == CapabilitySampleInterlock ||
+				        spirv[i + 1] == CapabilityShadingRateInterlock);
+				break;
+			case OpExtension: {
+				// A nul-terminated UTF-8 literal, four bytes a word, the first byte lowest.
+				std::string name;
+				for (uint32_t word = 1; word < count; word++) {
+					for (uint32_t byte = 0; byte < 4; byte++) {
+						const char c = static_cast<char>((spirv[i + word] >> (byte * 8u)) & 0xffu);
+						if (c == '\0') {
+							word = count;
+							break;
+						}
+						name.push_back(c);
+					}
+				}
+				drop = name == InterlockExtension;
+				break;
+			}
+			case OpExecutionMode:
+				if (count >= 3 && spirv[i + 2] >= ExecutionModeInterlockFirst &&
+				    spirv[i + 2] <= ExecutionModeInterlockLast) {
+					drop     = true;
+					has_mode = true;
+				}
+				break;
+			case OpBeginInvocationInterlock:
+			case OpEndInvocationInterlock:
+				drop = true;
+				removed++;
+				break;
+			case OpDecorate:
+				if (count >= 4 && spirv[i + 2] == DecorationBuiltIn && spirv[i + 3] == BuiltInPrimitiveId) {
+					flags |= PopsTwinReadsPrimitiveId;
+				}
+				drop = count == 3 && spirv[i + 2] == DecorationCoherent && drop_coherent(spirv[i + 1]);
+				break;
+			case OpMemberDecorate:
+				if (count >= 5 && spirv[i + 3] == DecorationBuiltIn && spirv[i + 4] == BuiltInPrimitiveId) {
+					flags |= PopsTwinReadsPrimitiveId;
+				}
+				// The emitter decorates variables only; a member's decoration goes with mode 0.
+				drop = coherent_mode == 0u && count == 4 && spirv[i + 3] == DecorationCoherent;
+				break;
+			default: break;
+		}
+		if (!drop) {
+			out.insert(out.end(), spirv.begin() + static_cast<std::ptrdiff_t>(i),
+			           spirv.begin() + static_cast<std::ptrdiff_t>(i + count));
+		}
+		i += count;
+	}
+	return has_mode;
+}
+
+bool PopsPlainBuffersEnabled() {
+	// v438zj: on by default (m18: PS 2209aa94 724-800 -> 178 us a draw with the interlock kept;
+	// exact, the buffers are never written). KYTY_POPS_BUFFER_COHERENT=1 keeps the original module.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_POPS_BUFFER_COHERENT");
+		return value == nullptr || value[0] != '1';
+	}();
+	return enabled;
+}
+
+bool PopsPlainBuffersProgram(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return !program.has_address_writes &&
+	       std::ranges::none_of(program.info.buffers,
+	                            [](const auto& buffer) { return buffer.written || buffer.atomic; });
+}
+
+bool StripBufferCoherent(std::span<const uint32_t> spirv, std::vector<uint32_t>& out, uint32_t& arrays,
+                         uint32_t& loads) {
+	constexpr uint32_t OpDecorate = 71u, DecorationCoherent = 23u;
+	arrays = 0;
+	loads  = 0;
+	out.clear();
+	const auto scan = ScanPopsSpirv(spirv);
+	if (!scan.valid || !scan.interlock || scan.polls || scan.buffer_stores) {
+		return false;
+	}
+	loads = scan.buffer_loads;
+	out.reserve(spirv.size());
+	out.insert(out.end(), spirv.begin(), spirv.begin() + 5);
+	for (size_t i = 5; i < spirv.size();) {
+		const uint32_t count  = spirv[i] >> 16u;
+		const uint32_t opcode = spirv[i] & 0xffffu;
+		bool           drop   = false;
+		if (opcode == OpDecorate && count == 3 && spirv[i + 2] == DecorationCoherent) {
+			const auto found = scan.variables.find(spirv[i + 1]);
+			drop             = found != scan.variables.end() && found->second == PopsSpirvScan::Kind::Buffers;
+			arrays += drop ? 1u : 0u;
+		}
+		if (!drop) {
+			out.insert(out.end(), spirv.begin() + static_cast<std::ptrdiff_t>(i),
+			           spirv.begin() + static_cast<std::ptrdiff_t>(i + count));
+		}
+		i += count;
+	}
+	return arrays != 0;
 }
 
 // KYTY_STAGE_SETS: which of the two stage sets is the push set (one per pipeline layout): the
@@ -936,7 +1262,27 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 			const char* value = std::getenv("KYTY_GPL_NOPUSH");
 			return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
 		}();
+		// v445x (Mac 11-21): tessellated pipelines are built whole by default (bit 2). Linked from
+		// pipeline libraries, Wolverine's water/terrain tessellation drew nothing on NVIDIA (water
+		// gone over the island since the GPL default of 11-14; back with KYTY_GPL=0 and with bit 2
+		// alone). KYTY_GPL_SKIP set explicitly replaces the default (0: link everything).
+		static const uint32_t gpl_skip = [] {
+			const char* value = std::getenv("KYTY_GPL_SKIP");
+			return value == nullptr ? 2u : static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+		}();
+		// v0.5c (11-25): the no-push rule is for linked pipelines; one the skip bits keep whole is
+		// never linked and keeps push descriptors, as with KYTY_GPL=0. The tessellated water's
+		// pipeline (built whole since v445x) took both stage sets from the descriptor heap, and its
+		// domain shader (b9f49649da3973b7) then looped on a garbage volume count in about 2 runs of 3
+		// in the opening cinematic until the device was lost; with push descriptors (KYTY_GPL=0, or
+		// KYTY_GPL_NOPUSH=0) it never did. KYTY_WHOLE_PUSH=0 restores the heap sets for them.
+		static const bool whole_push = [] {
+			const char* value = std::getenv("KYTY_WHOLE_PUSH");
+			return value == nullptr || value[0] != '0';
+		}();
+		const bool kept_whole = (mesh && (gpl_skip & 1u) != 0) || (tessellation && (gpl_skip & 2u) != 0);
 		const bool no_push = graphics.graphics_pipeline_library_enabled && !rect_list &&
+		                     !(whole_push && kept_whole) &&
 		                     (gpl_no_push == 1 || (gpl_no_push == 2 && mesh));
 		SplitStageSets(no_push ? 0u : graphics.max_push_descriptors, descriptor_bindings, pre_bindings,
 		               ps_bindings, pre_push, ps_push);
@@ -949,7 +1295,6 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		set_layouts[2] = pipeline.ps_set_layout;
 		EXIT_IF(set_layouts[1] == nullptr);
 		set_layout_count = 3;
-		static const uint32_t gpl_skip = GplKnob("KYTY_GPL_SKIP");
 		// KYTY_GPL_HASH_MASK / KYTY_GPL_HASH_VALUE (hex): only pairs whose VS^PS hash matches are
 		// linked (bisect to one pipeline, v436o).
 		static const uint64_t hash_mask = [] {
@@ -1287,6 +1632,11 @@ std::unordered_set<uint64_t>              g_library_modules[2];
 std::unordered_set<uint64_t>              g_prefetched;
 std::unordered_set<uint64_t>              g_prefetch_taken;
 std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> g_library_made_at;
+// v438w diagnosis: the key the prefetch kept each module's library under (by the module's hash),
+// to name a draw that makes its own library of a module the prefetch already holds under another
+// key (its create info then differs from the warm-up's, and the warm-up's library is no use to it).
+std::unordered_map<uint64_t, uint64_t>    g_prefetch_key_by_module;
+std::atomic<uint32_t>                     g_prefetch_key_mismatch {0};
 std::atomic<uint64_t>                     g_prefetch_made {0};
 std::atomic<uint64_t>                     g_prefetch_used {0};
 std::atomic<uint64_t>                     g_prefetch_late {0};
@@ -1649,6 +1999,30 @@ static vk::Result CreateLinkedGraphicsPipeline(const GraphicsPipelineBuild& buil
 				return;
 			}
 		}
+		if ((kind == vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders ||
+		     kind == vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader) &&
+		    base.stageCount != 0) {
+			// v438w diagnosis (see g_prefetch_key_by_module).
+			const auto& stage_list = kind == vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader ? fragment_stages : pre_stages;
+			if (stage_list.size() == 1) {
+				const uint64_t module_low = ModuleShardHash(stage_list.front().module);
+				uint64_t       other      = 0;
+				{
+					std::lock_guard lock(g_library_mutex);
+					if (const auto found = g_prefetch_key_by_module.find(module_low); found != g_prefetch_key_by_module.end()) {
+						other = found->second;
+					}
+				}
+				if (module_low != 0 && other != 0 && other != hash &&
+				    g_prefetch_key_mismatch.fetch_add(1, std::memory_order_relaxed) < 32) {
+					std::fprintf(stderr, "[gpl-key] %s module %016llx: the draw's library key %016llx is not the prefetch's %016llx "
+					                     "(shareable %d, unique %d)\n",
+					             kind == vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader ? "frag" : "pre",
+					             static_cast<unsigned long long>(module_low), static_cast<unsigned long long>(hash),
+					             static_cast<unsigned long long>(other), shareable ? 1 : 0, key.unique ? 1 : 0);
+				}
+			}
+		}
 		vk::PipelineLayout layout;
 		if (layout_kind >= 0 && make_layout(layout_kind == 1, &layout) != vk::Result::eSuccess) {
 			result = vk::Result::eErrorUnknown;
@@ -1700,7 +2074,59 @@ static vk::Result CreateLinkedGraphicsPipeline(const GraphicsPipelineBuild& buil
 		result = device.createGraphicsPipelines(library_cache ? library_cache : driver_cache, 1, &info,
 		                                        nullptr, &made);
 		NoteFeedback(feedback);
-		const bool library_miss = !shard_stages.empty() && g_last_cache_hit == 0;
+		const bool library_miss = !shard_stages.empty() && g_last_cache_hit == 0 &&
+		                          std::chrono::steady_clock::now() - made_begin >= GplRealMissTime(); // v438v
+		// v438s diagnosis (KYTY_GPL_MISS_LOG=N: the first N stage libraries the driver cache did not
+		// have, 0 off): what of the create info can differ from the warm-up's library of the same
+		// module (GplWarmLibrary: 1 sample, no sample mask/shading/alpha, no depth (all off), the
+		// fixed push range, 3 sets, the stage with no pNext/flags/specialization, view mask 0).
+		static const uint32_t miss_log = GplKnob("KYTY_GPL_MISS_LOG");
+		static std::atomic<uint32_t> miss_logged {0};
+		if (library_miss && miss_log != 0 && miss_logged.fetch_add(1) < miss_log) {
+			const bool frag_kind = kind == vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader;
+			PipelineRecipe::Hash128 mh {};
+			const bool known = PipelineRecipe::FindModuleHash(shard_stages.front().module, mh);
+			uint64_t dyn = 0;
+			for (const auto st: states) {
+				dyn = dyn * 1000003u + static_cast<uint32_t>(st);
+			}
+			const auto& st0 = shard_stages.front();
+			const auto* sg  = static_cast<const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo*>(st0.pNext);
+			char extra[320] = {};
+			if (frag_kind) {
+				const auto* ms  = base.pMultisampleState;
+				const auto* dsi = info.pDepthStencilState;
+				std::snprintf(extra, sizeof(extra),
+				              " ms(samples %u shading %u min %.2f mask %08x a2c %u a2one %u pnext %d) ds(%s dt %u dw %u op %u bt %u st %u min %.2f max %.2f)",
+				              static_cast<uint32_t>(ms->rasterizationSamples), ms->sampleShadingEnable, ms->minSampleShading,
+				              ms->pSampleMask != nullptr ? *ms->pSampleMask : 0xFFFFFFFFu, ms->alphaToCoverageEnable,
+				              ms->alphaToOneEnable, ms->pNext != nullptr ? 1 : 0, dsi == nullptr ? "null" : "set",
+				              dsi ? dsi->depthTestEnable : 0u, dsi ? dsi->depthWriteEnable : 0u,
+				              dsi ? static_cast<uint32_t>(dsi->depthCompareOp) : 0u, dsi ? dsi->depthBoundsTestEnable : 0u,
+				              dsi ? dsi->stencilTestEnable : 0u, dsi ? dsi->minDepthBounds : 0.0, dsi ? dsi->maxDepthBounds : 0.0);
+			} else {
+				std::snprintf(extra, sizeof(extra), " stages %zu tess %d raster(clamp %u cull %u front %u poly %u disc %u pnext %d)",
+				              shard_stages.size(), base.pTessellationState != nullptr ? 1 : 0,
+				              info.pRasterizationState->depthClampEnable,
+				              static_cast<uint32_t>(VkCullModeFlags(info.pRasterizationState->cullMode)),
+				              static_cast<uint32_t>(info.pRasterizationState->frontFace),
+				              static_cast<uint32_t>(info.pRasterizationState->polygonMode),
+				              info.pRasterizationState->rasterizerDiscardEnable,
+				              info.pRasterizationState->pNext != nullptr ? 1 : 0);
+			}
+			std::fprintf(stderr,
+			             "[gpl-miss] %s module %016llx%s (%zu stages) %.1f ms | dyn %u states %016llx | push 0x%x %u | sets %u | "
+			             "set key %016llx | flags 0x%x | stage flags 0x%x spec %d subgroup %u name %s | robust %d%s\n",
+			             frag_kind ? "frag" : "pre", static_cast<unsigned long long>(mh.low), known ? "" : " (unregistered)",
+			             shard_stages.size(), static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                                           std::chrono::steady_clock::now() - made_begin).count()) / 1000.0,
+			             static_cast<uint32_t>(states.size()), static_cast<unsigned long long>(dyn),
+			             static_cast<uint32_t>(VkShaderStageFlags(push.stageFlags)), push.size, build.set_count,
+			             static_cast<unsigned long long>(frag_kind ? build.gpl_ps_set_key : build.gpl_pre_set_key),
+			             static_cast<uint32_t>(VkPipelineCreateFlags(info.flags)), static_cast<uint32_t>(VkPipelineShaderStageCreateFlags(st0.flags)),
+			             st0.pSpecializationInfo != nullptr ? 1 : 0, sg != nullptr ? sg->requiredSubgroupSize : 0u,
+			             st0.pName != nullptr ? st0.pName : "-", robust ? 1 : 0, extra);
+		}
 		const auto   made_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                      std::chrono::steady_clock::now() - made_begin)
                                                      .count());
@@ -1933,9 +2359,43 @@ static vk::Result CreateLinkedGraphicsPipeline(const GraphicsPipelineBuild& buil
 // key a linked pipeline of this module in the common state builds, so the draw that asks for it
 // finds it made and only links. The temporary module is destroyed either way (a library keeps
 // what it needs); a kept library's layouts stay alive with it, as a draw's own library's do.
+// v438s diagnosis (KYTY_GPL_MISS_LOG): the dynamic states the warm-up gives each stage library,
+// in the [gpl-miss] lines' form, to compare with a draw's.
+void GplMissLogWarmState(const GraphicContext& graphics) {
+	if (GplKnob("KYTY_GPL_MISS_LOG") == 0) {
+		return;
+	}
+	const auto all_states = GraphicsDynamicStates(graphics, 1, true);
+	vk::PipelineDynamicStateCreateInfo all_dynamic {};
+	all_dynamic.dynamicStateCount = static_cast<uint32_t>(all_states.size());
+	all_dynamic.pDynamicStates    = all_states.data();
+	for (const auto kind: {vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
+	                       vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader}) {
+		const auto states = LibraryDynamicStates(&all_dynamic, kind);
+		uint64_t   dyn    = 0;
+		for (const auto st: states) {
+			dyn = dyn * 1000003u + static_cast<uint32_t>(st);
+		}
+		vk::ShaderStageFlags push_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment |
+		                                   vk::ShaderStageFlagBits::eTessellationControl |
+		                                   vk::ShaderStageFlagBits::eTessellationEvaluation;
+		if (graphics.mesh_shader_enabled) {
+			push_stages |= vk::ShaderStageFlagBits::eMeshEXT;
+		}
+		std::fprintf(stderr, "[gpl-miss] warm-up %s: dyn %u states %016llx | push 0x%x %u | sets 3 | retain %d\n",
+		             kind == vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader ? "frag" : "pre",
+		             static_cast<uint32_t>(states.size()), static_cast<unsigned long long>(dyn),
+		             static_cast<uint32_t>(VkShaderStageFlags(push_stages)),
+		             static_cast<uint32_t>(ShaderRecompiler::IR::NativePushConstantSize), GplRetainEnabled() ? 1 : 0);
+	}
+}
+
 bool GplWarmLibrary(GraphicContext& graphics, vk::PipelineCache driver_cache, ShaderType stage,
                     std::span<const uint32_t> spirv, const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                    bool keep) {
+                    bool keep, bool* cache_miss) {
+	if (cache_miss != nullptr) {
+		*cache_miss = false;
+	}
 	if (!graphics.graphics_pipeline_library_enabled || graphics.bindless_layout == nullptr ||
 	    GplKnob("KYTY_GPL_LTO") != 0 || GplKnob("KYTY_GPL_ROBUST") != 0 || GplKnob("KYTY_GPL_FULLSETS") != 0 ||
 	    GplKnob("KYTY_GPL_BINDLESS_SPLIT") != 0 || GplBindlessSet3()) {
@@ -2094,11 +2554,27 @@ bool GplWarmLibrary(GraphicContext& graphics, vk::PipelineCache driver_cache, Sh
 		made = nullptr;
 	} else if (result == vk::Result::eSuccess) {
 		const auto begin = std::chrono::steady_clock::now();
+		// v438t: the driver says whether its cache had the library (as CreateLinkedGraphicsPipeline
+		// asks for a draw's own, whose create info hits the libraries made here without it).
+		vk::PipelineCreationFeedback           feedback {};
+		vk::PipelineCreationFeedbackCreateInfo feedback_info {};
+		feedback_info.pPipelineCreationFeedback = &feedback;
+		feedback_info.pNext                     = info.pNext;
+		info.pNext                              = &feedback_info;
 		result = device.createGraphicsPipelines(shard ? shard : driver_cache, 1, &info, nullptr, &made);
+		if (cache_miss != nullptr && result == vk::Result::eSuccess) {
+			// v438v: and it took real time. NVIDIA serves ~440 of Mac's libraries from its own disk
+			// cache in a few ms without counting it as an application cache hit, and they never stick
+			// in ours, so every check found them "missing" and set the next full check (11-16).
+			*cache_miss = (feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid) &&
+			              !(feedback.flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit) &&
+			              std::chrono::steady_clock::now() - begin >= GplRealMissTime();
+		}
 		if (result == vk::Result::eSuccess && keep) {
 			std::lock_guard lock(g_library_mutex);
 			if (g_libraries.emplace(keep_hash, made).second) {
 				g_prefetched.insert(keep_hash);
+				g_prefetch_key_by_module[module_hash.low] = keep_hash;
 				kept = true;
 			} else {
 				late = g_library_made_at.contains(keep_hash); // made by a draw meanwhile
@@ -2411,6 +2887,628 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+}
+
+// v442 (incremental generations, IR/RtCallable.h): the pipeline libraries of the callable splits,
+// one per module, by the module's SPIR-V, the set layout and the stage. A new generation of a split
+// (more call targets) takes the libraries of the modules it shares with the older ones and compiles
+// only the new callables. A library lives as long as a pipeline linked from it does (the NVIDIA
+// driver reads a library after linking: g440r crashed in the group-handle query after they were
+// destroyed): each pipeline holds a use of every library it links (Pipeline::rt_libraries) and gives
+// it back when it is destroyed (ReleaseRtLibraries; PipelineCache::NoteRtDispatch retires the
+// older generations' pipelines), and a library without users is destroyed.
+// KYTY_RT_KEEP_LIBRARIES=1 never destroys a library; =0 gives every pipeline its own (as before
+// v442).
+namespace {
+
+enum class RtLibrarySharing { Private, Shared, Kept };
+
+RtLibrarySharing RtLibraryMode() {
+	static const RtLibrarySharing mode = [] {
+		const char* value = std::getenv("KYTY_RT_KEEP_LIBRARIES");
+		return value == nullptr     ? RtLibrarySharing::Shared
+		       : value[0] == '0' ? RtLibrarySharing::Private
+		       : value[0] == '1' ? RtLibrarySharing::Kept
+		                         : RtLibrarySharing::Shared;
+	}();
+	return mode;
+}
+
+struct RtLibrary {
+	vk::Pipeline pipeline = nullptr;
+	uint32_t     users    = 0;
+};
+
+// The layout objects of a fixed layout (BindingLayout::rt_fixed), by what it is made of.
+struct RtLayout {
+	vk::DescriptorSetLayout set_layout      = nullptr;
+	vk::PipelineLayout      pipeline_layout = nullptr;
+};
+
+std::mutex                               g_rt_library_mutex;
+std::unordered_map<uint64_t, RtLibrary>  g_rt_libraries;    // by key
+std::unordered_map<VkPipeline, uint64_t> g_rt_library_keys; // the shared libraries' keys
+std::unordered_map<uint64_t, RtLayout>   g_rt_layouts;      // by layout key
+
+} // namespace
+
+// streamBuffer.cpp: a callable split's binding table in the device-fault registry.
+void FaultNoteRtTable(uint64_t device, uint64_t size, uint64_t shader_hash, const uint32_t* counters,
+                      const std::vector<uint64_t>& targets, const std::vector<uint32_t>& code_hashes);
+
+void ReleaseRtLibraries(GraphicContext& graphics, PipelineCache::Pipeline& pipeline) {
+	std::lock_guard lock(g_rt_library_mutex);
+	for (const auto library: pipeline.rt_libraries) {
+		const auto key = g_rt_library_keys.find(static_cast<VkPipeline>(library));
+		if (key == g_rt_library_keys.end()) {
+			graphics.device.destroyPipeline(library, nullptr); // the pipeline's own
+			continue;
+		}
+		const auto shared = g_rt_libraries.find(key->second);
+		EXIT_IF(shared == g_rt_libraries.end() || shared->second.users == 0);
+		if (--shared->second.users == 0 && RtLibraryMode() != RtLibrarySharing::Kept) {
+			graphics.device.destroyPipeline(library, nullptr);
+			g_rt_libraries.erase(shared);
+			g_rt_library_keys.erase(key);
+		}
+	}
+	pipeline.rt_libraries.clear();
+}
+
+void DestroyRtShared(GraphicContext& graphics) {
+	std::lock_guard lock(g_rt_library_mutex);
+	for (const auto& [key, library]: g_rt_libraries) {
+		(void)key;
+		if (library.users == 0) { // (kept ones, KYTY_RT_KEEP_LIBRARIES=1)
+			graphics.device.destroyPipeline(library.pipeline, nullptr);
+		}
+	}
+	g_rt_libraries.clear();
+	g_rt_library_keys.clear();
+	for (const auto& [key, layout]: g_rt_layouts) {
+		(void)key;
+		graphics.device.destroyPipelineLayout(layout.pipeline_layout, nullptr);
+		graphics.device.destroyDescriptorSetLayout(layout.set_layout, nullptr);
+	}
+	g_rt_layouts.clear();
+}
+
+// v440 M3 (KYTY_RT_CALLABLES): a callable split's ray-tracing pipeline. One general group per
+// shader (ray generation 0, callable i at i + 1), no hit groups and no acceleration structures. The
+// shader binding table is a small host-visible buffer: the ray-generation record, then the callables.
+void CreateRtPipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                              const ShaderComputeInputInfo& input_info, const ShaderProgram& program,
+                              vk::PipelineCache driver_cache) {
+	EXIT_IF(!input_info.stage || program.module == nullptr || program.rt_callables == nullptr);
+	EXIT_IF(!graphics.ray_tracing_pipeline_enabled);
+	const auto& compiled  = *input_info.stage.program;
+	const auto& callables = program.rt_callables->modules;
+	const auto& targets   = program.rt_callables->targets;
+	const vk::ShaderStageFlags stages = vk::ShaderStageFlagBits::eRaygenKHR | vk::ShaderStageFlagBits::eCallableKHR;
+
+	// v443m, KYTY_RT_ROBUST=1 (a test): the split's libraries and pipeline name robustBufferAccess2
+	// for their buffers themselves (VK_EXT_pipeline_robustness), instead of taking the device's
+	// default, which is the same thing when the driver follows it in the ray-tracing stages.
+	static const bool rt_robust_knob = [] {
+		const char* value = std::getenv("KYTY_RT_ROBUST");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool rt_robust = rt_robust_knob && graphics.pipeline_robustness_enabled;
+	vk::PipelineRobustnessCreateInfoEXT rt_robustness {};
+	rt_robustness.storageBuffers = vk::PipelineRobustnessBufferBehaviorEXT::eRobustBufferAccess2;
+	rt_robustness.uniformBuffers = vk::PipelineRobustnessBufferBehaviorEXT::eRobustBufferAccess2;
+	rt_robustness.vertexInputs   = vk::PipelineRobustnessBufferBehaviorEXT::eDeviceDefault;
+	rt_robustness.images         = vk::PipelineRobustnessImageBehaviorEXT::eDeviceDefault;
+	if (rt_robust_knob) {
+		static std::atomic<bool> said {false};
+		if (!said.exchange(true)) {
+			std::fprintf(stderr, "[rt-callables] KYTY_RT_ROBUST=1: pipeline robustness %s\n",
+			             rt_robust ? "named on the libraries and the pipeline" : "is not available on this device");
+		}
+	}
+
+	// v443q, KYTY_RT_STACK_BYTES=<n> (a test): the split's pipeline and libraries are made with a
+	// dynamic stack size, set to n bytes before each trace, instead of the driver's own figure
+	// (the ray generation's plus twice the largest callable's, and it reports 0 for every callable).
+	// A stack that is too small is read and written past its end.
+	static const uint32_t rt_stack_bytes = [] {
+		const char* value = std::getenv("KYTY_RT_STACK_BYTES");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+	}();
+	const vk::DynamicState                 rt_dynamic_state = vk::DynamicState::eRayTracingPipelineStackSizeKHR;
+	vk::PipelineDynamicStateCreateInfo     rt_dynamic {};
+	rt_dynamic.dynamicStateCount = 1;
+	rt_dynamic.pDynamicStates    = &rt_dynamic_state;
+	pipeline.rt_stack_bytes      = rt_stack_bytes;
+	if (rt_stack_bytes != 0) {
+		static std::atomic<bool> said {false};
+		if (!said.exchange(true)) {
+			std::fprintf(stderr, "[rt-callables] KYTY_RT_STACK_BYTES: %u bytes of stack per invocation, set before each trace\n",
+			             rt_stack_bytes);
+		}
+	}
+
+	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	// v442: the fixed layout (BindingLayout::rt_fixed): the same set layout for every generation of
+	// the split, so that a library made for one links into the next. Its bindings have capacities
+	// instead of the program's counts and are partially bound (the host writes what the program
+	// has); the set is never a push set. The bindless table is part of the layout whenever there is
+	// one, whether or not a module samples through it yet.
+	const bool fixed_layout = compiled.bindings.rt_fixed;
+	if (fixed_layout) {
+		EXIT_IF(!graphics.partially_bound_enabled);
+		for (const auto& binding: ShaderRecompiler::IR::RtFixedSetLayout(compiled.bindings)) {
+			descriptor_bindings.push_back({ShaderRecompiler::IR::NativeBinding(compiled.stage, binding.kind),
+			                               NativeDescriptorType(binding.kind), binding.count, stages, nullptr});
+		}
+		pipeline.uses_bindless         = UsesBindless(compiled) || graphics.bindless_layout != nullptr;
+		pipeline.uses_push_descriptors = false;
+	} else {
+		for (const auto& binding: compiled.bindings.descriptors) {
+			descriptor_bindings.push_back({ShaderRecompiler::IR::NativeBinding(compiled.stage, binding.kind),
+			                               NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stages,
+			                               nullptr});
+		}
+		pipeline.uses_bindless = UsesBindless(compiled);
+		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	}
+	// What the layout is made of: part of the libraries' keys.
+	std::vector<uint32_t> layout_words {pipeline.uses_bindless ? 1u : 0u, pipeline.uses_push_descriptors ? 1u : 0u,
+	                                    fixed_layout ? 1u : 0u};
+	for (const auto& binding: descriptor_bindings) {
+		layout_words.push_back(binding.binding);
+		layout_words.push_back(static_cast<uint32_t>(binding.descriptorType));
+		layout_words.push_back(binding.descriptorCount);
+	}
+	const uint64_t layout_key = XXH3_64bits(layout_words.data(), layout_words.size() * sizeof(uint32_t));
+	const vk::PushConstantRange push_constants {stages, 0, ShaderRecompiler::IR::NativePushConstantSize};
+	const auto make_pipeline_layout = [&]() {
+		std::array<vk::DescriptorSetLayout, 2> set_layouts {};
+		uint32_t                               set_layout_count = 0;
+		FillSetLayouts(graphics, pipeline, set_layouts, set_layout_count);
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = set_layout_count;
+		layout_info.pSetLayouts            = set_layouts.data();
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push_constants;
+		EXIT_IF(pipeline.pipeline_layout != nullptr);
+		EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&layout_info, nullptr, &pipeline.pipeline_layout) !=
+		                     vk::Result::eSuccess);
+	};
+	if (fixed_layout) {
+		// One set layout and one pipeline layout object per fixed layout, for every pipeline and
+		// library made with it (never destroyed while pipelines exist): a library and the pipelines
+		// it is linked into have the very same layout, and the descriptor heap keeps one batch of
+		// sets for all of them.
+		std::lock_guard lock(g_rt_library_mutex);
+		auto&           shared = g_rt_layouts[layout_key];
+		if (shared.pipeline_layout == nullptr) {
+			const std::vector<vk::DescriptorBindingFlags> binding_flags(descriptor_bindings.size(),
+			                                                           vk::DescriptorBindingFlagBits::ePartiallyBound);
+			vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
+			flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
+			flags_info.pBindingFlags = binding_flags.data();
+			vk::DescriptorSetLayoutCreateInfo create {};
+			create.pNext        = &flags_info;
+			create.bindingCount = static_cast<uint32_t>(descriptor_bindings.size());
+			create.pBindings    = descriptor_bindings.data();
+			EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &pipeline.descriptor_set_layout) !=
+			        vk::Result::eSuccess);
+			make_pipeline_layout();
+			shared = {pipeline.descriptor_set_layout, pipeline.pipeline_layout};
+		}
+		pipeline.descriptor_set_layout = shared.set_layout;
+		pipeline.pipeline_layout       = shared.pipeline_layout;
+		pipeline.rt_shared_layouts     = true;
+	} else {
+		make_pipeline_layout();
+	}
+	pipeline.push_stages = stages;
+
+	std::vector<vk::PipelineShaderStageCreateInfo>     shader_stages;
+	std::vector<vk::RayTracingShaderGroupCreateInfoKHR> groups;
+	const auto make_stage = [&](vk::ShaderStageFlagBits stage, vk::ShaderModule module,
+	                            std::vector<vk::PipelineShaderStageCreateInfo>&     stage_list,
+	                            std::vector<vk::RayTracingShaderGroupCreateInfoKHR>& group_list) {
+		vk::PipelineShaderStageCreateInfo info {};
+		info.stage  = stage;
+		info.module = module;
+		info.pName  = "main";
+		vk::RayTracingShaderGroupCreateInfoKHR group {};
+		group.type               = vk::RayTracingShaderGroupTypeKHR::eGeneral;
+		group.generalShader      = static_cast<uint32_t>(stage_list.size());
+		group.closestHitShader   = VK_SHADER_UNUSED_KHR;
+		group.anyHitShader       = VK_SHADER_UNUSED_KHR;
+		group.intersectionShader = VK_SHADER_UNUSED_KHR;
+		stage_list.push_back(info);
+		group_list.push_back(group);
+	};
+	make_stage(vk::ShaderStageFlagBits::eRaygenKHR, program.module, shader_stages, groups);
+	for (const auto module: callables) {
+		make_stage(vk::ShaderStageFlagBits::eCallableKHR, module, shader_stages, groups);
+	}
+	const auto begin = std::chrono::steady_clock::now();
+	vk::Result result = vk::Result::eSuccess;
+	if (graphics.rt_pipeline_library_enabled) {
+		// Each module is a pipeline library, kept by its SPIR-V and the layout: a new set of call
+		// targets compiles only the shaders it has not seen and links.
+		const auto sharing = RtLibraryMode();
+		vk::RayTracingPipelineInterfaceCreateInfoKHR library_interface {};
+		std::vector<vk::Pipeline> linked;
+		uint32_t made = 0;
+		double   compile_ms = 0.0;
+		// The libraries not made yet, compiled on several threads (each callable takes the NVIDIA
+		// compiler seconds; KYTY_RT_LIBRARY_THREADS, default half the cores).
+		std::vector<uint64_t> keys(shader_stages.size(), 0);
+		std::vector<uint64_t> module_hashes(shader_stages.size(), 0);
+		linked.assign(shader_stages.size(), nullptr);
+		std::vector<size_t> missing;
+		{
+			// A module that occurs more than once in the pipeline (two call targets with the same
+			// code) gets a library per occurrence, as before: no library is linked twice.
+			std::unordered_map<uint64_t, uint32_t> occurrences;
+			std::lock_guard                        lock(g_rt_library_mutex);
+			for (size_t i = 0; i < shader_stages.size(); i++) {
+				module_hashes[i] = ModuleShardHash(shader_stages[i].module);
+				if (module_hashes[i] != 0 && sharing != RtLibrarySharing::Private) {
+					const auto     stage = static_cast<uint64_t>(static_cast<VkShaderStageFlags>(shader_stages[i].stage));
+					const uint64_t base  = module_hashes[i] ^ (layout_key * 0x9e3779b97f4a7c15ull) ^ stage;
+					const uint64_t nth   = occurrences[base]++;
+					keys[i]              = XXH3_64bits_withSeed(&base, sizeof(base), nth);
+					keys[i]              = keys[i] != 0 ? keys[i] : 1;
+				}
+				if (const auto found = g_rt_libraries.find(keys[i]); keys[i] != 0 && found != g_rt_libraries.end()) {
+					linked[i] = found->second.pipeline;
+					found->second.users++; // this pipeline's use (ReleaseRtLibraries)
+					pipeline.rt_libraries.push_back(linked[i]);
+				} else {
+					missing.push_back(i);
+				}
+			}
+		}
+		static const uint32_t thread_limit = [] {
+			const char* value = std::getenv("KYTY_RT_LIBRARY_THREADS");
+			const auto  cores = std::max(2u, std::thread::hardware_concurrency());
+			// Default 6: the driver's compiles slow each other down past a few threads, and each one
+			// takes gigabytes at its peak.
+			return value != nullptr ? std::max(1u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
+			                        : std::min(6u, cores / 2u);
+		}();
+		std::atomic<size_t>   next {0};
+		std::atomic<bool>     failed {false};
+		std::atomic<uint64_t> total_us {0};
+		// v443: a library the driver's cache has takes it milliseconds, a compile seconds: how many of
+		// each this pipeline had (the summary line below), so a warm start can be told from a cold one.
+		constexpr int64_t     CachedUs = 100000;
+		std::atomic<uint32_t> cached {0};
+		const auto compile_one = [&]() {
+			for (size_t n = next.fetch_add(1); n < missing.size(); n = next.fetch_add(1)) {
+				const size_t i = missing[n];
+				vk::RayTracingShaderGroupCreateInfoKHR group = groups[i];
+				group.generalShader = 0;
+				vk::RayTracingPipelineCreateInfoKHR library_info {};
+				if (rt_robust) {
+					library_info.pNext = &rt_robustness;
+				}
+				if (rt_stack_bytes != 0) {
+					library_info.pDynamicState = &rt_dynamic;
+				}
+				library_info.flags                        = vk::PipelineCreateFlagBits::eLibraryKHR;
+				library_info.stageCount                   = 1;
+				library_info.pStages                      = &shader_stages[i];
+				library_info.groupCount                   = 1;
+				library_info.pGroups                      = &group;
+				library_info.maxPipelineRayRecursionDepth = 1;
+				library_info.pLibraryInterface            = &library_interface;
+				library_info.layout                       = pipeline.pipeline_layout;
+				library_info.basePipelineIndex            = -1;
+				vk::Pipeline library = nullptr;
+				const auto   t0      = std::chrono::steady_clock::now();
+				const auto   r = graphics.device.createRayTracingPipelinesKHR(nullptr, driver_cache, 1, &library_info, nullptr,
+				                                                              &library);
+				const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+				total_us.fetch_add(static_cast<uint64_t>(us));
+				if (us < CachedUs) {
+					cached.fetch_add(1);
+				}
+				if (i == 0 || us > 2000000) {
+					std::fprintf(stderr, "[rt-callables] %016llx: library %s %zu (module %016llx) %s in %.1f ms\n",
+					             static_cast<unsigned long long>(compiled.shader_hash), i == 0 ? "raygen" : "callable",
+					             i == 0 ? size_t {0} : i - 1, static_cast<unsigned long long>(module_hashes[i]),
+					             vk::to_string(r).c_str(), static_cast<double>(us) / 1000.0);
+				}
+				if (r != vk::Result::eSuccess || library == nullptr) {
+					failed = true;
+					continue;
+				}
+				linked[i] = library;
+			}
+		};
+		const auto library_begin = std::chrono::steady_clock::now();
+		// v443: as many compiles at once as the free memory has room for (the driver's compile of
+		// one callable takes gigabytes at its peak; g442c ended at the memory guard with six going).
+		// KYTY_RT_LIBRARY_GB: the room one compile is given (default 4; 0: no such limit).
+		size_t memory_limit = thread_limit;
+		{
+			static const uint64_t per_compile = [] {
+				const char* value = std::getenv("KYTY_RT_LIBRARY_GB");
+				return (value != nullptr ? std::strtoull(value, nullptr, 10) : 4ull) << 30u;
+			}();
+			uint64_t commit_limit = 0, commit_free = 0;
+			if (per_compile != 0 && missing.size() > 1 && Common::VirtualMemory::QueryCommit(commit_limit, commit_free)) {
+				memory_limit = static_cast<size_t>(std::clamp<uint64_t>(commit_free / per_compile, 1u, thread_limit));
+				if (memory_limit < std::min<size_t>(missing.size(), thread_limit)) {
+					std::fprintf(stderr, "[rt-callables] %016llx: %zu compile threads instead of %zu (%.1f GiB of commit left)\n",
+					             static_cast<unsigned long long>(compiled.shader_hash), memory_limit,
+					             std::min<size_t>(missing.size(), thread_limit),
+					             static_cast<double>(commit_free) / static_cast<double>(1ull << 30u));
+				}
+			}
+		}
+		{
+			std::vector<std::thread> threads;
+			const size_t count = std::min<size_t>({missing.size(), thread_limit, memory_limit});
+			for (size_t t = 1; t < count; t++) {
+				// v443: below the emulator's own threads (the driver compiles on the calling thread).
+				threads.emplace_back([&compile_one] {
+					Common::LowerBackgroundThreadPriority();
+					compile_one();
+				});
+			}
+			compile_one();
+			for (auto& thread: threads) {
+				thread.join();
+			}
+		}
+		EXIT_NOT_IMPLEMENTED(failed.load());
+		{
+			// The new libraries join the shared ones, each with this pipeline's use. One another
+			// build made meanwhile (KYTY_RT_ASYNC=0 beside the worker) is taken instead.
+			std::lock_guard lock(g_rt_library_mutex);
+			for (const size_t i: missing) {
+				if (keys[i] != 0) {
+					if (const auto [entry, inserted] = g_rt_libraries.try_emplace(keys[i], RtLibrary {linked[i], 1u});
+					    inserted) {
+						g_rt_library_keys.emplace(static_cast<VkPipeline>(linked[i]), keys[i]);
+					} else {
+						graphics.device.destroyPipeline(linked[i], nullptr);
+						linked[i] = entry->second.pipeline;
+						entry->second.users++;
+					}
+				}
+				pipeline.rt_libraries.push_back(linked[i]);
+			}
+		}
+		made       = static_cast<uint32_t>(missing.size());
+		compile_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - library_begin).count();
+		std::fprintf(stderr, "[rt-callables] %016llx: %zu libraries compiled on %zu threads in %.1f ms (%.1f ms of compiler time); "
+		             "%u of them in under %d ms each (the driver's cache had them)\n",
+		             static_cast<unsigned long long>(compiled.shader_hash), missing.size(),
+		             std::min<size_t>({missing.size(), thread_limit, memory_limit}), compile_ms,
+		             static_cast<double>(total_us.load()) / 1000.0, cached.load(), static_cast<int>(CachedUs / 1000));
+		vk::PipelineLibraryCreateInfoKHR library_list {};
+		library_list.libraryCount = static_cast<uint32_t>(linked.size());
+		library_list.pLibraries   = linked.data();
+		vk::RayTracingPipelineCreateInfoKHR info {};
+		if (rt_robust) {
+			info.pNext = &rt_robustness;
+		}
+		if (rt_stack_bytes != 0) {
+			info.pDynamicState = &rt_dynamic;
+		}
+		info.pLibraryInfo                 = &library_list;
+		info.pLibraryInterface            = &library_interface;
+		info.maxPipelineRayRecursionDepth = 1;
+		info.layout                       = pipeline.pipeline_layout;
+		info.basePipelineIndex            = -1;
+		const auto t0 = std::chrono::steady_clock::now();
+		result = graphics.device.createRayTracingPipelinesKHR(nullptr, driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+		const double link_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		// [rt-callables] ... layout <key>: the same key from one generation to the next means the
+		// older libraries could be taken again; "taken" says how many were.
+		std::fprintf(stderr,
+		             "[rt-callables] %016llx: layout %016llx (%s, %zu bindings), %zu of %zu libraries taken again, %u "
+		             "compiled (%.1f ms), linked %s in %.1f ms\n",
+		             static_cast<unsigned long long>(compiled.shader_hash), static_cast<unsigned long long>(layout_key),
+		             fixed_layout ? "fixed" : "of the counts", descriptor_bindings.size(), shader_stages.size() - made,
+		             shader_stages.size(), made, compile_ms, vk::to_string(result).c_str(), link_ms);
+	} else {
+		vk::RayTracingPipelineCreateInfoKHR info {};
+		if (rt_robust) {
+			info.pNext = &rt_robustness;
+		}
+		if (rt_stack_bytes != 0) {
+			info.pDynamicState = &rt_dynamic;
+		}
+		info.stageCount                   = static_cast<uint32_t>(shader_stages.size());
+		info.pStages                      = shader_stages.data();
+		info.groupCount                   = static_cast<uint32_t>(groups.size());
+		info.pGroups                      = groups.data();
+		info.maxPipelineRayRecursionDepth = 1;
+		info.layout                       = pipeline.pipeline_layout;
+		info.basePipelineIndex            = -1;
+		result = graphics.device.createRayTracingPipelinesKHR(nullptr, driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+	}
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+	std::fprintf(stderr, "[rt-callables] %016llx: ray-tracing pipeline %s in %.1f ms (%zu shaders)\n",
+	             static_cast<unsigned long long>(compiled.shader_hash), vk::to_string(result).c_str(), ms,
+	             shader_stages.size());
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pipeline.pipeline == nullptr);
+
+	{
+		// v443f: the stack the driver gives each shader (the pipeline's stack is the ray generation's
+		// plus twice the largest callable's, by default): in the log, to see what a callable needs.
+		const auto general = vk::ShaderGroupShaderKHR::eGeneral;
+		const auto raygen  = graphics.device.getRayTracingShaderGroupStackSizeKHR(pipeline.pipeline, 0, general);
+		vk::DeviceSize largest = 0;
+		uint32_t       which   = 0;
+		for (uint32_t group = 1; group < groups.size(); group++) {
+			const auto size = graphics.device.getRayTracingShaderGroupStackSizeKHR(pipeline.pipeline, group, general);
+			if (size > largest) {
+				largest = size;
+				which   = group - 1u;
+			}
+		}
+		std::fprintf(stderr, "[rt-callables] %016llx: stack: ray generation %llu bytes, callables up to %llu bytes (callable %u)\n",
+		             static_cast<unsigned long long>(compiled.shader_hash), static_cast<unsigned long long>(raygen),
+		             static_cast<unsigned long long>(largest), which);
+	}
+	// The shader binding table.
+	const auto align = [](uint64_t value, uint64_t to) { return (value + to - 1u) / to * to; };
+	const uint32_t handle_size = graphics.rt_group_handle_size;
+	std::vector<uint8_t> handles(static_cast<size_t>(handle_size) * groups.size());
+	EXIT_NOT_IMPLEMENTED(graphics.device.getRayTracingShaderGroupHandlesKHR(
+	                         pipeline.pipeline, 0, static_cast<uint32_t>(groups.size()), handles.size(),
+	                         handles.data()) != vk::Result::eSuccess);
+	// v443: a shared callable's record (IR/RtCallable.h) follows its handle; every callable entry
+	// has room for the longest one. The ray-generation entry has the handle alone.
+	const auto& records = program.rt_callables->records;
+	EXIT_IF(!records.empty() && records.size() != callables.size());
+	size_t record_words = 0;
+	for (const auto& words: records) {
+		record_words = std::max(record_words, words.size());
+	}
+	const uint64_t record        = align(handle_size + record_words * sizeof(uint32_t), graphics.rt_group_handle_alignment);
+	EXIT_NOT_IMPLEMENTED(graphics.rt_max_group_stride != 0 && record > graphics.rt_max_group_stride);
+	const uint64_t raygen_size   = align(align(handle_size, graphics.rt_group_handle_alignment), graphics.rt_group_base_alignment);
+	const uint64_t callable_size = align(record * callables.size(), graphics.rt_group_base_alignment);
+	const uint64_t table_size    = raygen_size + std::max<uint64_t>(callable_size, graphics.rt_group_base_alignment);
+	// The call targets' table follows the binding table in the same buffer (IR/RtCallable.h).
+	const uint64_t targets_bytes = uint64_t {ShaderRecompiler::IR::RtTargetSlots} * ShaderRecompiler::IR::RtTargetWords * 4u;
+	std::vector<uint32_t> target_words(ShaderRecompiler::IR::RtTargetSlots * ShaderRecompiler::IR::RtTargetWords, 0u);
+	for (uint32_t slot = 0; slot < ShaderRecompiler::IR::RtTargetSlots; slot++) {
+		target_words[slot * ShaderRecompiler::IR::RtTargetWords + 2u] = UINT32_MAX;
+	}
+	// v443: an entry may be anywhere in the RtTargetProbes entries from its hash, so when those are
+	// all taken one of them moves to a free entry of its own range (two levels deep) to make room.
+	std::vector<uint32_t> entry_hash(ShaderRecompiler::IR::RtTargetSlots, 0u);
+	const auto entry_at = [&](uint32_t slot) {
+		return &target_words[size_t {slot} * ShaderRecompiler::IR::RtTargetWords];
+	};
+	const auto free_entry = [&](const auto& self, uint32_t hash, uint32_t depth) -> uint32_t {
+		constexpr uint32_t Mask = ShaderRecompiler::IR::RtTargetSlots - 1u;
+		for (uint32_t probe = 0; probe < ShaderRecompiler::IR::RtTargetProbes; probe++) {
+			if (const uint32_t slot = (hash + probe) & Mask; entry_at(slot)[2] == UINT32_MAX) {
+				return slot;
+			}
+		}
+		for (uint32_t probe = 0; depth != 0 && probe < ShaderRecompiler::IR::RtTargetProbes; probe++) {
+			const uint32_t slot  = (hash + probe) & Mask;
+			const uint32_t other = self(self, entry_hash[slot], depth - 1u);
+			if (entry_at(slot)[2] == UINT32_MAX) {
+				return slot; // (the search below moved this very entry)
+			}
+			if (other == UINT32_MAX) {
+				continue;
+			}
+			std::copy_n(entry_at(slot), 3, entry_at(other));
+			entry_hash[other]  = entry_hash[slot];
+			entry_at(slot)[0]  = 0;
+			entry_at(slot)[1]  = 0;
+			entry_at(slot)[2]  = UINT32_MAX;
+			return slot;
+		}
+		return UINT32_MAX;
+	};
+	for (uint32_t index = 0; index < targets.size(); index++) {
+		const auto low  = static_cast<uint32_t>(targets[index]);
+		const auto high = static_cast<uint32_t>(targets[index] >> 32u);
+		const auto hash = ShaderRecompiler::IR::RtTargetHash(low, high);
+		const auto slot = free_entry(free_entry, hash, 2u);
+		const bool placed = slot != UINT32_MAX;
+		if (placed) {
+			auto* entry      = entry_at(slot);
+			entry[0]         = low;
+			entry[1]         = high;
+			entry[2]         = index;
+			entry_hash[slot] = hash;
+		}
+		if (!placed) {
+			std::fprintf(stderr, "[rt-callables] %016llx: call target %u (0x%llx) does not fit the target table; it calls nothing\n",
+			             static_cast<unsigned long long>(compiled.shader_hash), index,
+			             static_cast<unsigned long long>(targets[index]));
+		}
+	}
+	vk::BufferCreateInfo buffer_info {};
+	// (room to align the start; the counters: IR::RtCounterWords and one word per callable)
+	buffer_info.size  = table_size + targets_bytes + (ShaderRecompiler::IR::RtCounterWords + callables.size()) * sizeof(uint32_t) + 64u +
+	                    graphics.rt_group_base_alignment;
+	buffer_info.usage = vk::BufferUsageFlagBits::eShaderBindingTableKHR |
+	                    vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eStorageBuffer;
+	EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&buffer_info, nullptr, &pipeline.rt_sbt_buffer) !=
+	                     vk::Result::eSuccess);
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(pipeline.rt_sbt_buffer, &requirements);
+	const auto& memory_properties = graphics.physical_device_memory_properties;
+	uint32_t    type_index        = UINT32_MAX;
+	for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
+		const auto flags = memory_properties.memoryTypes[i].propertyFlags;
+		if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+		    (flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+		    (flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+			type_index = i;
+			// Prefer memory that is also device local (resizable BAR).
+			if (flags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+				break;
+			}
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(type_index == UINT32_MAX);
+	vk::MemoryAllocateFlagsInfo allocate_flags {};
+	allocate_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	vk::MemoryAllocateInfo allocate_info {};
+	allocate_info.pNext           = &allocate_flags;
+	allocate_info.allocationSize  = requirements.size;
+	allocate_info.memoryTypeIndex = type_index;
+	EXIT_NOT_IMPLEMENTED(graphics.device.allocateMemory(&allocate_info, nullptr, &pipeline.rt_sbt_memory) !=
+	                     vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(graphics.device.bindBufferMemory(pipeline.rt_sbt_buffer, pipeline.rt_sbt_memory, 0) !=
+	                     vk::Result::eSuccess);
+	void* mapped = nullptr;
+	EXIT_NOT_IMPLEMENTED(graphics.device.mapMemory(pipeline.rt_sbt_memory, 0, VK_WHOLE_SIZE, {}, &mapped) !=
+	                     vk::Result::eSuccess);
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer       = pipeline.rt_sbt_buffer;
+	const uint64_t address    = graphics.device.getBufferAddress(&address_info);
+	const uint64_t base       = align(address, graphics.rt_group_base_alignment);
+	auto*          bytes      = static_cast<uint8_t*>(mapped) + (base - address);
+	std::memset(static_cast<uint8_t*>(mapped), 0, static_cast<size_t>(buffer_info.size));
+	std::memcpy(bytes, handles.data(), handle_size);
+	for (size_t i = 0; i < callables.size(); i++) {
+		std::memcpy(bytes + raygen_size + i * record, handles.data() + (i + 1u) * handle_size, handle_size);
+		if (i < records.size() && !records[i].empty()) {
+			std::memcpy(bytes + raygen_size + i * record + handle_size, records[i].data(),
+			            records[i].size() * sizeof(uint32_t));
+		}
+	}
+	std::memcpy(bytes + table_size, target_words.data(), static_cast<size_t>(targets_bytes));
+	static const bool count = [] {
+		const char* value = std::getenv("KYTY_RT_COUNT");
+		return value != nullptr && value[0] == '1';
+	}();
+	// (stays mapped: v443e, the callables' loop cap reports here whether or not the counters are on)
+	pipeline.rt_counters = reinterpret_cast<const uint32_t*>(bytes + table_size + targets_bytes);
+	pipeline.rt_count    = count;
+	pipeline.rt_target_table = base + table_size;
+	// v443: the table's device addresses, in the log and in the device-fault registry (a fault
+	// address inside one, alive or destroyed, is then named with its shader).
+	pipeline.rt_sbt_address = address;
+	pipeline.rt_sbt_bytes   = buffer_info.size;
+	FaultNoteRtTable(address, buffer_info.size, compiled.shader_hash, pipeline.rt_counters, targets,
+	                 program.rt_callables->code_hashes);
+	std::fprintf(stderr,
+	             "[rt-callables] %016llx: binding table at dev 0x%llx+0x%llx (callables +0x%llx, %llu bytes each, "
+	             "%zu record words; call targets +0x%llx; counters +0x%llx)\n",
+	             static_cast<unsigned long long>(compiled.shader_hash), static_cast<unsigned long long>(address),
+	             static_cast<unsigned long long>(buffer_info.size),
+	             static_cast<unsigned long long>(base - address + raygen_size), static_cast<unsigned long long>(record),
+	             record_words, static_cast<unsigned long long>(base - address + table_size),
+	             static_cast<unsigned long long>(base - address + table_size + targets_bytes));
+	// The ray-generation region's size must equal its stride.
+	pipeline.rt_raygen_region   = vk::StridedDeviceAddressRegionKHR {base, raygen_size, raygen_size};
+	pipeline.rt_callable_region = vk::StridedDeviceAddressRegionKHR {base + raygen_size, record,
+	                                                                record * callables.size()};
+	pipeline.ray_tracing        = true;
 }
 
 // Compute warm-up (with step D4): a compute permutation's pipeline made as GetComputePipeline makes

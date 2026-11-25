@@ -23,6 +23,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 namespace Libs::Graphics {
 
@@ -33,6 +34,194 @@ void     WaitUploadWorker(uint64_t upto);
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
+
+// KYTY_QUEUE_STATS, [op-latency] (v445m, counters only): how long after the host GPU finished a
+// tick the operations deferred to that tick ran. A thread of its own waits on the timeline
+// semaphore for each next value and notes the time it wakes: that is when the completion became
+// observable. It reads the semaphore only (no Refresh, no scheduler state), so nothing else
+// changes. Classes: the GPU thread's pending operations (PopPendingOperations, polled per draw
+// and dispatch and throttled by KYTY_POP_POLL_US), the priority thread's operations (interrupts,
+// flips, readback publications), and deferred end-of-pipe label writes (labels at completion:
+// the priority thread hands the write to the GPU thread).
+struct OpLatency {
+	static constexpr uint64_t Slots = 8192;
+	enum Class : uint32_t { Pending, Priority, Label, ClassCount };
+	struct Stat {
+		std::atomic<uint64_t> count {0};  // with a completion time
+		std::atomic<uint64_t> early {0};  // ran before the watcher saw the tick (latency ~0)
+		std::atomic<uint64_t> sum_ns {0};
+		std::atomic<uint64_t> max_ns {0};
+		std::atomic<uint64_t> buckets[5] {}; // <50 us, <200 us, <1 ms, <5 ms, >=5 ms
+	};
+	std::atomic<int64_t>  done_ns[Slots] {};
+	std::atomic<uint64_t> seen {0};
+	std::atomic<uint64_t> ticks {0}; // completions seen in the window
+	Stat                  stats[ClassCount];
+	std::atomic<int64_t>  reported_ms {0};
+	std::atomic<bool>     stop {false};
+	std::atomic<bool>     running {false};
+	std::atomic<const void*> owner {nullptr};
+	std::thread           thread;
+};
+
+bool OpLatencyEnabled() {
+	static const bool enabled = std::getenv("KYTY_QUEUE_STATS") != nullptr;
+	return enabled;
+}
+
+// Never destroyed: a watcher still running at exit must not meet its std::thread's destructor.
+OpLatency& GetOpLatency() {
+	static OpLatency* const state = new OpLatency;
+	return *state;
+}
+
+thread_local int64_t t_operation_done_ns = 0;
+
+int64_t SteadyNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+void OpLatencyWatch(vk::Device device, vk::Semaphore semaphore) {
+	Common::Sampler::RegisterCurrentThread("tick-watch");
+	auto&    state = GetOpLatency();
+	uint64_t seen  = 0;
+	if (device.getSemaphoreCounterValue(semaphore, &seen) != vk::Result::eSuccess) {
+		state.running.store(false, std::memory_order_release);
+		return;
+	}
+	state.seen.store(seen, std::memory_order_release);
+	while (!state.stop.load(std::memory_order_acquire)) {
+		uint64_t              target = seen + 1;
+		vk::SemaphoreWaitInfo wait_info {};
+		wait_info.semaphoreCount = 1;
+		wait_info.pSemaphores    = &semaphore;
+		wait_info.pValues        = &target;
+		const auto result        = device.waitSemaphores(&wait_info, 50'000'000ull);
+		if (result == vk::Result::eTimeout) {
+			continue;
+		}
+		if (result != vk::Result::eSuccess) {
+			break; // a lost device: the scheduler's own waits report it
+		}
+		const auto now   = SteadyNs();
+		uint64_t   value = target;
+		if (device.getSemaphoreCounterValue(semaphore, &value) != vk::Result::eSuccess || value < target) {
+			value = target;
+		}
+		const auto first = value - seen > OpLatency::Slots ? value - OpLatency::Slots + 1 : seen + 1;
+		for (uint64_t tick = first; tick <= value; tick++) {
+			state.done_ns[tick & (OpLatency::Slots - 1)].store(now, std::memory_order_relaxed);
+		}
+		state.ticks.fetch_add(value - seen, std::memory_order_relaxed);
+		seen = value;
+		state.seen.store(seen, std::memory_order_release);
+	}
+	state.running.store(false, std::memory_order_release);
+}
+
+// The time the watcher saw `tick` done; 0 when it has not (yet), or no longer knows.
+int64_t OpLatencyDoneNs(uint64_t tick) {
+	auto&      state = GetOpLatency();
+	const auto seen  = state.seen.load(std::memory_order_acquire);
+	if (tick == 0 || tick > seen || seen - tick >= OpLatency::Slots - 64) {
+		return 0;
+	}
+	return state.done_ns[tick & (OpLatency::Slots - 1)].load(std::memory_order_relaxed);
+}
+
+void OpLatencyReport(bool force);
+
+void OpLatencyAdd(OpLatency::Class kind, int64_t done_ns) {
+	auto& stat = GetOpLatency().stats[kind];
+	if (done_ns == 0) {
+		stat.early.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		const auto now = SteadyNs();
+		const auto ns  = static_cast<uint64_t>(now > done_ns ? now - done_ns : 0);
+		stat.count.fetch_add(1, std::memory_order_relaxed);
+		stat.sum_ns.fetch_add(ns, std::memory_order_relaxed);
+		auto max = stat.max_ns.load(std::memory_order_relaxed);
+		while (ns > max && !stat.max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+		}
+		stat.buckets[ns < 50'000 ? 0 : ns < 200'000 ? 1 : ns < 1'000'000 ? 2 : ns < 5'000'000 ? 3 : 4].fetch_add(
+		    1, std::memory_order_relaxed);
+	}
+	OpLatencyReport(false);
+}
+
+// Printed with [pop-poll] (force), or by itself when that line has not come for 7 s.
+void OpLatencyReport(bool force) {
+	auto&      state = GetOpLatency();
+	const auto ms    = SteadyNs() / 1'000'000;
+	auto       last  = state.reported_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		state.reported_ms.compare_exchange_strong(last, ms);
+		return;
+	}
+	if (ms - last < (force ? 1000 : 7000) || !state.reported_ms.compare_exchange_strong(last, ms)) {
+		return;
+	}
+	const double s = static_cast<double>(ms - last) / 1000.0;
+	static constexpr const char* names[OpLatency::ClassCount] = {"pending ops (GPU thread)", "priority ops",
+	                                                             "deferred label writes"};
+	std::string text = "[op-latency] " + std::to_string(static_cast<int>(s * 10.0 + 0.5) / 10) + " s, GPU ticks seen " +
+	                   std::to_string(state.ticks.exchange(0)) + (state.running.load() ? "" : " (NO WATCHER)") +
+	                   "; from a tick's completion being observable to its operation running:";
+	for (uint32_t kind = 0; kind < OpLatency::ClassCount; kind++) {
+		auto&      stat  = state.stats[kind];
+		const auto count = stat.count.exchange(0);
+		const auto early = stat.early.exchange(0);
+		const auto sum   = stat.sum_ns.exchange(0);
+		const auto max   = stat.max_ns.exchange(0);
+		uint64_t   b[5];
+		for (uint32_t i = 0; i < 5; i++) {
+			b[i] = stat.buckets[i].exchange(0);
+		}
+		char line[320];
+		std::snprintf(line, sizeof(line),
+		              "%s %s: %.0f/s (+%.0f/s run before the watcher woke), avg %.0f us, max %.0f us, total %.2f ms/s, "
+		              "<50us %llu, <200us %llu, <1ms %llu, <5ms %llu, >=5ms %llu",
+		              kind == 0 ? "" : " |", names[kind], static_cast<double>(count) / s, static_cast<double>(early) / s,
+		              count != 0 ? static_cast<double>(sum) / 1e3 / static_cast<double>(count) : 0.0,
+		              static_cast<double>(max) / 1e3, static_cast<double>(sum) / 1e6 / s,
+		              static_cast<unsigned long long>(b[0]), static_cast<unsigned long long>(b[1]),
+		              static_cast<unsigned long long>(b[2]), static_cast<unsigned long long>(b[3]),
+		              static_cast<unsigned long long>(b[4]));
+		text += line;
+	}
+	text += "\n";
+	std::fputs(text.c_str(), stderr);
+}
+
+void OpLatencyStart(const void* owner, vk::Device device, vk::Semaphore semaphore) {
+	if (!OpLatencyEnabled()) {
+		return;
+	}
+	auto&       state    = GetOpLatency();
+	const void* expected = nullptr;
+	if (!state.owner.compare_exchange_strong(expected, owner)) {
+		return; // one scheduler only
+	}
+	state.stop.store(false, std::memory_order_release);
+	state.running.store(true, std::memory_order_release);
+	state.thread = std::thread([device, semaphore] { OpLatencyWatch(device, semaphore); });
+}
+
+void OpLatencyStop(const void* owner) {
+	if (!OpLatencyEnabled()) {
+		return;
+	}
+	auto& state = GetOpLatency();
+	if (state.owner.load(std::memory_order_acquire) != owner) {
+		return;
+	}
+	state.stop.store(true, std::memory_order_release);
+	if (state.thread.joinable()) {
+		state.thread.join();
+	}
+}
 
 void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
                        uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
@@ -61,6 +250,29 @@ uint32_t DrawFlushInterval() {
 		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 	}();
 	return interval;
+}
+
+// v438y: the interval of the "flush4" toggle mode's on windows (KYTY_TOGGLE_FLUSH_INTERVAL, default
+// 4 as before; 0: no periodic submit). With KYTY_SYNC_TOGGLE=10;KYTY_SYNC_TOGGLE_MODE=flush4 and
+// KYTY_GPU_TIME=1, one run alternates the default 16 with this value every 10 s, and [floor]'s
+// gpu= and fps= show what the periodic submits cost or buy on the GPU (61 % of all submits were
+// "draw interval" in s03, 11-15: 4,400 of 7,200 a second).
+uint32_t ToggleFlushInterval() {
+	static const uint32_t interval = [] {
+		const char* v = std::getenv("KYTY_TOGGLE_FLUSH_INTERVAL");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 4u;
+	}();
+	return interval;
+}
+
+// v438y: [submits] by reason without the full diagnostics (KYTY_FPS_ONLY=0 changes the shader cache
+// key and the timing): KYTY_SUBMIT_STATS=1.
+bool SubmitStats() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_SUBMIT_STATS");
+		return Common::FpsLogDiagnostics() || (v != nullptr && v[0] == '1');
+	}();
+	return enabled;
 }
 
 } // namespace
@@ -249,10 +461,23 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
     : m_gpu_timer(std::make_unique<GpuTimer>(graphics)), m_master(graphics), m_context(context),
       m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	OpLatencyStart(this, m_graphics.device, m_master.Handle()); // KYTY_QUEUE_STATS only
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	OpLatencyStop(this); // before the timeline semaphore goes
+}
+
+int64_t CommandScheduler::OperationDoneNs() noexcept {
+	return t_operation_done_ns;
+}
+
+void CommandScheduler::NoteLabelLatency(int64_t done_ns) noexcept {
+	if (done_ns != 0 && OpLatencyEnabled()) {
+		OpLatencyAdd(OpLatency::Label, done_ns);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -318,6 +543,7 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 
 void CommandScheduler::EndRendering(std::source_location site) {
 	if (Active() && !m_command.IsInvalid()) {
+		const CpuCost::Phase cpu_phase_("Scheduler::EndRendering");
 		Current().EndRendering(site);
 	}
 }
@@ -375,7 +601,7 @@ void CommandScheduler::CompleteDraw() {
 	if (Common::FloorStats::Enabled()) {
 		Common::FloorStats::Add(Common::FloorStats::Get().draws, 1);
 	}
-	const auto interval = SyncToggle::Flush4Window() ? 4u : DrawFlushInterval();
+	const auto interval = SyncToggle::Flush4Window() ? ToggleFlushInterval() : DrawFlushInterval();
 	if (interval == 0u || ++m_recorded_draws < interval) {
 		return;
 	}
@@ -386,7 +612,19 @@ void CommandScheduler::CompleteDraw() {
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	if (Common::FloorStats::Enabled()) {
-		Common::FloorStats::Add(Common::FloorStats::Get().cmd_buffers, 1);
+		auto& floor = Common::FloorStats::Get();
+		Common::FloorStats::Add(floor.cmd_buffers, 1);
+		// [floor] lag=: how many command buffers this thread has handed off that the host GPU has
+		// not finished (recording thread + GPU), sampled at every 8th submit with a fresh GPU tick
+		// (one driver call, ~500 a second). Near 0: the GPU keeps up with this thread. A large
+		// share of cb/f: the frame waits behind the recording thread or the GPU.
+		if ((++m_lag_sample_counter & 7u) == 0) {
+			m_master.Refresh();
+			const auto current = m_master.CurrentTick();
+			const auto done    = m_master.KnownGpuTick();
+			Common::FloorStats::Add(floor.lag_ticks, current > done + 1 ? current - done - 1 : 0);
+			Common::FloorStats::Add(floor.lag_samples, 1);
+		}
 	}
 	Submit(submit);
 	BeginNext();
@@ -403,11 +641,21 @@ void CommandScheduler::FlushAndWait() {
 void CommandScheduler::Finish() {
 	KYTY_PROFILER_FUNCTION();
 	CheckActive();
+	const CpuCost::Phase cpu_phase_("Scheduler::Finish");
 	if (!m_command.IsInvalid()) {
 		DefaultSubmitReason("finish");
 		Submit();
 	}
+	const auto wait_begin = std::chrono::steady_clock::now();
 	m_master.Wait(CurrentTick() - 1);
+	if (Common::FloorStats::Enabled() && GuestGpu::IsGpuThread()) {
+		auto& floor = Common::FloorStats::Get();
+		Common::FloorStats::Add(floor.gpu_wait_ns,
+		                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                  std::chrono::steady_clock::now() - wait_begin)
+		                                                  .count()));
+		Common::FloorStats::Add(floor.gpu_waits, 1);
+	}
 	BeginNext();
 	PopPendingOperations();
 }
@@ -429,6 +677,11 @@ void RecordWait(double seconds, bool drained) {
 	if (!GuestGpu::IsGpuThread()) {
 		return;
 	}
+	if (Common::FloorStats::Enabled()) {
+		auto& floor = Common::FloorStats::Get();
+		Common::FloorStats::Add(floor.gpu_wait_ns, static_cast<uint64_t>(seconds * 1e9));
+		Common::FloorStats::Add(floor.gpu_waits, 1);
+	}
 	auto& stats = g_wait_stats;
 	stats.count++;
 	stats.total_s += seconds;
@@ -449,6 +702,7 @@ void RecordWait(double seconds, bool drained) {
 
 void CommandScheduler::Wait(uint64_t tick) {
 	KYTY_PROFILER_FUNCTION();
+	const CpuCost::Phase cpu_phase_("Scheduler::Wait");
 	EXIT_IF(tick > CurrentTick());
 	// KYTY_WAIT_STACKS=1: a host stack for every 23rd wait that has to block (up to 60), to name
 	// the paths that make the command thread wait for the GPU.
@@ -520,6 +774,51 @@ void CommandScheduler::PopPendingOperations() {
 			return;
 		}
 		if (!m_master.IsFree(front)) {
+			// v445e, KYTY_POP_POLL_US=<n> (default 50; 0: at every call, as before). This runs before
+			// every draw and dispatch (~75,000 a second in a fight), and while the oldest operation's
+			// tick is submitted and not finished each call asked the driver how far the GPU is (~1 us).
+			// Now it asks when a command buffer was submitted since the last time it asked (the GPU got
+			// new work, and whoever waits for a tick submits first) or n microseconds have passed.
+			// An operation runs once its tick is done, never before; here it may run up to n us later.
+			static const int64_t poll_us = [] {
+				const char* value = std::getenv("KYTY_POP_POLL_US");
+				return value != nullptr ? static_cast<int64_t>(std::strtoll(value, nullptr, 10)) : int64_t {50};
+			}();
+			static const bool poll_stats = std::getenv("KYTY_QUEUE_STATS") != nullptr;
+			static std::atomic<uint64_t> calls {0}, polls {0};
+			static std::atomic<int64_t>  reported {0};
+			bool                         poll = true;
+			if (poll_us > 0) {
+				const auto now  = std::chrono::steady_clock::now();
+				const auto tick = m_master.CurrentTick();
+				poll = tick != m_pop_poll_tick || now - m_pop_poll_time >= std::chrono::microseconds(poll_us);
+				if (poll) {
+					m_pop_poll_tick = tick;
+					m_pop_poll_time = now;
+				}
+			}
+			if (poll_stats) {
+				calls.fetch_add(1, std::memory_order_relaxed);
+				polls.fetch_add(poll ? 1u : 0u, std::memory_order_relaxed);
+				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                    std::chrono::steady_clock::now().time_since_epoch())
+				                    .count();
+				auto last = reported.load(std::memory_order_relaxed);
+				if (last == 0) {
+					reported.compare_exchange_strong(last, ms);
+				} else if (ms - last >= 5000 && reported.compare_exchange_strong(last, ms)) {
+					const double s = static_cast<double>(ms - last) / 1000.0;
+					std::fprintf(stderr,
+					             "[pop-poll] %.0f calls/s with an unfinished oldest operation, %.0f/s asked the "
+					             "driver (KYTY_POP_POLL_US=%lld)\n",
+					             static_cast<double>(calls.exchange(0)) / s, static_cast<double>(polls.exchange(0)) / s,
+					             static_cast<long long>(poll_us));
+					OpLatencyReport(true);
+				}
+			}
+			if (!poll) {
+				return; // nothing new is known: the loop below would find the front not free
+			}
 			m_master.Refresh();
 		}
 	}
@@ -535,7 +834,13 @@ void CommandScheduler::PopPendingOperations() {
 			m_pending_operations.pop();
 		}
 		WaitPriorityOperations(operation.tick);
+		if (OpLatencyEnabled()) {
+			const auto done_ns  = OpLatencyDoneNs(operation.tick);
+			OpLatencyAdd(OpLatency::Pending, done_ns);
+			t_operation_done_ns = done_ns != 0 ? done_ns : SteadyNs();
+		}
 		RunOperation(std::move(operation.callback));
+		t_operation_done_ns = 0;
 	}
 }
 
@@ -621,7 +926,13 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		if (!stop.stop_requested()) {
 			// Priority callbacks publish labels, interrupts, fences, and flips to guest waiters.
 			DrainProtectionHelper(ProtectDrainReason::GuestSignal);
+			if (OpLatencyEnabled()) {
+				const auto done_ns  = OpLatencyDoneNs(operation.tick);
+				OpLatencyAdd(OpLatency::Priority, done_ns);
+				t_operation_done_ns = done_ns != 0 ? done_ns : SteadyNs();
+			}
 			RunOperation(std::move(operation.callback));
+			t_operation_done_ns = 0;
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
@@ -679,8 +990,11 @@ CommandBuffer& CommandScheduler::Current() {
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
+	const CpuCost::Phase cpu_phase_("Scheduler::BeginCommand");
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_open = true;
+	m_command_serial++;       // v445d: a new command buffer:
+	m_compute_state_serial++; // nothing is bound in it
 	// Ticks are allocated in submit order, so this command buffer will be submitted with the
 	// current one.
 	const auto tick = m_master.CurrentTick();
@@ -704,6 +1018,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	KYTY_PROFILER_FUNCTION();
+	const CpuCost::Phase cpu_phase_("Scheduler::Submit"); // the hand-off of a finished command buffer
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
@@ -724,7 +1039,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			std::fflush(stderr);
 		}
 	}
-	if (static const bool fps_log = Common::FpsLogDiagnostics(); fps_log) {
+	if (static const bool fps_log = SubmitStats(); fps_log) {
 		static std::atomic<uint64_t> count {0};
 		static std::atomic<int64_t>  window_start {0};
 		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -826,8 +1141,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
+	const CpuCost::Phase cpu_phase_("Scheduler::QueueSubmit"); // on the GPU thread only without a recording thread
 	// KYTY_UPLOAD_WORKER: the staging bytes this submission's copies read are written.
 	WaitUploadWorker(job.upload_reads);
+	// v438zv (KYTY_TEX_SPARSE): the sparse binds asked for so far are done before this runs.
+	m_graphics.WaitSparseBinds();
 	// Every guarded write recorded in this command buffer must be protected before it can execute.
 	DrainProtectionHelper(ProtectDrainReason::Submit);
 	auto&      graphics = m_graphics;
@@ -969,6 +1287,7 @@ void CommandScheduler::DispatchChunk() {
 }
 
 vk::CommandBuffer CommandScheduler::DrainRecording() {
+	m_compute_state_serial++; // whoever asked records directly: the compute bind point may change
 	if (!m_threaded) {
 		return m_command.m_buffer;
 	}
@@ -983,6 +1302,18 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 	if (stacks && m_drains % 4999 == 0 && m_drains / 4999 <= 64) {
 		LOGF("Recording thread drain %" PRIu64 ":\n%s", m_drains,
 		     Common::HostBacktrace().c_str());
+	}
+	if (m_chunks_executed != m_chunks_dispatched && Common::FloorStats::Enabled()) {
+		// [floor] drain=: this thread waiting for the recording thread to catch up.
+		const auto wait_begin = std::chrono::steady_clock::now();
+		m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
+		auto& floor = Common::FloorStats::Get();
+		Common::FloorStats::Add(floor.record_drain_ns,
+		                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                  std::chrono::steady_clock::now() - wait_begin)
+		                                                  .count()));
+		Common::FloorStats::Add(floor.record_drains, 1);
+		return m_worker_buffer;
 	}
 	m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
 	return m_worker_buffer;
@@ -1008,11 +1339,21 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 			chunk = std::move(m_record_queue.front());
 			m_record_queue.pop_front();
 		}
+		// [floor] rec=: the recording thread's busy time (two clock reads per chunk).
+		const bool floor_stats = Common::FloorStats::Enabled();
+		const auto chunk_begin = floor_stats ? std::chrono::steady_clock::now()
+		                                     : std::chrono::steady_clock::time_point {};
 		for (auto* command = chunk->first; command != nullptr;) {
 			auto* next = command->next;
 			command->Execute(m_worker_buffer);
 			command->~RecordedCommand();
 			command = next;
+		}
+		if (floor_stats) {
+			Common::FloorStats::Add(Common::FloorStats::Get().record_busy_ns,
+			                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                  std::chrono::steady_clock::now() - chunk_begin)
+			                                                  .count()));
 		}
 		chunk->first = nullptr;
 		chunk->last  = nullptr;

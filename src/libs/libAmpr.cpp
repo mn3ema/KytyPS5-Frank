@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/dateTime.h"
 #include "common/file.h"
+#include "common/floorStats.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/timer.h"
@@ -1819,6 +1820,9 @@ static void AmmDiagWaitBegin(bool counter, uint64_t target, uint64_t ref, uint32
 
 static void AmmDiagWaitEnd() {
 	t_wait_total_us += AmmDiagMicros() - t_wait_begin_us;
+	if (Common::FloorStats::Enabled()) {
+		Common::FloorStats::Add(Common::FloorStats::Get().amm_wait_ns, (AmmDiagMicros() - t_wait_begin_us) * 1000u);
+	}
 	std::scoped_lock lock(g_amm_diag_mutex);
 	for (auto it = g_current_waits.begin(); it != g_current_waits.end(); ++it) {
 		if (it->engine == t_ampr_engine) {
@@ -1991,8 +1995,14 @@ private:
 			const double ms = std::chrono::duration<double, std::milli>(
 			                      std::chrono::steady_clock::now() - batch_begin)
 			                      .count();
+			if (Common::FloorStats::Enabled()) {
+				auto& floor = Common::FloorStats::Get();
+				Common::FloorStats::Add(floor.amm_batches, 1);
+				Common::FloorStats::Add(floor.amm_batch_ns, static_cast<uint64_t>(ms * 1e6));
+			}
+			// The first 2,000 (64 until v438m: a 23-minute session passed that in its first half).
 			static std::atomic<uint32_t> logged {0};
-			if (ms >= 20.0 && logged.fetch_add(1) < 64) {
+			if (ms >= 20.0 && logged.fetch_add(1) < 2000) {
 				size_t unmaps = 0;
 				for (const auto& map: submission.state.amm_map_commands) {
 					unmaps += map.kind == AmmCommandKind::Unmap ? 1u : 0u;
@@ -2349,7 +2359,7 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				if (const double waited_ms = wait_timer.GetTimeS() * 1000.0;
 				    waited_ms >= (amm_engine ? 5.0 : 50.0)) {
 					static std::atomic<uint32_t> logged {0};
-					if (logged.fetch_add(1) < 96) {
+					if (logged.fetch_add(1) < 2000) {
 						std::fprintf(stderr,
 						             "[amm-wait] %s address=0x%016" PRIx64 " compare=%u ref=0x%016" PRIx64
 						             " observed=0x%016" PRIx64 " waited=%.1f ms%s\n",
@@ -2480,7 +2490,7 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 							                                 .count();
 							    waited_ms >= 5.0) {
 								static std::atomic<uint32_t> logged {0};
-								if (logged.fetch_add(1) < 96) {
+								if (logged.fetch_add(1) < 2000) {
 									std::fprintf(stderr,
 									             "[amm-wait] %s counter=%u compare=%u ref=0x%016" PRIx64
 									             " observed=0x%016" PRIx64 " waited=%.1f ms%s\n",

@@ -115,6 +115,9 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
+	if (RtTracePc(ctx.state)) {
+		EmitRtTraceMark(ctx.state, RtTraceMark::End);
+	}
 	if (UsesPixelInterlock(ctx.state.program)) {
 		ctx.state.builder.AddFunction(spv::OpEndInvocationInterlockEXT);
 	}
@@ -163,6 +166,34 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			}
 			auto condition = ctx.Def(info.condition);
 			auto& st       = ctx.state;
+			if (st.rt_missing_call_variable != 0 && ctx.half == 0) {
+				// v443: a wave one of whose lanes found no callable for its call target takes the
+				// exit of the loops around the call (the whole wave: its branches are the wave's, as
+				// the guest's are).
+				const bool true_exits = std::ranges::find(st.rt_call_loop_merges, term.true_block) !=
+				                        st.rt_call_loop_merges.end();
+				const bool false_exits = std::ranges::find(st.rt_call_loop_merges, term.false_block) !=
+				                         st.rt_call_loop_merges.end();
+				if (true_exits != false_exits) {
+					st.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+					st.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+					const auto flag = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpLoad, TypeU32(st), flag, st.rt_missing_call_variable);
+					const auto set    = Binary(st, spv::OpINotEqual, TypeBool(st), flag, ConstantU32(st, 0u));
+					const auto ballot = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(st, 4), ballot,
+					                       ConstantU32(st, spv::ScopeSubgroup), set);
+					const auto low  = st.builder.AllocateId();
+					const auto high = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpCompositeExtract, TypeU32(st), low, ballot, 0);
+					st.builder.AddFunction(spv::OpCompositeExtract, TypeU32(st), high, ballot, 1);
+					const auto leave = Binary(st, spv::OpINotEqual, TypeBool(st),
+					                          Binary(st, spv::OpBitwiseOr, TypeU32(st), low, high), ConstantU32(st, 0u));
+					condition = true_exits ? Binary(st, spv::OpLogicalOr, TypeBool(st), condition, leave)
+					                       : Binary(st, spv::OpLogicalAnd, TypeBool(st), condition,
+					                                Unary(st, spv::OpLogicalNot, TypeBool(st), leave));
+				}
+			}
 			if (st.loop_guard_variable != 0 && ctx.half == 0) {
 				const bool true_exits = std::ranges::find(st.loop_guard_merges, term.true_block) !=
 				                        st.loop_guard_merges.end();
@@ -171,7 +202,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				if (true_exits != false_exits) {
 					// Count the decision; past the limit, take the exit. KYTY_LOOP_GUARD_LIMIT
 					// (default 65536) sets the limit (LoopGuard.h; part of the shader cache key).
-					const uint32_t LoopGuardLimit = IR::LoopGuardLimit(st.program.shader_hash);
+					const uint32_t LoopGuardLimit =
+					    st.rt_loop_cap != 0 ? st.rt_loop_cap : IR::LoopGuardLimit(st.program.shader_hash);
 					const auto         count          = st.builder.AllocateId();
 					st.builder.AddFunction(spv::OpLoad, TypeU32(st), count, st.loop_guard_variable);
 					const auto next = st.builder.AllocateId();
@@ -182,6 +214,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 					if (st.loop_guard_report_function != 0) {
 						st.builder.AddFunction(spv::OpFunctionCall, TypeVoid(st), st.builder.AllocateId(),
 						                       st.loop_guard_report_function, next);
+					}
+					if (st.rt_loop_cap_report_function != 0) {
+						const auto entry_lanes = st.builder.AllocateId();
+						st.builder.AddFunction(spv::OpLoad, TypeU32(st), entry_lanes, st.rt_entry_lanes_variable);
+						st.builder.AddFunction(spv::OpFunctionCall, TypeVoid(st), st.builder.AllocateId(),
+						                       st.rt_loop_cap_report_function, next, ConstantU32(st, info.start_pc),
+						                       entry_lanes);
 					}
 					const auto exhausted = st.builder.AllocateId();
 					st.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(st), exhausted, next,
@@ -443,6 +482,9 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		if (RtTracePc(ctx.state)) {
+			EmitRtTraceMark(ctx.state, RtTraceMark::Block, program.block_info[index].start_pc);
+		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block, program.block_info[index]);
 	}
@@ -1168,15 +1210,61 @@ void EmitProgram(EmitterState& state) {
 	// KYTY_LOOP_GUARD_HASHES (LoopGuard.h: a hash list, "all" or "digits:<hex digits>"): the
 	// binding layout decided (BindingLayout::loop_guard); unstructured programs have the
 	// dispatcher's own transition cap instead.
-	if (program.bindings.loop_guard && !state.program.dispatcher_fallback) {
+	// v443: a ray-generation module's loops are also left once a call target was missing
+	// (EmitExecuteCallable). KYTY_RT_MISSING_CALL=0: the lane goes on as if the call had returned.
+	static const bool leave_on_missing_call = [] {
+		const char* value = std::getenv("KYTY_RT_MISSING_CALL");
+		return value == nullptr || value[0] != '0';
+	}();
+	const bool missing_call_exits = leave_on_missing_call && program.rt_role == IR::RtRole::Raygen;
+	// v443e: a callable without the loop guard has the callables' loop cap.
+	const uint32_t callable_cap =
+	    program.rt_role == IR::RtRole::Callable && !program.bindings.loop_guard ? IR::RtCallableLoopLimit() : 0u;
+	if ((program.bindings.loop_guard || missing_call_exits || callable_cap != 0) && !state.program.dispatcher_fallback) {
 		for (const auto& info: program.block_info) {
 			if (info.terminator.loop_header && info.terminator.merge_block != UINT32_MAX) {
 				state.loop_guard_merges.push_back(info.terminator.merge_block);
 			}
 		}
-		if (!state.loop_guard_merges.empty()) {
+		if (!state.loop_guard_merges.empty() && program.bindings.loop_guard) {
 			state.loop_guard_variable = state.builder.AllocateId();
 			DefineLoopGuardReport(state);
+		} else if (!state.loop_guard_merges.empty() && callable_cap != 0) {
+			state.loop_guard_variable     = state.builder.AllocateId();
+			state.rt_entry_lanes_variable = state.builder.AllocateId();
+			state.rt_loop_cap             = callable_cap;
+			DefineRtLoopCapReport(state);
+		}
+		if (missing_call_exits) {
+			// The loops the call is in, by the guest's code: the loop begins at or before the call
+			// and its merge block is after it. (A loop whose blocks have no such order counts as
+			// one of them.) The other loops, such as a traversal's own, end by themselves.
+			uint32_t call_pc = UINT32_MAX;
+			for (size_t index = 0; index < program.blocks.size() && index < program.block_info.size(); index++) {
+				for (const auto& inst: *program.blocks[index]) {
+					if (inst.GetOpcode() == IR::ValueOpcode::ExecuteCallable) {
+						call_pc = program.block_info[index].start_pc;
+					}
+				}
+			}
+			for (const auto& info: program.block_info) {
+				if (call_pc == UINT32_MAX || !info.terminator.loop_header || info.terminator.merge_block == UINT32_MAX) {
+					continue;
+				}
+				const auto merge = std::ranges::find_if(program.block_info, [&](const IR::BlockInfo& other) {
+					return other.id == info.terminator.merge_block;
+				});
+				const bool ordered = merge != program.block_info.end() && merge->start_pc > info.start_pc;
+				if (!ordered || (info.start_pc <= call_pc && merge->start_pc > call_pc)) {
+					state.rt_call_loop_merges.push_back(info.terminator.merge_block);
+				}
+			}
+			if (!state.rt_call_loop_merges.empty()) {
+				state.rt_missing_call_variable = state.builder.AllocateId();
+			}
+		}
+		if (!program.bindings.loop_guard && state.rt_loop_cap == 0) {
+			state.loop_guard_merges.clear(); // (collected for the loop guard alone)
 		}
 	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
@@ -1187,6 +1275,18 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.loop_guard_variable, spv::StorageClassFunction,
+		                          ConstantU32(state, 0u));
+	}
+	if (state.rt_missing_call_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.rt_missing_call_variable, spv::StorageClassFunction,
+		                          ConstantU32(state, 0u));
+	}
+	if (state.rt_entry_lanes_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.rt_entry_lanes_variable, spv::StorageClassFunction,
 		                          ConstantU32(state, 0u));
 	}
 	if (state.requirements.function_lds) {
@@ -1237,6 +1337,18 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	if (state.rt_entry_lanes_variable != 0) {
+		// v443e: the subgroup's lanes when the callable starts (its loop cap's report compares them
+		// with the lanes at the loop that hit the cap).
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+		const auto ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+		const auto lanes = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), lanes, ballot, 0);
+		state.builder.AddFunction(spv::OpStore, state.rt_entry_lanes_variable, lanes);
+	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
@@ -1252,6 +1364,9 @@ void EmitProgram(EmitterState& state) {
 		// POPS: the guest orders overlapping pixels itself (POPS_EXITING_WAVE_ID); here the
 		// whole shader is the ordered critical section.
 		state.builder.AddFunction(spv::OpBeginInvocationInterlockEXT);
+	}
+	if (RtTracePc(state)) {
+		EmitRtTraceMark(state, RtTraceMark::Start); // (before the first load the callable makes)
 	}
 	EmitMemoryOffsets(state);
 	EmitSrtVerify(state);

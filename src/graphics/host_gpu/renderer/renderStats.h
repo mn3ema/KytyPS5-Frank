@@ -105,6 +105,40 @@ enum class ReplayNote : uint32_t {
 // Counted, and printed as [multi-replay] every 5 s with KYTY_RENDER_STATS=1.
 void NoteReplay(ReplayNote note);
 
+// Multi-draw packets by class (item 2, 11-20), printed as [multi-packets] every 5 s with
+// KYTY_RENDER_STATS=1. Counted only then. With [multi-replay] it says how many sub-draws a
+// coverage change could reach:
+// - replay for indexed packets: at most indexed-rest (sub-draws after the first), split by
+//   pipeline kind in indexed-mesh / indexed-vertex (every indexed sub-draw that was drawn) and
+//   indexed-writes (those that write memory: they would need the barrier change as well);
+// - replay for non-mesh packets and the write barrier at the packet's end: at most
+//   [multi-replay] no-base (sub-draws after the first with no base), of which base-not-mesh and
+//   base-writes say which kind;
+// - first-draws: the first sub-draws of replayed packets, always drawn in full. Of those:
+//   first-same-state would have been replayed from the previous packet's base if a base lived
+//   across packets (same command buffer, rendering and commit, same registers, and what
+//   ReplayMultiDraw checks; an upper bound, nothing is replayed), first-other-commit had other
+//   work or a submit in between, first-state-changed had other registers, pixel user data, vertex
+//   program or plan-read user data, first-no-base followed a packet that ended without a base.
+enum class MultiPacketNote : uint32_t {
+	Packets,
+	SubDraws,
+	Single, // packets with one sub-draw
+	IndexedPackets,
+	IndexedRest,
+	IndexedMesh,
+	IndexedVertex,
+	IndexedWrites,
+	ReplayPackets,
+	FirstDraws,
+	FirstNoBase,
+	FirstOtherCommit,
+	FirstStateChanged,
+	FirstSameState,
+	Count
+};
+void NoteMultiPacket(MultiPacketNote note, uint64_t count = 1);
+
 } // namespace RenderStats
 } // namespace Libs::Graphics
 

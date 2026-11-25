@@ -130,7 +130,33 @@ public:
 		// how many resolved images. Unchanged since, only the images resolved after need a look.
 		uint64_t checked_generation = 0;
 		size_t   checked_count      = 0;
+		// v439: a block of guest memory an address-keyed image found its T# in (base = the block,
+		// table_offset = the T#'s 32-byte phase); listed in the address directory.
+		bool     address            = false;
+		// v439b: the value heap of a binding (keys are its value directory's entries; each key's
+		// T# is the one the shader asked for, kept in `descriptors`, not read from guest memory).
+		bool     value              = false;
 	};
+	// v439 (address-keyed bindless images, BindlessAddressBlockBits): the index a draw patches
+	// into an address-keyed image's first flattened-SRT word; the shader passes it back with a
+	// request, so the heap it creates resolves keys as that image samples them.
+	[[nodiscard]] uint32_t RegisterAddressResource(const ShaderRecompiler::IR::ImageResource& resource);
+	// The block requests in the last feedback snapshot: a heap and a directory entry for each new
+	// block. Call where the heaps' key requests are taken (the same snapshot).
+	void ProcessAddressRequests();
+	// The address heaps of one view binding (a draw that samples address-keyed images of that
+	// binding keeps their textures readable).
+	// v439b (value-keyed bindless images): the T# requests in the last feedback snapshot get a
+	// value directory entry each; `created` lists the (heap, key) pairs to resolve now.
+	void ProcessValueRequests(std::vector<std::pair<Heap*, uint32_t>>& created);
+	[[nodiscard]] Heap* ValueHeap(uint32_t binding) {
+		return binding < m_value_heaps.size() && m_value_heaps[binding].region != 0 ? &m_value_heaps[binding]
+		                                                                             : nullptr;
+	}
+	[[nodiscard]] const std::vector<Heap*>& AddressHeaps(uint32_t binding) const {
+		static const std::vector<Heap*> none;
+		return binding < m_address_heaps.size() ? m_address_heaps[binding] : none;
+	}
 
 	// The heap for (base, table offset, view binding), created with every entry pending and
 	// room to grow, or moved to a larger region when a descriptor covers more keys; null when
@@ -338,6 +364,15 @@ private:
 	std::array<std::deque<std::pair<uint32_t, uint64_t>>, ImageArrays> m_free_slots; // slot, tick
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
 	uint32_t                m_next_region = 1; // translation[0] is the out-of-range entry
+	// v439: address-keyed images (RegisterAddressResource, ProcessAddressRequests).
+	bool InsertAddressDirectory(uint64_t block, uint32_t phase, uint32_t binding, uint32_t region);
+	std::mutex                                          m_address_mutex;
+	std::vector<ShaderRecompiler::IR::ImageResource>    m_address_resources;
+	std::array<std::vector<Heap*>, ImageArrays>         m_address_heaps;
+	std::unordered_map<uint64_t, Heap*>                 m_address_heap_index; // block | phase / 4 | binding << 3 (blocks are 16 KB aligned)
+	uint32_t                                            m_address_directory_full = 0;
+	std::array<Heap, ShaderRecompiler::IR::BindlessValueBindings> m_value_heaps;
+	uint32_t                                            m_value_directory_full = 0;
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,
 	                                               PlaceholderColors, PlaceholderColors,
 	                                               PlaceholderColors};

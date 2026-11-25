@@ -315,6 +315,21 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	// v438zr: a sparse image takes only the levels that have memory (the others are levels no
+	// view can reach; their bytes are those of memory the game has not mapped).
+	std::vector<vk::BufferImageCopy> bound_copies;
+	if (sparse.sparse && sparse.bound_first != 0) {
+		const auto first = std::min(sparse.bound_first, sparse.tail_first);
+		for (const auto& copy: copies) {
+			if (copy.imageSubresource.mipLevel >= first) {
+				bound_copies.push_back(copy);
+			}
+		}
+		if (bound_copies.empty()) {
+			return;
+		}
+		copies = bound_copies;
+	}
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -411,8 +426,32 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	return {source_layers, destination_layers};
 }
 
+// v446w: the region two images share at a level: a copy between images of different sizes (the
+// game reuses one guest range for 48x264, 59x264, 50x502... targets) took the source's size and
+// wrote past the end of a smaller destination (Mac 11-22: device losses, "WriteInvalid", at the
+// truck-fight cinematics). Block-compressed images keep whole blocks unless the edge is shared.
+static vk::Extent2D SharedCopyExtent(const Image& source, const Image& destination, uint32_t level,
+                                     bool block) {
+	const auto source_width       = std::max(source.backing.extent.width >> level, 1u);
+	const auto source_height      = std::max(source.backing.extent.height >> level, 1u);
+	const auto destination_width  = std::max(destination.backing.extent.width >> level, 1u);
+	const auto destination_height = std::max(destination.backing.extent.height >> level, 1u);
+	auto       width              = std::min(source_width, destination_width);
+	auto       height             = std::min(source_height, destination_height);
+	if (block) {
+		if (width != source_width || width != destination_width) {
+			width = std::max(width & ~3u, std::min(width, 4u));
+		}
+		if (height != source_height || height != destination_height) {
+			height = std::max(height & ~3u, std::min(height, 4u));
+		}
+	}
+	return {width, height};
+}
+
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	(void)EnsureSparseLevels(0, false); // v438zr: a copy writes every level
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	const uint32_t base_depth = source.backing.image_type == backing.image_type
@@ -427,8 +466,9 @@ void Image::CopyImage(Image& source) {
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width  = std::max(source.backing.extent.width >> level, 1u);
-		const auto height = std::max(source.backing.extent.height >> level, 1u);
+		const auto shared = SharedCopyExtent(source, *this, level, source.info.IsBlock() || info.IsBlock());
+		const auto width  = shared.width;
+		const auto height = shared.height;
 		const auto depth  = std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 		vk::ImageCopy copy {};
@@ -533,6 +573,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
+	(void)EnsureSparseLevels(0, false); // v438zr
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
 	const auto     source_aspect =
@@ -570,8 +611,9 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		const auto shared            = SharedCopyExtent(source, *this, level, source_block != 1u);
+		const auto width             = shared.width;
+		const auto height            = shared.height;
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;
@@ -637,6 +679,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
+	(void)EnsureSparseLevels(mip, false); // v438zr
 	m_scheduler.EndRendering();
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
@@ -795,7 +838,28 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	// v438zr (KYTY_TEX_SPARSE=1|2, off by default): a block-compressed 2D texture with a level
+	// chain is made sparse. Such a format can be neither a render target nor a storage image, so
+	// the image is only ever uploaded to and read. It keeps its size and its levels, so nothing a
+	// shader or a sampler counts in levels changes. =1: every level gets memory now (the same
+	// picture, by another path). =2: only the mip tail now; a level gets memory when a view can
+	// reach it (TextureCache::FindTexture): the game names whole chains and keeps the levels it
+	// has not loaded out of reach with the minimum LOD (3,975 of 5,404 MB in F1, 11-17).
+	bool made_sparse = false;
+	if (TexSparseMode() != 0 && graphics.sparse_images && info.IsBlock() && !info.IsVolume() && info.samples == 1 &&
+	    info.resources.layers == 1 && info.resources.levels > 1 && create.imageType == vk::ImageType::e2D &&
+	    graphics.GetImageFormatProperties(
+	        create.format, create.imageType, create.tiling, create.usage,
+	        create.flags | vk::ImageCreateFlagBits::eSparseBinding | vk::ImageCreateFlagBits::eSparseResidency,
+	        &properties) == vk::Result::eSuccess &&
+	    graphics.CreateSparseImage(create, backing, sparse)) {
+		if (graphics.BindSparseLevels(backing, sparse, TexSparseMode() == 1 ? 0u : sparse.tail_first)) {
+			made_sparse = true;
+		} else {
+			graphics.DeleteSparseImage(backing, sparse); // whole, as before
+		}
+	}
+	if (!made_sparse && !graphics.CreateImage(create, backing)) {
 		EXIT("Out of memory: an image fits neither in video memory nor in system memory (the VMA "
 		     "heap lines above give usage and budget). Close other programs; on a card with little "
 		     "video memory lower the resolution; if Windows' commit limit is reached, enlarge the "
@@ -981,8 +1045,26 @@ Image::~Image() {
 	if (backing.image != nullptr) {
 		AuditDestroy(*this, m_scheduler);
 		ImageHistory::NoteDestroy(static_cast<VkImage>(backing.image), m_scheduler.CurrentTick());
-		m_graphics.DeleteImage(backing);
+		if (sparse.sparse) {
+			m_graphics.DeleteSparseImage(backing, sparse);
+		} else {
+			m_graphics.DeleteImage(backing);
+		}
 	}
+}
+
+bool Image::EnsureSparseLevels(uint32_t first, bool upload_again) {
+	if (!sparse.sparse || first >= std::min(sparse.bound_first, sparse.tail_first)) {
+		return false;
+	}
+	if (!m_graphics.BindSparseLevels(backing, sparse, first)) {
+		EXIT("Out of memory: levels %u and up of a %ux%u texture could not be given memory (guest 0x%016" PRIx64 ")\n",
+		     first, info.extent.width, info.extent.height, info.data.address);
+	}
+	if (upload_again) {
+		InvalidateCpuWrite(info.data.address, info.data.size);
+	}
+	return true;
 }
 
 } // namespace Libs::Graphics

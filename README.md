@@ -7,7 +7,7 @@ I'm testing it only on Marvel's Wolverine for now, the tests are all done on my 
 I'm sharing this for anyone who wants to try it and add to it, if you can help us with the issues we're facing that would be awesome.
 This is where it stands right now:
 
-## Where it stands (November 2026, v0.4)
+## Where it stands (November 2026, v0.5)
 
 **Game:** Marvel's Wolverine (PPSA03671, version 01.001.005).
 
@@ -18,11 +18,22 @@ This is where it stands right now:
 | Opening cinematic, the rest | 28–38 | 9 (at scene cuts) |
 | First gameplay, Trask Outpost (jungle at night, rain) | 18–21 | 10 |
 
-Measured with v0.4 on the test laptop (new game, first start with the shipped shader list). The jungle gameplay is the limit right now: the emulator's GPU thread is at its limit there, and that is what the next versions go after.
+Measured with v0.4 on the test laptop (new game, first start with the shipped shader list); v0.5 was not re-measured. The jungle gameplay is the limit right now: the emulator's GPU thread is at its limit there, and that is what the next versions go after.
 
 v0.3 measured other spots (see "New in v0.3" below); the closest match, grass / jungle standing, was 19 FPS.
 
 Target: 60 FPS in Performance mode, 30 in Fidelity.
+
+### New in v0.5 (November 25)
+
+- **Fixed: the GPU crash ("device lost") in the opening cinematic**, in about 2 of 3 new games, in the helicopter scene over the island. The water's tessellation shader (domain shader `b9f49649da3973b7`) looped on a garbage count: tessellated pipelines are built whole (not linked from pipeline libraries) but took their descriptors from the descriptor heap, a rule meant for linked pipelines. Pipelines built whole now keep push descriptors (`KYTY_WHOLE_PUSH=0` restores the old way). 0 hangs in 6 new games with the fix.
+- **The water and terrain tessellation are back** (they drew nothing when linked from pipeline libraries on NVIDIA).
+- **Fixed: the crashes at the start of the cinematics after the truck fight.**
+- **Frame generation (FSR 3.1) as an option.** Off when the emulator starts; **F8** turns it on or off at any time, also on the title screen and after quitting back to the main menu. It adds a generated frame between the game's own frames (smoother motion; the game itself does not run faster). `KYTY_FSR3_FG=1` starts with it on, `KYTY_FSR3_FG=0` removes it.
+- **Bigger shader list**: it now covers the game up to the forest after the truck fight. The first start prepares it in about 20 minutes on the test laptop (about 5 GB of caches), then the game plays without shader-compile stutter where the list covers it.
+- **Title-screen panels**: the shader preparation panel and the frame generation key stay on the title screen until you load a save or start a new game, and come back when you quit to the main menu.
+
+Coming from v0.4 or v0.4.1: use a new folder, or delete the old `_ShaderCache` and `_PipelineCache` folders first (v0.5 builds its caches again).
 
 ### v0.4.1 (November 19)
 
@@ -102,7 +113,7 @@ Stability:
 
 - **Tested only on Marvel's Wolverine, and only on an NVIDIA RTX 5090 Laptop.** Nothing new for AMD in v0.4. Intel GPUs and other games are untested.
 - **Short hitches (100–250 ms) when a new area or a lot of new content appears**, also on a restart. They come from the emulator's GPU thread being at its limit, not from shader compiles.
-- **First launch is long** and writes a large cache next to the emulator (about 25 GB); caches are per GPU and driver, so a driver update means a new warm-up. Set the NVIDIA shader cache size to Unlimited.
+- **First launch is long** and writes a large cache next to the emulator (about 5 GB); caches are per GPU and driver, so a driver update means a new warm-up. Set the NVIDIA shader cache size to Unlimited.
 - **A rare GPU hang** in a chain of compute shaders is still open (seen once in a 16-minute session).
 - **Cards with 16 GB or less** will run with texture trimming much of the time (the jungle gameplay uses 15–17 GB here).
 - **Occasional freeze in some scene changes** (reported in v0.3, for example the drop-off scene; frame counter stuck). Not seen in the v0.4 test runs, but not confirmed fixed. Restarting gets past it.
@@ -117,7 +128,7 @@ Measured in the jungle gameplay on the test laptop:
 - Of the GPU frame, about 11 ms is gaps between the game's work (barriers, copies, sync), about 18 ms is draws and about 5 ms compute. One pixel shader alone takes about 7 ms: the emulator holds the GPU's draw-order lock for the whole shader, where the game needs it only for its last few percent.
 - When a new area appears, the GPU thread is already near its limit, so the extra work for the new content shows up as 100–250 ms frames.
 
-**Next (v0.5):**
+**Next:**
 1. Hold the draw-order lock only where the game asks for it (the 7 ms shader).
 2. Drop barriers between compute passes that don't depend on each other.
 3. Name and fix the work behind the 100 ms+ frames (v0.4 already logs it with `KYTY_HITCH_COST_MS=100`).
@@ -129,8 +140,8 @@ Needs 64-bit Windows 10/11, a CPU with AVX2 (Intel Haswell from 2013 or AMD Zen,
 
 1. Download the latest `KytyPS5-Frank-...-win64.zip` from the [Releases](../../releases) page and unzip it to a folder on a drive with plenty of free space (the first start writes a large cache next to the emulator).
 2. You need your own legally dumped copy of the game, version 01.001.005. No games or system files are provided or linked.
-3. Open `Play.bat` in a text editor (right-click > Edit) and set `GAME` to your game folder, the one that contains `eboot.bin`, for example `set GAME=D:\Games\Wolverine`. If you used v0.3, delete its `_ShaderCache` and `_PipelineCache` folders.
-4. Double-click `Play.bat`. The first start shows "Preparing pipelines" for a long time (about 45–50 minutes on the test laptop); leave it running and the game starts by itself when it's done. To play at once instead, press Esc or Cross and confirm with Y / Circle (the game may stutter until the rest is prepared in the background).
+3. Open `Play.bat` in a text editor (right-click > Edit) and set `GAME` to your game folder, the one that contains `eboot.bin`, for example `set GAME=D:\Games\Wolverine`. If you used an older version, delete its `_ShaderCache` and `_PipelineCache` folders.
+4. Double-click `Play.bat`. The first start shows "Preparing pipelines" for a while (about 20 minutes on the test laptop); leave it running and the game starts by itself when it's done. To play at once instead, press Esc or Cross and confirm with Y / Circle (the game may stutter until the rest is prepared in the background).
 5. Later starts take under a minute. The log goes to `kyty_log.txt` next to `Play.bat`; please attach it when you report a problem.
 
 Settings are environment variables: to change one, add a line such as `set KYTY_KEEP_ASPECT=0` to `Play.bat` before the line that starts `kyty_emulator.exe`. `launcher.exe`, the KytyPS5 launcher, works too, but it doesn't restart a first start that a driver crash cut off.
@@ -148,7 +159,7 @@ A game controller should work too (only the keyboard was tested for this release
 | D-pad | Arrow keys | | Touchpad (left / right) | Backspace / Tab |
 | Left stick | W A S D | | Right stick | T F G H |
 
-F7 uses the mouse as the right stick (F7 again releases it). F11 or Alt+Enter: full screen.
+F7 uses the mouse as the right stick (F7 again releases it). F8 turns frame generation on or off. F11 or Alt+Enter: full screen.
 
 The settings tuned for Wolverine are built in. To start with plain KytyPS5 settings, set the environment variable `KYTY_FRANK_DEFAULTS=0`.
 

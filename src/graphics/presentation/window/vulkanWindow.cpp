@@ -18,6 +18,9 @@
 #include "graphics/host_gpu/renderer/barrierSink.h"
 #include "graphics/host_gpu/renderer/barrierStats.h"
 #include "graphics/host_gpu/renderer/staleHooks.h"
+#include "graphics/host_gpu/renderer/fsr3FrameGen.h"
+#include "graphics/host_gpu/renderer/upscaler/dlss.h"
+#include "graphics/host_gpu/renderer/upscaler/fsr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -27,6 +30,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -435,7 +439,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 }
 
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
-	                                 const std::vector<const char*>& device_extensions) {
+	                                 const std::vector<const char*>& device_extensions, vk::SurfaceKHR surface) {
 	// Aftermath must be enabled before the device exists (KYTY_AFTERMATH_DLL, opt-in).
 	Aftermath::Initialize();
 	const auto physical_device = graphics.physical_device;
@@ -646,6 +650,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
 		features12.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
 	}
+	// v442: a callable split's fixed set layout (IR/RtCallable.h, BindingLayout::rt_fixed) has
+	// partially bound bindings. The feature is on with bindless images; without them it is enabled
+	// only when callable splits were asked for (KYTY_RT_CALLABLES added the extension).
+	if (features12.descriptorBindingPartiallyBound != VK_TRUE &&
+	    supported_features12.descriptorBindingPartiallyBound == VK_TRUE &&
+	    HasExtension(device_extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)) {
+		features12.descriptorBindingPartiallyBound = VK_TRUE;
+	}
+	graphics.partially_bound_enabled = features12.descriptorBindingPartiallyBound == VK_TRUE;
+	ShaderRecompiler::IR::SetRtFixedLayoutSupported(graphics.partially_bound_enabled);
 	graphics.bindless_storage_enabled =
 	    graphics.bindless_enabled &&
 	    supported_features12.shaderStorageImageArrayNonUniformIndexing == VK_TRUE &&
@@ -780,6 +794,37 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.occlusion_query_precise = supported_features2.features.occlusionQueryPrecise == VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
+	// v438zr (KYTY_TEX_SPARSE=1|2): sparse residency for block-compressed textures. Asked of the
+	// device only with the switch, and only when it has both features and the render queue family
+	// can bind sparse memory (the binds go through the render queue, under its mutex).
+	// v438zy (Mac 11-17, "make it default"): with KYTY_TEX_SPARSE unset, NVIDIA GPUs use
+	// KYTY_TEX_SPARSE_NVIDIA (Frank default 2: mac6 play, hitches 31.6 -> 4.5 per minute, device
+	// memory flat). Other vendors stay off (untested there).
+	{
+		const char* emulate     = std::getenv("KYTY_EMULATE_NON_NVIDIA");
+		const bool  nvidia      = physical_device.getProperties().vendorID == 0x10deu &&
+		                          !(emulate != nullptr && emulate[0] == '1');
+		const char* nv_default  = std::getenv("KYTY_TEX_SPARSE_NVIDIA");
+		const bool  nv_set      = nv_default != nullptr && (nv_default[0] == '1' || nv_default[0] == '2');
+		SetTexSparseDefault(nvidia && nv_set ? static_cast<uint32_t>(nv_default[0] - '0') : 0u);
+	}
+	if (TexSparseMode() != 0) {
+		bool     sparse_queue = false;
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		sparse_queue = graphics.queue_family < family_count &&
+		               static_cast<bool>(families[graphics.queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		graphics.sparse_images = sparse_queue && supported_features2.features.sparseBinding == VK_TRUE &&
+		                         supported_features2.features.sparseResidencyImage2D == VK_TRUE;
+		if (graphics.sparse_images) {
+			device_features.sparseBinding          = VK_TRUE;
+			device_features.sparseResidencyImage2D = VK_TRUE;
+		}
+		std::fprintf(stderr, "[tex-sparse] KYTY_TEX_SPARSE=%u: sparse textures %s\n", TexSparseMode(),
+		             graphics.sparse_images ? "on" : "not possible on this device (as before)");
+	}
 #if !defined(__APPLE__)
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
 	device_features.depthClamp  = VK_TRUE;
@@ -797,6 +842,66 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan fragmentShaderPixelInterlock (POPS): %s\n", pixel_interlock ? "true" : "false");
 	std::fprintf(stderr, "[device] fragmentShaderPixelInterlock=%d (extension %d)\n",
 	             pixel_interlock ? 1 : 0, interlock_extension ? 1 : 0);
+	// v438zq [sparse-caps]: what this device offers for images that have memory only for some of
+	// their levels (sparse residency). Read only: nothing is enabled or created. A streamed
+	// texture's descriptor names the whole chain and keeps the levels the game has not loaded out
+	// of reach with its minimum LOD; the host image has memory for all of them (3,975 of 5,404 MB
+	// in F1, 11-17). Leaving those levels without memory is exact only if the image keeps its size
+	// and level count (the sampler's LOD clamps, explicit LODs and size queries all count levels
+	// from the view's base), which sparse residency does and a smaller image does not. Views bound
+	// to texel fetches would keep every level: a fetch is not clamped, and what an unbound level
+	// returns (zeros with residencyNonResidentStrict) is not always what a zero-filled compressed
+	// level decodes to.
+	{
+		const auto& f = supported_features2.features;
+		const auto& p = properties2.properties.sparseProperties;
+		bool        sparse_queue = false;
+		{
+			uint32_t count = 0;
+			physical_device.getQueueFamilyProperties(&count, nullptr);
+			std::vector<vk::QueueFamilyProperties> families(count);
+			physical_device.getQueueFamilyProperties(&count, families.data());
+			sparse_queue = graphics.queue_family < count &&
+			               static_cast<bool>(families[graphics.queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		}
+		std::fprintf(stderr,
+		             "[sparse-caps] sparseBinding=%d sparseResidencyImage2D=%d sparseResidencyImage3D=%d "
+		             "sparseResidencyAliased=%d | residencyNonResidentStrict=%d residencyAlignedMipSize=%d "
+		             "residencyStandard2DBlockShape=%d | the render queue family can bind sparse memory: %d | "
+		             "sparseAddressSpaceSize %llu GB\n",
+		             f.sparseBinding ? 1 : 0, f.sparseResidencyImage2D ? 1 : 0, f.sparseResidencyImage3D ? 1 : 0,
+		             f.sparseResidencyAliased ? 1 : 0, p.residencyNonResidentStrict ? 1 : 0,
+		             p.residencyAlignedMipSize ? 1 : 0, p.residencyStandard2DBlockShape ? 1 : 0, sparse_queue ? 1 : 0,
+		             static_cast<unsigned long long>(properties2.properties.limits.sparseAddressSpaceSize >> 30u));
+		static constexpr vk::Format formats[] = {
+		    vk::Format::eBc1RgbaUnormBlock, vk::Format::eBc1RgbaSrgbBlock, vk::Format::eBc3UnormBlock,
+		    vk::Format::eBc3SrgbBlock,      vk::Format::eBc4UnormBlock,    vk::Format::eBc5UnormBlock,
+		    vk::Format::eBc5SnormBlock,     vk::Format::eBc6HUfloatBlock,  vk::Format::eBc7UnormBlock,
+		    vk::Format::eBc7SrgbBlock,      vk::Format::eR8G8B8A8Unorm,    vk::Format::eR8G8B8A8Srgb,
+		    vk::Format::eR8Unorm,           vk::Format::eR8G8Unorm,        vk::Format::eR16G16B16A16Sfloat,
+		};
+		std::string text;
+		for (const auto format: formats) {
+			uint32_t count = 0;
+			const auto usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst |
+			                   vk::ImageUsageFlagBits::eTransferSrc;
+			physical_device.getSparseImageFormatProperties(format, vk::ImageType::e2D, vk::SampleCountFlagBits::e1, usage,
+			                                               vk::ImageTiling::eOptimal, &count, nullptr);
+			std::vector<vk::SparseImageFormatProperties> list(count);
+			if (count != 0) {
+				physical_device.getSparseImageFormatProperties(format, vk::ImageType::e2D, vk::SampleCountFlagBits::e1,
+				                                               usage, vk::ImageTiling::eOptimal, &count, list.data());
+			}
+			if (count == 0) {
+				text += fmt::format(" | {}: no", vk::to_string(format));
+			} else {
+				text += fmt::format(" | {}: {}x{} texels a block, flags {}", vk::to_string(format),
+				                    list[0].imageGranularity.width, list[0].imageGranularity.height,
+				                    vk::to_string(list[0].flags));
+			}
+		}
+		std::fprintf(stderr, "[sparse-caps] 2D sampled images by format%s\n", text.c_str());
+	}
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
 	device_features.independentBlend                     = VK_TRUE;
@@ -908,6 +1013,58 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                            (nv_diagnostics_value != nullptr && nv_diagnostics_value[0] == '1');
 	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
 	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
+	// v440 (KYTY_RT_CALLABLES): the ray-tracing pipeline, when its extensions were added.
+	vk::PhysicalDeviceRayTracingPipelineFeaturesKHR ray_tracing_enable {};
+	if (HasExtension(device_extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)) {
+		vk::PhysicalDeviceRayTracingPipelineFeaturesKHR supported_rt {};
+		vk::PhysicalDeviceFeatures2                     rt_query {};
+		rt_query.pNext = &supported_rt;
+		physical_device.getFeatures2(&rt_query);
+		if (supported_rt.rayTracingPipeline) {
+			vk::PhysicalDeviceRayTracingPipelinePropertiesKHR rt_properties {};
+			vk::PhysicalDeviceProperties2                     rt_properties2 {};
+			rt_properties2.pNext = &rt_properties;
+			physical_device.getProperties2(&rt_properties2);
+			ray_tracing_enable.rayTracingPipeline = VK_TRUE;
+			ray_tracing_enable.rayTracingPipelineTraceRaysIndirect = supported_rt.rayTracingPipelineTraceRaysIndirect;
+			graphics.rt_trace_indirect_enabled = supported_rt.rayTracingPipelineTraceRaysIndirect == VK_TRUE;
+			ray_tracing_enable.pNext              = const_cast<void*>(create_info.pNext);
+			create_info.pNext                     = &ray_tracing_enable;
+			graphics.ray_tracing_pipeline_enabled = true;
+			graphics.rt_group_handle_size         = rt_properties.shaderGroupHandleSize;
+			graphics.rt_group_handle_alignment    = rt_properties.shaderGroupHandleAlignment;
+			graphics.rt_group_base_alignment      = rt_properties.shaderGroupBaseAlignment;
+			graphics.rt_max_group_stride          = rt_properties.maxShaderGroupStride;
+			graphics.rt_pipeline_library_enabled  = HasExtension(device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+		}
+		std::fprintf(stderr, "[rt-callables] ray-tracing pipeline: %s%s (handle %u, align %u, base align %u)\n",
+		             graphics.ray_tracing_pipeline_enabled ? "enabled" : "not supported",
+		             graphics.rt_trace_indirect_enabled ? ", indirect launch" : "",
+		             graphics.rt_group_handle_size, graphics.rt_group_handle_alignment,
+		             graphics.rt_group_base_alignment);
+	}
+	// v441a: maximal reconvergence for the ray-tracing modules (spirvEmitterRt.cpp).
+	vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR uniform_control_flow_enable {};
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR        maximal_reconvergence_enable {};
+	if (graphics.ray_tracing_pipeline_enabled &&
+	    HasExtension(device_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
+		vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR supported_ucf {};
+		vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR        supported_mr {};
+		supported_ucf.pNext = &supported_mr;
+		vk::PhysicalDeviceFeatures2 query {};
+		query.pNext = &supported_ucf;
+		physical_device.getFeatures2(&query);
+		if (supported_ucf.shaderSubgroupUniformControlFlow && supported_mr.shaderMaximalReconvergence) {
+			uniform_control_flow_enable.shaderSubgroupUniformControlFlow = VK_TRUE;
+			maximal_reconvergence_enable.shaderMaximalReconvergence    = VK_TRUE;
+			uniform_control_flow_enable.pNext  = &maximal_reconvergence_enable;
+			maximal_reconvergence_enable.pNext = const_cast<void*>(create_info.pNext);
+			create_info.pNext                  = &uniform_control_flow_enable;
+			ShaderRecompiler::Spirv::SetRtMaximalReconvergence(true);
+		}
+		std::fprintf(stderr, "[rt-callables] maximal reconvergence: %s\n",
+		             supported_mr.shaderMaximalReconvergence ? "on" : "not supported");
+	}
 	if (nv_diagnostics &&
 	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 		vk::PhysicalDeviceDiagnosticsConfigFeaturesNV supported_diagnostics {};
@@ -960,7 +1117,24 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// bindings (SetRobustBufferAccess, upstream ee034be4): plain loads and stores skip the
 	// shader's own check. A coarser alignment would round the range past the guest's last byte.
 	{
-		const bool robust = robustness2_ext_enabled &&
+		// v438zs, KYTY_EMULATE_NON_NVIDIA=1: the two choices below that follow the device are
+		// made as on a card that is not NVIDIA's with a storage-buffer bounds alignment over 1
+		// (AMD: 4): the shaders check storage buffer bounds themselves, and coherent loads get
+		// their acquire barrier. A public user's AMD card lost the device at the first dispatch of
+		// compute shader 06544f382c6b0850 on the title screen (v0.4, 11-17); these are paths an
+		// NVIDIA card never runs, and this lets them run here. The shader cache keys on both, so
+		// the shaders used are translated again under their own key; the normal cache is untouched.
+		// Not emulated: the FP32 flush-to-zero execution mode (the device has to support it) and
+		// the driver itself.
+		static const bool emulate_non_nvidia = [] {
+			const char* value = std::getenv("KYTY_EMULATE_NON_NVIDIA");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (emulate_non_nvidia) {
+			std::fprintf(stderr, "[gpu] KYTY_EMULATE_NON_NVIDIA: shader bounds checks and coherent-load acquire "
+			                     "barriers, as on a card without byte-exact device bounds\n");
+		}
+		const bool robust = !emulate_non_nvidia && robustness2_ext_enabled &&
 		                    supported_robustness2.robustBufferAccess2 == VK_TRUE &&
 		                    supported_robustness2.nullDescriptor == VK_TRUE &&
 		                    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
@@ -972,7 +1146,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		                 robustness2_properties.robustStorageBufferAccessSizeAlignment));
 	}
 	// NVIDIA reloads coherent loads without a barrier; AMD's drivers need one (SpirvEmitter.h).
-	ShaderRecompiler::Spirv::SetCoherentLoadAcquire(properties2.properties.vendorID != 0x10deu);
+	{
+		const char* emulate = std::getenv("KYTY_EMULATE_NON_NVIDIA"); // see the bounds choice above
+		ShaderRecompiler::Spirv::SetCoherentLoadAcquire((emulate != nullptr && emulate[0] == '1') ||
+		                                                properties2.properties.vendorID != 0x10deu);
+	}
 	LOGF("Vulkan coherent loads: acquire barrier %s\n",
 	     ShaderRecompiler::Spirv::GetCoherentLoadAcquire() ? "on" : "off");
 	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeline_executable {};
@@ -1014,11 +1192,38 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	create_info.pQueueCreateInfos       = queue_create_infos.data();
-	create_info.queueCreateInfoCount    = queue_create_count;
+	// Frame generation's swapchain presents and acquires on queues of its own (KYTY_FSR3_FG=1).
+	std::vector<vk::DeviceQueueCreateInfo> queue_infos(queue_create_infos.begin(),
+	                                                   queue_create_infos.begin() + queue_create_count);
+	Fsr3::FrameGen::AddQueues(graphics.physical_device, surface, queue_infos);
+	create_info.pQueueCreateInfos       = queue_infos.data();
+	create_info.queueCreateInfoCount    = static_cast<uint32_t>(queue_infos.size());
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
+
+	// v438w: the device's configuration, on stderr in every log. The driver neither serves nor
+	// replaces a pipeline-cache entry written by a device of another configuration (v437q), so two
+	// runs on one folder that differ here undo each other's warm-up; the diagnostic inputs below
+	// get cache files and a warmed record of their own.
+	{
+		std::vector<std::string> names(device_extensions.begin(), device_extensions.end());
+		std::sort(names.begin(), names.end());
+		uint64_t hash = 1469598103934665603ull;
+		for (const auto& name: names) {
+			for (const char c: name) {
+				hash = (hash ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+			}
+			hash = (hash ^ 0xffu) * 1099511628211ull;
+		}
+		graphics.diagnostic_device_bits = (graphics.diagnostic_checkpoints_enabled ? 1u : 0u) |
+		                                  (diagnostics_features.diagnosticsConfig == VK_TRUE ? 2u : 0u) |
+		                                  (device_features.pipelineStatisticsQuery == VK_TRUE ? 4u : 0u);
+		std::fprintf(stderr, "[device] configuration: %zu extensions (hash %016llx), diagnostic bits 0x%x (1 NV checkpoints, "
+		                     "2 NV diagnostics config, 4 pipeline statistics)\n",
+		             names.size(), static_cast<unsigned long long>(hash), graphics.diagnostic_device_bits);
+		std::fflush(stderr);
+	}
 
 	vk::Device device = nullptr;
 
@@ -1287,8 +1492,12 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
+	Dlss::Load();
+	Fsr::Load();
+
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
+	Dlss::AppendExtensions(r.required_extensions, r.available_extensions, false);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -1533,12 +1742,43 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		// v440: KYTY_RT_CALLABLES=<hash,...> (ray-tracing shaders on the ray-tracing pipeline):
+		// only when asked for.
+		if (const char* rt = std::getenv("KYTY_RT_CALLABLES");
+		    rt != nullptr && rt[0] != '\0' && rt[0] != '0' &&
+		    HasExtension(available_extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+		}
+		// v441a: ...with maximal reconvergence (guest wave code after a callable call assumes the
+		// lanes are back together). v443g: off unless KYTY_RT_RECONVERGE=1. With it, NVIDIA's driver
+		// (RTX 5090 Laptop) left lanes inside a callable without a loop until the device was lost
+		// (g443e/g443g); with it off the same traces ran a whole session (g443f).
+		if (const char* rc = std::getenv("KYTY_RT_RECONVERGE");
+		    rc != nullptr && rc[0] == '1' &&
+		    HasExtension(device_extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+		}
+		// ...and the callable splits' modules as pipeline libraries (each compiled once).
+		if (HasExtension(device_extensions, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+		    !HasExtension(device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+		}
 		// KYTY_GPL=1 (zero-compile plan, graphics pipeline libraries): only when asked for.
 		if (const char* gpl = std::getenv("KYTY_GPL");
 		    gpl != nullptr && gpl[0] == '1' &&
 		    HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			if (!HasExtension(device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			}
 			device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 			if (HasExtension(available_extensions, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME)) {
 				device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
@@ -1552,25 +1792,33 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		// The device extensions DLSS asks for (none unless a DLSS model was loaded).
+		Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	}
 
-	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions, surface);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
+	EXIT_IF(graphic_ctx.queue == nullptr);
+	// Before the barrier and stale hooks: frame generation's swapchain copies the driver's own pointers,
+	// so its command buffers stay out of the hooks' per-command-buffer state.
+	Fsr3::FrameGen::Start(graphic_ctx);
 	InstallBarrierSink();
 	InstallBarrierMerge();
 	InstallBarrierStats();
 	InstallStaleHooks(graphic_ctx.device);
-	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
-	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (graphic_ctx.queue_count >= 2) {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
 	}
 	if (graphic_ctx.transfer_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.transfer_family, 0, &graphic_ctx.transfer_queue);
 	}
+	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1605,6 +1853,8 @@ WindowContext::~WindowContext() {
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
+	Fsr::Shutdown();
+	Dlss::Shutdown();
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");

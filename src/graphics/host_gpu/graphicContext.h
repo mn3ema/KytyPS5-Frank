@@ -17,6 +17,7 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
+struct SparseImageState;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -56,6 +57,11 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               external_memory_host_enabled          = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
+	// v438w: what a diagnostic run adds to the device (a normal play start has none): bit 0 the NV
+	// checkpoint extension, bit 1 the NV diagnostics config, bit 2 pipeline statistics queries.
+	// The driver caches and the warmed record of such a device are files of their own
+	// (DeviceConfigTag, GplWarmLoad).
+	uint32_t                           diagnostic_device_bits                = 0;
 	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
 	bool                               host_query_reset_enabled              = false;
 	bool                               calibrated_timestamps_enabled         = false;
@@ -77,6 +83,17 @@ struct GraphicContext {
 	bool                               depth_color_copy_enabled               = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// v440 (KYTY_RT_CALLABLES): VK_KHR_ray_tracing_pipeline, for callable splits of the guest's
+	// ray-tracing shaders (no acceleration structures are built). The shader group handle layout.
+	bool                               ray_tracing_pipeline_enabled          = false;
+	uint32_t                           rt_group_handle_size                  = 0;
+	uint32_t                           rt_group_handle_alignment             = 0;
+	uint32_t                           rt_group_base_alignment               = 0;
+	uint32_t                           rt_max_group_stride                   = 0; // maxShaderGroupStride
+	bool                               rt_pipeline_library_enabled           = false; // VK_KHR_pipeline_library
+	bool                               rt_trace_indirect_enabled             = false; // rayTracingPipelineTraceRaysIndirect
+	// v442: descriptorBindingPartiallyBound is enabled (a callable split's fixed set layout).
+	bool                               partially_bound_enabled               = false;
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
 	// bound and updated after bind.
 	bool                               bindless_enabled                      = false;
@@ -176,6 +193,28 @@ struct GraphicContext {
 	// v386 [mem-census]: one line of device memory (VMA heaps: usage, budget, allocated, blocks;
 	// the free-delay quarantine) for the census.
 	[[nodiscard]] std::string DescribeDeviceMemory() const;
+	// v438zr: sparse residency images (one layer, 2D). CreateSparseImage makes the image with no
+	// memory; BindSparseLevels gives memory to the levels from `first` on that have none yet (and
+	// to the mip tail the first time) and returns when the device has bound it.
+	[[nodiscard]] bool CreateSparseImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+	                                     SparseImageState& state);
+	[[nodiscard]] bool BindSparseLevels(VulkanImage& image, SparseImageState& state, uint32_t first);
+	void               DeleteSparseImage(VulkanImage& image, SparseImageState& state);
+	// v438zv: a sparse bind no longer waits for the device on the thread that asked for it (the
+	// GPU thread: 4.9 % of it in Mac's play of 11-18 was this wait). Its fence is kept here, and
+	// every queue submission first waits for all of them (WaitSparseBinds, on the thread that
+	// submits): a command buffer recorded after a bind is submitted after it, so it still runs
+	// with the memory bound. KYTY_TEX_SPARSE_WAIT=1: wait at the bind, as v438zr did.
+	void               WaitSparseBinds();
+	std::mutex             sparse_fence_mutex;
+	std::vector<vk::Fence> sparse_fences;
+	// The sparse features are enabled on the device (set at device creation).
+	bool sparse_images = false;
+	// v438zo [vma-frag]: per memory type, the blocks, what is allocated in them and the free space
+	// left inside them (how many free ranges, the largest). Walks the allocator: for the census only.
+	[[nodiscard]] std::string DescribeFragmentation() const;
+	// The bytes the allocator gave this image (0 when it has none).
+	[[nodiscard]] uint64_t ImageAllocationBytes(const VulkanImage& image) const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
@@ -232,6 +271,31 @@ struct VulkanImageState {
 	// Set by a guest draw's or dispatch's bindings (KYTY_GUEST_STORAGE_REPEAT, Image::GetBarriers).
 	bool guest = false;
 };
+
+// v438zr (KYTY_TEX_SPARSE): a sparse image's memory, level by level. Levels from `bound_first` on
+// have memory; the levels of the mip tail (from `tail_first` on) always do, together.
+struct SparseImageState {
+	bool                       sparse      = false;
+	uint32_t                   levels      = 0;
+	uint32_t                   tail_first  = 0;
+	uint32_t                   bound_first = UINT32_MAX; // UINT32_MAX: nothing bound yet
+	bool                       tail_bound  = false;
+	vk::Extent3D               granularity = {1, 1, 1};
+	uint64_t                   block_bytes = 0;
+	uint64_t                   tail_offset = 0;
+	uint64_t                   tail_size   = 0;
+	uint32_t                   memory_type_bits = 0;
+	uint64_t                   bound_bytes = 0;
+	uint32_t                   binds       = 0;
+	std::vector<VmaAllocation> allocations;
+};
+
+// KYTY_TEX_SPARSE: 0 off, 1 sparse images with every level bound, 2 only the levels a view can
+// reach. Unset: KYTY_TEX_SPARSE_NVIDIA on NVIDIA GPUs (Frank default 2, v438zy), off elsewhere.
+// KYTY_TEX_SPARSE_VERIFY=1: an exit where a view reaches a level without memory.
+[[nodiscard]] uint32_t TexSparseMode();
+void                   SetTexSparseDefault(uint32_t mode);
+[[nodiscard]] bool     TexSparseVerify();
 
 struct VulkanImage {
 	VulkanImage() = default;

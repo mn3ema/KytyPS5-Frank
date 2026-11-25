@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERIR_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERIR_H_
 
+#include "graphics/shader/recompiler/ir/RtCallable.h"
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -108,6 +109,15 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x2 ||
 		                        opcode == ValueOpcode::LoadBufferU32x3 ||
 		                        opcode == ValueOpcode::LoadBufferU32x4);
+	}
+
+	// v439g: an 8- or 16-bit raw load through a GPU-selected descriptor (a ray-tracing shader
+	// reading packed vertex data through a V# taken from its geometry records). Only where the
+	// descriptor is not a valid runtime value: the host-binding paths keep their rules.
+	[[nodiscard]] bool SupportsIndirectSubwordLoad(ValueOpcode opcode) const {
+		return !typed && !formatted &&
+		       ((data_bits == 8u && opcode == ValueOpcode::LoadBufferU8) ||
+		        (data_bits == 16u && opcode == ValueOpcode::LoadBufferU16));
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -227,6 +237,12 @@ struct ImageResource {
 	// the shader emits the instruction for both (as the 2D-specialized module would for a 2D T#) and
 	// selects by the draw's bit (BindingLayout::ImageDim3DDword: 1 = the T# is 2D).
 	bool                          dynamic_3d        = false;
+	// v439: the bindless key is the T#'s own guest address, computed by the shader (handle
+	// arguments 0-2: address low, high, byte offset); see BindlessAddressBlockBits.
+	bool                          bindless_address  = false;
+	// v439b: the bindless key is the T#'s eight words (the handle's arguments, as the shader
+	// built them); see BindlessValueEntries.
+	bool                          bindless_value    = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -435,6 +451,21 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
 
+// v442: the descriptor count of a binding kind in a callable split's fixed set layout
+// (BindingLayout::rt_fixed, IR/RtCallable.h), for the kind's count in the merged program. The SPIR-V
+// arrays have the same lengths.
+[[nodiscard]] constexpr uint32_t RtFixedDescriptorCount(DescriptorBindingKind kind, uint32_t count) {
+	if (kind == DescriptorBindingKind::Buffers) {
+		return RtBufferCapacity;
+	}
+	const auto value = static_cast<uint32_t>(kind);
+	if (kind == DescriptorBindingKind::Samplers ||
+	    (value >= FirstImageBinding && value < FirstImageBinding + ImageBindingCount)) {
+		return RtArrayCapacity(count);
+	}
+	return 1u;
+}
+
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
 	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {
@@ -587,23 +618,41 @@ struct BindingLayout {
 	// draw by RebindBuffers) instead of being baked in; the specialization keeps only the static
 	// bits (swizzle enable, ADD_TID). KYTY_BUFFER_STRIDE_DATA=0: constants as before.
 	uint8_t                        buffer_stride_count = 0; // (8 bits, MaxBuffers 64: keeps the layout's size)
+	// v442 (incremental generations, IR/RtCallable.h): the layout of a callable split. A module's
+	// SPIR-V must not change when later call targets add resources, so nothing in it may depend on
+	// the merged program's counts: every optional part of the shader data is present, the per-buffer
+	// parts have RtBufferCapacity entries (the counts above still say how many the host writes),
+	// the data is never pushed, and the host's descriptor set has fixed capacities
+	// (RtFixedDescriptorCount). KYTY_RT_FIXED_LAYOUT=0: the layout of the merged counts, as before.
+	bool                           rt_fixed            = false;
+	// v443 (shared callables, IR/RtCallable.h): the user data has RtUserDataDwords, and a callable
+	// module reads its place-dependent numbers from its shader record. rt_image_kinds: bit i set
+	// when the fixed set layout has image binding FirstImageBinding + i (this program's kinds and
+	// those any callable split had before it, RtImageKinds).
+	bool                           rt_shared           = false;
+	uint64_t                       rt_image_kinds      = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
+	[[nodiscard]] uint32_t BufferSlots() const { return rt_fixed ? RtBufferCapacity : memory_offset_count; }
+	// The shader data starts with the user data registers.
+	[[nodiscard]] uint32_t UserDataDwords() const {
+		return rt_shared ? RtUserDataDwords : static_cast<uint32_t>(user_data_registers.size());
+	}
 	[[nodiscard]] uint32_t BufferLengthDword() const {
-		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+		return memory_offset_dword + (BufferSlots() + 3u) / 4u;
 	}
 	[[nodiscard]] uint32_t WriteTrackDword() const {
-		return BufferLengthDword() + memory_offset_count;
+		return BufferLengthDword() + BufferSlots();
 	}
 	[[nodiscard]] uint32_t VerifyDword() const {
-		return WriteTrackDword() + (write_tracking ? 2u + 2u * memory_offset_count : 0u);
+		return WriteTrackDword() + (write_tracking || rt_fixed ? 2u + 2u * BufferSlots() : 0u);
 	}
 	[[nodiscard]] uint32_t GuardDword() const {
-		return VerifyDword() + (srt_verify ? 4u : 0u);
+		return VerifyDword() + (srt_verify || rt_fixed ? 4u : 0u);
 	}
 	[[nodiscard]] uint32_t ClipSpaceDword() const {
-		return GuardDword() + (loop_guard ? 2u : 0u);
+		return GuardDword() + (loop_guard || rt_fixed ? 2u : 0u);
 	}
 	[[nodiscard]] uint32_t ExportMappingDword() const {
 		return ClipSpaceDword() + (clip_space ? 6u : 0u);
@@ -612,19 +661,19 @@ struct BindingLayout {
 		return ExportMappingDword() + (export_mapping ? 2u : 0u);
 	}
 	[[nodiscard]] uint32_t ImageClassDword() const {
-		return BufferStrideDword() + buffer_stride_count;
+		return BufferStrideDword() + (rt_fixed ? RtBufferCapacity : buffer_stride_count);
 	}
 	[[nodiscard]] uint32_t ImageLayerDword() const {
-		return ImageClassDword() + ((image_flags & ImageClassFlags) != 0 ? 1u : 0u);
+		return ImageClassDword() + ((image_flags & ImageClassFlags) != 0 || rt_fixed ? 1u : 0u);
 	}
 	[[nodiscard]] uint32_t ImageCubeDword() const {
-		return ImageLayerDword() + ((image_flags & ImageLayerFlags) != 0 ? 1u : 0u);
+		return ImageLayerDword() + ((image_flags & ImageLayerFlags) != 0 || rt_fixed ? 1u : 0u);
 	}
 	[[nodiscard]] uint32_t ImageDim3DDword() const {
-		return ImageCubeDword() + ((image_flags & ImageCubeFlags) != 0 ? 1u : 0u);
+		return ImageCubeDword() + ((image_flags & ImageCubeFlags) != 0 || rt_fixed ? 1u : 0u);
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return ImageDim3DDword() + ((image_flags & ImageDim3DFlags) != 0 ? 1u : 0u);
+		return ImageDim3DDword() + ((image_flags & ImageDim3DFlags) != 0 || rt_fixed ? 1u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -644,6 +693,7 @@ struct ShaderInfo {
 	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
+	static_assert(RtBufferCapacity == MaxBuffers);
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;
@@ -656,6 +706,13 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// v446h: ShaderComputeInputInfo::translation_variant of the translation (in memory only: such
+	// programs never reach the shader disk cache, so the disk Visit leaves it out).
+	uint8_t                          translation_variant = 0;
+	// v446j: this program's formatted buffers keep their format in the program instead of reading
+	// it per dispatch (DynamicBufferFormat off): compute programs, KYTY_COMPUTE_STATIC_FORMATS
+	// (default on). On disk with the program.
+	uint8_t                          static_buffer_formats = 0;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -689,6 +746,10 @@ struct DescriptorSource {
 		// Bindless through the storage array (BindlessStorage2D): the stores to a GPU-selected
 		// image, and the loads of the same descriptor in a pixel-ordered (POPS) section.
 		bool     storage   = false;
+		// v439: looked up by the T#'s guest address (ImageResource::bindless_address); no table.
+		bool     address   = false;
+		// v439b: looked up by the T#'s eight words (ImageResource::bindless_value); no table.
+		bool     value     = false;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;
@@ -863,6 +924,17 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// v440 callable split (IR/RtCallable.h): the ray-generation or callable half, and the payload
+	// size in 32-bit slots.
+	RtRole                        rt_role          = RtRole::None;
+	uint32_t                      rt_payload_words = 0;
+	uint64_t                      rt_code_address  = 0; // callable: its guest code address (S_GETPC base)
+	uint32_t                      rt_code_hash     = 0; // callable: RtCodeHash of its code (v443e)
+	// A merged callable split (MergeRtCallables): the modules, ray generation first. Empty otherwise.
+	std::vector<RtModule>         rt_modules;
+	// While one module of a merged split is emitted (program.blocks its range): every module's
+	// blocks, which the binding layout was made from (CollectMemoryResources, UsesFlattenedSrt).
+	const BlockList*              layout_blocks    = nullptr;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
@@ -875,6 +947,10 @@ struct Program: ResourcePlan {
 	// The shader reads POPS_EXITING_WAVE_ID: a primitive-ordered pixel shader (POPS), whose
 	// overlapping pixels must run in primitive order (the emitter adds a fragment interlock).
 	bool                          uses_pops          = false;
+	// v446a: an EXEC write that can turn on lanes the current EXEC lacks inside a region
+	// (S_ORN2_SAVEEXEC, S_ORN2/S_NOT/S_WQM into EXEC, a nonzero constant into EXEC). With it, or a
+	// cross-lane read, a wave32 shader keeps wave-uniform EXEC branches (spirvEmitterFlow.cpp).
+	bool                          exec_widens_lanes  = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
