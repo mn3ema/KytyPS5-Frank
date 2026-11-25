@@ -50,11 +50,13 @@ Coming from v0.4 or v0.4.1: use a new folder, or delete the old `_ShaderCache` a
 
 The full list is in the [v0.4 release notes](../../releases/tag/v0.4).
 
-### Gameplay video (v0.3)
+### Gameplay video (v0.5)
 
-[![Marvel's Wolverine on PC – PS5 Emulator (KytyPS5-Frank) – RTX 5090 Laptop Gameplay](https://img.youtube.com/vi/kV5F9csrAUk/hqdefault.jpg)](https://youtu.be/kV5F9csrAUk)
+[![Marvel's Wolverine on PC – PS5 Emulator (KytyPS5-Frank v0.5) with Frame Generation](https://img.youtube.com/vi/l7eKDJFNs3Q/hqdefault.jpg)](https://youtu.be/l7eKDJFNs3Q)
 
-About 11 minutes of gameplay with v0.3 on the RTX 5090 Laptop (FPS in the window title). It ends with one of the "device lost" crashes listed under known issues.
+Gameplay with v0.5 on the RTX 5090 Laptop, frame generation on (it is off by default; F8 turns it on or off).
+
+Earlier: [v0.3 gameplay video](https://youtu.be/kV5F9csrAUk).
 
 ### Screenshots
 
