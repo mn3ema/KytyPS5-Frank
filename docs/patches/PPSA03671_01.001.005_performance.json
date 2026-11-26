@@ -1,0 +1,31 @@
+{
+  "name": "Marvel's Wolverine",
+  "id": "PPSA03671",
+  "version": "01.001.005",
+  "process": "eboot.bin",
+  "credits": ["paulohenriquesn"],
+  "mods": [
+    {
+      "name": "Dynamic resolution floor 1280x720 (was 1664x936)",
+      "hint": "The dynamic resolution steps are a table at 0x9B7E7D0, five dwords each (width, height, three floats), from 3840x2160 down to 1664x936. This replaces the last three steps (1920x1080, 1792x1008, 1664x936) with 1536x864, 1408x792 and 1280x720.",
+      "type": "checkbox",
+      "enabled": true,
+      "memory": [
+        { "offset": "09B7E898", "on": "00050000D0020000", "off": "80060000A8030000" },
+        { "offset": "09B7E884", "on": "8005000018030000", "off": "00070000F0030000" },
+        { "offset": "09B7E870", "on": "0006000060030000", "off": "8007000038040000" }
+      ]
+    },
+    {
+      "name": "Output at 1920x1080 (was 3840x2160)",
+      "hint": "The output size is fixed in code at 0x3B0D28B (movabs rcx, stored at +0x14 and +0x60) and passed again as the two immediates of the call to 0x3F0B740.",
+      "type": "checkbox",
+      "enabled": true,
+      "memory": [
+        { "offset": "03B0D28D", "on": "8007000038040000", "off": "000F000070080000" },
+        { "offset": "03B0D2C7", "on": "80070000", "off": "000F0000" },
+        { "offset": "03B0D2CD", "on": "38040000", "off": "70080000" }
+      ]
+    }
+  ]
+}
