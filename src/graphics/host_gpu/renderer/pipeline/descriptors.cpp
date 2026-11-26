@@ -1785,7 +1785,20 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 		table.WriteSlot(slot_binding, slot, view, layout, static_cast<VkImage>(image->backing.image),
 		                heap.base, key, width, height, layers);
 	}
-	const uint32_t entry    = as_array ? (slot | ShaderRecompiler::IR::BindlessSlotArrayFlag) : slot;
+	// v448: a cube T# in the 2D-array binding (KYTY_BINDLESS_CUBE_AS_ARRAY): the shader's
+	// coordinates are cube face coordinates (BindlessSlotCubeFlag); without the flag cube 1 and
+	// up read the wrong layers (Marvel's Wolverine's light cookies: white blotches on metal).
+	// KYTY_BINDLESS_CUBE_FACES=0 leaves the flag off (raw coordinates, as before v448).
+	static const bool cube_faces = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_CUBE_FACES");
+		return value == nullptr || value[0] != '0';
+	}();
+	const bool     cube_in_array = cube_faces && !as_array &&
+	                               slot_binding == ShaderRecompiler::IR::BindlessImages2DArray &&
+	                               descriptor.Type() == Prospero::ImageType::kCube;
+	const uint32_t entry    = as_array        ? (slot | ShaderRecompiler::IR::BindlessSlotArrayFlag)
+	                          : cube_in_array ? (slot | ShaderRecompiler::IR::BindlessSlotCubeFlag)
+	                                          : slot;
 	heap.slots[key]         = entry;
 	heap.images[key]        = binding.image_id;
 	image->bindless_pinned  = true;

@@ -203,6 +203,14 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 // v431 (ImageResource::dynamic_cube): the coordinates both ways, picked by the draw's cube bit.
 uint32_t CoordF32ForImage(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                           uint32_t first, uint32_t components, uint32_t resource, bool cube) {
+	// v448: a bindless 2D-array image whose slot holds a cube T# (BindlessSlotCubeFlag).
+	if (!cube && components == 3u && ctx.state.bindless_cube != 0 &&
+	    BindlessArrayMayBeCube(ImageResourceAt(ctx.state, resource))) {
+		const auto plain = CoordF32(ctx, mem, address, first, components, false);
+		const auto faces = CoordF32(ctx, mem, address, first, components, true);
+		return SelectVector(ctx.state, TypeF32Vector(ctx.state, 3), 3u, ctx.state.bindless_cube,
+		                    faces, plain);
+	}
 	if (!ImageResourceAt(ctx.state, resource).dynamic_cube) {
 		return CoordF32(ctx, mem, address, first, components, cube);
 	}
@@ -1268,6 +1276,21 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 		const auto array_ok = Binary(state, spv::OpLogicalAnd, TypeBool(state), is_array, low_ok);
 		valid = Binary(state, spv::OpLogicalOr, TypeBool(state), valid, array_ok);
 	}
+	// v448: a cube T# in the 2D-array binding: the slot without its flag, coordinates converted.
+	uint32_t cube_slot = 0;
+	if (BindlessArrayMayBeCube(image)) {
+		const auto flags   = Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+		                            ConstantU32(state, IR::BindlessSlotFlagMask));
+		const auto is_cube = Binary(state, spv::OpIEqual, TypeBool(state), flags,
+		                            ConstantU32(state, IR::BindlessSlotCubeFlag));
+		const auto low     = Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
+		                            ConstantU32(state, ~IR::BindlessSlotFlagMask));
+		const auto low_ok  = Binary(state, spv::OpULessThan, TypeBool(state), low, max_slots);
+		const auto cube_ok = Binary(state, spv::OpLogicalAnd, TypeBool(state), is_cube, low_ok);
+		valid              = Binary(state, spv::OpLogicalOr, TypeBool(state), valid, cube_ok);
+		state.bindless_cube = cube_ok;
+		cube_slot           = low;
+	}
 	const auto bad = Binary(state, spv::OpLogicalAnd, TypeBool(state),
 	                        Unary(state, spv::OpLogicalNot, TypeBool(state), pending),
 	                        Unary(state, spv::OpLogicalNot, TypeBool(state), valid));
@@ -1372,9 +1395,12 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 	state.bindless_translation_raw = raw;
 	// Pending keys sample slot 2 (the blue placeholder) while their texture is loaded; a value
 	// that names no slot samples slot 0 (v127).
+	const auto named = state.bindless_cube != 0 && cube_slot != 0
+	                       ? Select(state, TypeU32(state), state.bindless_cube, cube_slot, raw)
+	                       : raw;
 	const auto safe = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), safe, bad, ConstantU32(state, 0u),
-	                          raw);
+	                          named);
 	const auto slot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, pending, ConstantU32(state, 2u),
 	                          safe);
@@ -1558,6 +1584,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = ImageResourceAt(state, mem.resource);
+	state.bindless_cube = 0u;
 	state.bindless_slot = image.bindless ? BindlessSlot(ctx, image, mem.resource, image_arg) : 0u;
 	state.bindless_sampler_slot = 0u;
 	if (image_info.needs_sampler && inst.NumArgs() > 1u &&

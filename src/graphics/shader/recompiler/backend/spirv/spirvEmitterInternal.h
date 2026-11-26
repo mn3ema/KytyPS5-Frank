@@ -235,6 +235,9 @@ struct EmitterState {
 	// The raw translation entry behind bindless_slot (BindlessSlotArrayFlag marks a 2D or 2D-array
 	// texture a 3D image instruction samples).
 	uint32_t                                         bindless_translation_raw      = 0;
+	// v448: for a bindless 2D-array image, the bool "the slot holds a cube T#"
+	// (BindlessSlotCubeFlag); the coordinates are then cube face coordinates. 0 when none.
+	uint32_t                                         bindless_cube                 = 0;
 	// While image_override_index names a resource, ImageResourceAt() returns image_override for
 	// it: the same instruction emitted against another view type of its texture.
 	uint32_t                                         image_override_index          = UINT32_MAX;
@@ -357,6 +360,12 @@ inline bool ProbeAppendWanted(const EmitterState& state) {
 inline bool BindlessVolumeMayBeArray(const IR::ImageResource& image) {
 	return image.bindless && !image.cube && image.resource_class == IR::ImageResourceClass::Sampled &&
 	       image.dimension == Decoder::ImageDimension::Dim3D;
+}
+
+// v448: a bindless sampled 2D-array image: its key may name a cube T# (BindlessSlotCubeFlag).
+inline bool BindlessArrayMayBeCube(const IR::ImageResource& image) {
+	return image.bindless && !image.cube && image.resource_class == IR::ImageResourceClass::Sampled &&
+	       image.dimension == Decoder::ImageDimension::Dim2DArray;
 }
 
 inline const IR::ImageResource& ImageResourceAt(const EmitterState& state, uint32_t index) {

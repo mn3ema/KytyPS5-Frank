@@ -94,6 +94,11 @@ inline constexpr uint32_t BindlessPending        = 0xffffffffu;
 // instruction's dimension, so a 3D sample of it reads layer round(z) (Marvel's Wolverine
 // particles). Pending (all bits set) is told apart by the bit above.
 inline constexpr uint32_t BindlessSlotArrayFlag  = 0x40000000u;
+// v448: in a 2D-array binding's region: the key's T# is a cube (or cube array), held in the
+// 2D-array binding at the slot in the low bits. The hardware addresses a cube T# by its type: a
+// 2D-array instruction's coordinates are cube face coordinates (s, t in [1, 2], layer
+// cube * 8 + face), which the shader converts as for a cube resource (CubeAxis, CubeLayer).
+inline constexpr uint32_t BindlessSlotCubeFlag   = 0x80000000u;
 inline constexpr uint32_t BindlessSlotFlagMask   = 0xc0000000u;
 // v127: slots per image array (BindlessTable::MaxImagesPerArray). A translation value that is
 // not pending and names no slot below this (or, outside a 3D region, carries flag bits) would

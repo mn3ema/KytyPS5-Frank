@@ -184,8 +184,9 @@ public:
 		           : heap.binding;
 	}
 	[[nodiscard]] static uint32_t SlotIndex(uint32_t entry) {
-		return (entry & ShaderRecompiler::IR::BindlessSlotFlagMask) ==
-		               ShaderRecompiler::IR::BindlessSlotArrayFlag
+		const uint32_t flags = entry & ShaderRecompiler::IR::BindlessSlotFlagMask;
+		return flags == ShaderRecompiler::IR::BindlessSlotArrayFlag ||
+		               flags == ShaderRecompiler::IR::BindlessSlotCubeFlag
 		           ? entry & ~ShaderRecompiler::IR::BindlessSlotFlagMask
 		           : entry;
 	}

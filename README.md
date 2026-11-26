@@ -7,7 +7,7 @@ I'm testing it only on Marvel's Wolverine for now, the tests are all done on my 
 I'm sharing this for anyone who wants to try it and add to it, if you can help us with the issues we're facing that would be awesome.
 This is where it stands right now:
 
-## Where it stands (November 2026, v0.5)
+## Where it stands (November 2026, v0.5.1)
 
 **Game:** Marvel's Wolverine (PPSA03671, version 01.001.005).
 
@@ -23,6 +23,11 @@ Measured with v0.4 on the test laptop (new game, first start with the shipped sh
 v0.3 measured other spots (see "New in v0.3" below); the closest match, grass / jungle standing, was 19 FPS.
 
 Target: 60 FPS in Performance mode, 30 in Fidelity.
+
+### v0.5.1 (November 26)
+
+- **Fixed: white/grey cloud-shaped blotches on metal** (server racks, metal boxes, Wolverine's belt, parts of the floor). Lights that project a pattern (light cookies) sample cube maps packed into texture arrays of up to 32 cubes, using the GPU's cube addressing (face coordinates, layer = cube × 8 + face). The emulator passed those coordinates to a plain 2D array, so only the first cube of each pack came out right. Such slots are now marked as cubes and their coordinates converted (`KYTY_BINDLESS_CUBE_FACES=0` restores the old way). Game-neutral: any game that samples cube textures this way benefits.
+- Coming from v0.5: copy the new `kyty_emulator.exe` over the old one and delete the `_ShaderCache` and `_PipelineCache` folders. The fix changes shaders, so the first start prepares pipelines again (about 15 minutes on the test laptop).
 
 ### New in v0.5 (November 25)
 
